@@ -149,18 +149,31 @@ does not mutate the agent's declared goals.
 `GoalAgenda` is immutable.
 Use `withEntry`, `withoutEntry`, or `expire` to produce a new agenda.
 `EvolutionOptions.agendaCatalog` is an activatable catalog: entries without an
-`activationKey` are activated at a process seam, and keyed entries are activated
-when matching blackboard ingress is drained.
-Runtime code can also propose entries directly with `AgentProcess.addAgendaEntry`.
-An `AgendaEntryApprover` can approve or veto either path.
+`activationKey` are activated once per entry id at a process seam, and keyed
+entries are activated when matching blackboard ingress is drained.
+Runtime code can also propose entries directly with `AgentProcess.addAgendaEntry`;
+direct additions are the repeatable path for entries created while the process
+is already running.
+An `AgendaEntryApprover` can approve or veto catalog activation or direct
+runtime proposals.
 Once activated, an entry is projected into the process planning system without
 adding a new planner type.
 The selected process goal is an `AgendaPlanningGoal`, whose `entry` exposes the
 agenda id, bindings, lane, source, and completion mode.
 The wrapper preserves the underlying goal name for planner semantics such as
 `NIRVANA`; agenda identity lives on `entry.id`.
+This lets an agenda-wrapped `NIRVANA` goal keep using Hybrid utility planning
+for standing utility work.
 If any active entry is in the `SAFETY` lane, safety entries are planned before
 economic entries.
+
+`BlackboardIngress` is available from `AgentProcess` and `ProcessContext`.
+`IngressOptions` can append facts, keep only the latest visible fact for a key,
+coalesce pending ingress by key, activate catalog entries by `activationKey`,
+wake blocked processes, safety-preempt cooperative actions, and hide drained
+facts after a TTL.
+Ingress publish is safe for external callers; blackboard writes happen when the
+process drains ingress at a process seam.
 
 Agenda completion is controlled by `AgendaCompletionMode`.
 `TERMINAL` completes the process when the entry's goal is satisfied.
@@ -168,9 +181,7 @@ Agenda completion is controlled by `AgendaCompletionMode`.
 satisfied. If the underlying goal is satisfied before the predicate is true, the
 process waits instead of repeatedly replanning the same already-satisfied goal.
 `RESUMABLE` removes the satisfied entry and lets the process re-arbitrate.
-`KEEP_ALIVE` keeps the process alive rather than completing it; after the goal is
-satisfied the process parks in `WAITING` until a host tick, run, or wake event
-drives it again.
+`KEEP_ALIVE` and `RECURRING` are intentionally not part of this POC surface.
 
 `IngressWake.WAKE` makes a `WAITING`, `STUCK`, or `PAUSED` process runnable
 again. `IngressWake.SAFETY_PREEMPT` also trips the process cancellation token so

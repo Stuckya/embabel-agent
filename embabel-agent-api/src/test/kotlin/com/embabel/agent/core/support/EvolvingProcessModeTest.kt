@@ -474,7 +474,7 @@ class EvolvingProcessModeTest {
         val nirvanaEntry = AgendaEntry(
             id = "chop",
             goal = NIRVANA,
-            completionMode = AgendaCompletionMode.KEEP_ALIVE,
+            completionMode = AgendaCompletionMode.TERMINAL,
         )
         val agentProcess = SimpleAgentProcess(
             id = "test-agenda-nirvana-utility",
@@ -496,6 +496,14 @@ class EvolvingProcessModeTest {
 
         assertEquals(AgentProcessStatusCode.RUNNING, agentProcess.status)
         assertEquals(EconomicOutcome("chop"), agentProcess.lastResult())
+    }
+
+    @Test
+    fun `agenda completion modes stay within first POC surface`() {
+        assertEquals(
+            setOf("TERMINAL", "RESUMABLE", "COMPOSITE_TERMINAL"),
+            AgendaCompletionMode.entries.map { it.name }.toSet(),
+        )
     }
 
     @Test
@@ -798,65 +806,6 @@ class EvolvingProcessModeTest {
         agentProcess.addAgendaEntry(safetyEntry)
 
         assertTrue(safetyOutcome in agentProcess.objects)
-    }
-
-    @Test
-    fun `keep alive agenda entry parks process after goal is achieved`() {
-        val blackboard = InMemoryBlackboard()
-        blackboard += SafetySignal("danger")
-        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
-        val keepAliveEntry = AgendaEntry(
-            id = "keep-alive-safety-entry",
-            goal = safetyGoal,
-            completionMode = AgendaCompletionMode.KEEP_ALIVE,
-        )
-        val agentProcess = SimpleAgentProcess(
-            id = "test-keep-alive",
-            agent = EvolvingAgendaAgent,
-            processOptions = ProcessOptions().withEvolution(
-                EvolutionOptions(
-                    agendaCatalog = GoalAgenda().withEntry(keepAliveEntry),
-                )
-            ),
-            blackboard = blackboard,
-            platformServices = dummyPlatformServices(),
-            plannerFactory = DefaultPlannerFactory,
-            parentId = null,
-        )
-
-        agentProcess.tick()
-        agentProcess.tick()
-
-        assertEquals(AgentProcessStatusCode.WAITING, agentProcess.status)
-        assertEquals(ProcessOutcomeCode.CONTINUE, agentProcess.outcome.code)
-    }
-
-    @Test
-    fun `keep alive run parks instead of spinning on already satisfied goal`() {
-        val blackboard = InMemoryBlackboard()
-        blackboard += SafetySignal("danger")
-        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
-        val keepAliveEntry = AgendaEntry(
-            id = "keep-alive-safety-entry",
-            goal = safetyGoal,
-            completionMode = AgendaCompletionMode.KEEP_ALIVE,
-        )
-        val agentProcess = SimpleAgentProcess(
-            id = "test-keep-alive-run",
-            agent = EvolvingAgendaAgent,
-            processOptions = ProcessOptions().withEvolution(
-                EvolutionOptions(
-                    agendaCatalog = GoalAgenda().withEntry(keepAliveEntry),
-                )
-            ),
-            blackboard = blackboard,
-            platformServices = dummyPlatformServices(),
-            plannerFactory = DefaultPlannerFactory,
-            parentId = null,
-        )
-
-        assertRunReturnsWithin(agentProcess, AgentProcessStatusCode.WAITING)
-        assertEquals(ProcessOutcomeCode.CONTINUE, agentProcess.outcome.code)
     }
 
     @Test

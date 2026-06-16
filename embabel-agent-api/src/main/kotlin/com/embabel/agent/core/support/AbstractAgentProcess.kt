@@ -497,15 +497,6 @@ abstract class AbstractAgentProcess(
                 )
                 AgentProcessStatusCode.RUNNING
             }
-
-            AgendaCompletionMode.KEEP_ALIVE -> {
-                _outcome = ProcessOutcome(
-                    code = ProcessOutcomeCode.CONTINUE,
-                    reason = "Agenda entry ${agendaEntry.id} is keeping the process alive",
-                    goal = agendaEntry.goal,
-                )
-                AgentProcessStatusCode.WAITING
-            }
         }
     }
 

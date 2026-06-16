@@ -2,257 +2,230 @@
 
 ## Overview
 
-Introduce Evolving Process Mode as a process/runtime module that lets a running
-agent process add, expire, and arbitrate goals while preserving Embabel's
+Evolving Process Mode is a process/runtime overlay that lets a running agent
+process add, expire, and arbitrate agenda goals while preserving Embabel's
 existing planner model.
 
-Evolving mode should not introduce a new `PlannerType`. It should compose with
-GOAP, Utility, and Hybrid planners by changing the effective planning system
-available to the process at each OODA seam.
+Evolving mode is not a `PlannerType`. It composes with GOAP, Utility, and
+Hybrid planners by changing the effective planning system available to a process
+at OODA seams. Agenda projection does not mutate `Agent.goals`.
 
-The intent is to implement the roadmap shape described in the README: a process
-can work with multiple goals and modify the running process as new facts make
-additional goals or agents relevant.
+The current implementation is a POC for the roadmap shape described in the
+README: a process can work with multiple goals and modify the running process as
+new facts make additional goals or agents relevant.
 
-## Current State
-
-Embabel already has most of the primitives needed:
-
-- `Blackboard` provides append-only process context with `hide` for excluding
-  visible objects without deleting them.
-- `AgentProcess` and `ProcessContext` provide the runtime seam for actions,
-  planning, status, history, and process options.
-- `ProcessOptions` and `ProcessControl` configure process behavior through
-  immutable data classes and withers.
-- `AgenticEventListener` is the existing event seam for platform and process
-  events.
-- `GoalChoiceApprover` and `Ranker` are the existing autonomy seams for initial
-  goal selection.
-- `ReplanRequestedException` lets an action update the blackboard and request a
-  replan without treating the request as an error.
-- GOAP, Utility, and Hybrid are existing planner adapters with different
-  arbitration behavior.
-
-The missing depth is runtime evolution. Today a process plans from a fixed agent
-scope, external events have no first-class typed ingress path into the process,
-and process completion is still centered on the currently selected goal.
-
-## Proposed Contracts
+## Implemented POC Surface
 
 ### EvolutionOptions
 
-Add an `EvolutionOptions` data class and a `withEvolution` wither on
-`ProcessOptions`.
+`ProcessOptions.evolution` carries an `EvolutionOptions` value with:
 
-`EvolutionOptions` should be a configuration bag, not a builder. It should use
-`@JvmOverloads` for Java callers and expose Java-friendly defaults from a
-companion object where appropriate.
+- `agendaCatalog`: an activatable catalog of agenda entries
+- `agendaEntryApprover`: an approval seam for catalog activation and runtime
+  entry proposals
+- `completionPolicy`: a process outcome policy
+
+`ProcessOptions.withEvolution` installs an `EvolutionOptions` value.
+`EvolutionOptions.initialAgenda` remains as a deprecated alias for
+`agendaCatalog`; entries here are a catalog, not active initial state.
 
 ### BlackboardIngress
 
-Add a process-level ingress interface for typed facts:
-
-```kotlin
-interface BlackboardIngress {
-    fun publish(fact: Any, options: IngressOptions = IngressOptions()): IngressReceipt
-}
-```
-
-Ingress should be available from both `AgentProcess` and `ProcessContext`.
-
-### IngressOptions
+`BlackboardIngress` is exposed from both `AgentProcess` and `ProcessContext`.
+`publish` queues a typed fact for the next process seam and returns an
+`IngressReceipt`.
 
 `IngressOptions` describes one publish operation:
 
-- mode: append or latest
-- wake: no wake, wake, or safety preempt
-- coalesce key
-- activation key
-- TTL
+- `mode`: `APPEND` or `LATEST`
+- `wake`: `NONE`, `WAKE`, or `SAFETY_PREEMPT`
+- `coalesceKey`: replaces pending ingress with the same key before drain
+- `activationKey`: activates matching catalog entries at drain time
+- `ttl`: hides the drained fact after the duration expires
 
-Latest semantics should be implemented by adding the new fact and hiding older
-visible facts with the same key. TTL expiry should be a logged hide operation,
-not deletion or mutation.
+Ingress publish is safe for external callers. It records pending ingress under
+lock and may wake a blocked process. Blackboard writes still happen at process
+seams.
 
 ### GoalAgenda
 
-`GoalAgenda` is an immutable runtime overlay over the agent's known goals,
-actions, and conditions.
+`GoalAgenda` is an immutable overlay of agenda entries that can be projected
+into planning. It exposes `withEntry`, `withoutEntry`, and `expire`, all of
+which return a new agenda instance.
 
-It should not mutate `Agent.goals`. It should expose withers such as
-`withEntry`, `withoutEntry`, and `expire`, returning a new agenda instance.
-
-The process uses the agenda to build the effective planning system for a tick.
+The active agenda is visible as `AgentProcess.goalAgenda`.
 
 ### AgendaEntry
 
-An agenda entry references a known goal and carries runtime context:
+An `AgendaEntry` references a known goal and carries runtime context:
 
-- id
-- goal
-- bindings
-- source
-- lane: economic or safety
-- completion mode
-- activation key
-- optional TTL
+- `id`
+- `goal`
+- `bindings`
+- `source`
+- `lane`: `ECONOMIC` or `SAFETY`
+- `completionMode`
+- `activationKey`
+- `ttl`
+- `createdAt`
+- `completionPredicate`
 
-Completion modes:
+Completion modes are intentionally small in the first POC:
 
-- terminal: satisfying the entry completes the process
-- resumable: satisfying the entry removes or marks the entry complete, then
-  re-arbitrates
-- keep-alive: keeps the process alive without completing it, parking in
-  `WAITING` after the goal is satisfied until the host ticks/runs/wakes it again
-- composite terminal: completes when a deterministic predicate over child
-  entries or facts is satisfied; if the child goal is satisfied first, the
-  process waits rather than spinning on the same complete goal
+- `TERMINAL`: satisfying the entry completes the process
+- `RESUMABLE`: satisfying the entry removes it and re-arbitrates
+- `COMPOSITE_TERMINAL`: completes only when its completion predicate is true;
+  if the child goal is satisfied before the predicate is true, the process
+  waits instead of spinning on the already-satisfied goal
+
+`KEEP_ALIVE` and `RECURRING` are intentionally not part of the POC. Continuous
+background utility work should be modeled with the existing `NIRVANA` goal under
+the Hybrid planner. Agenda projection preserves the wrapped goal name so
+agenda-wrapped `NIRVANA` still reaches Hybrid utility planning.
 
 ### AgendaEntryApprover
 
-Add an approver seam mirroring the shape of `GoalChoiceApprover`, but scoped to
-runtime agenda entries.
+`AgendaEntryApprover` approves or rejects agenda entry activation. The request
+includes the proposed entry, source fact, source type, lane, bindings, current
+agenda, and agent process.
 
-The request should include the proposed entry, source fact, source type, lane,
-bindings, current agenda, and process state. This is a sibling pattern to
-`GoalChoiceApprover`, not a replacement.
+The approver is used for both catalog activation and direct runtime proposals
+through `AgentProcess.addAgendaEntry`.
 
 ### CompletionPolicy
 
-Add a completion or outcome policy for Evolving processes.
+`CompletionPolicy` evaluates the process and current agenda and returns a
+`ProcessOutcome`.
 
-This should not be modeled as `EarlyTerminationPolicy`, because early
-termination currently means a `TERMINATED` process rather than successful
+Outcome codes are:
+
+- `CONTINUE`: keep running normal process logic
+- `COMPLETED`: mark the process completed
+- `EXHAUSTED`: terminate the process as a non-success exhausted outcome
+- `CANCELLED`: terminate the process as a cancellation outcome
+
+`CompletionPolicy` is separate from `EarlyTerminationPolicy`, because early
+termination is an existing hard stop path rather than evolving agenda
 completion.
-
-The outcome policy should distinguish:
-
-- continue
-- completed
-- exhausted
-- cancelled
 
 ### ProcessCancellationToken
 
-Expose a pollable cancellation token from `ProcessContext`.
+`ProcessContext.cancellationToken` exposes a pollable token for blocking action
+code. `IngressWake.SAFETY_PREEMPT` trips an action-scope termination signal
+immediately, so cooperative blocking actions can exit at bounded checkpoints.
 
-Blocking actions should be able to check bounded cancellation points and exit
-cleanly. Safety preemption should trip the token immediately, then let the next
-process seam drain ingress and re-arbitrate.
+If an action returns normally after observing an action-scope termination signal,
+the process records the action as terminated rather than successful progress and
+then re-arbitrates.
 
 ## Runtime Behavior
 
-Normal ingress drains at OODA tick seams. It should not mutate the blackboard
-from an arbitrary async path.
+Normal ingress drains at OODA tick seams. It does not mutate the blackboard from
+the async publish path.
 
-Safety ingress is special but narrow. An approved safety fact may trip the
-cancellation token immediately so an in-flight action can exit at its next
-checkpoint. The blackboard and agenda still activate through the normal process
-seam. A cooperative action that returns normally after observing an action-scope
-safety preempt is reported as action-terminated so the process re-arbitrates
-rather than treating the checkpoint exit as successful progress.
+At drain time, the process:
 
-Wake ingress moves a blocked process from `WAITING`, `STUCK`, or `PAUSED` back to
-`RUNNING`; terminal statuses remain terminal.
+1. expires active ingress whose TTL has elapsed
+2. drains pending ingress
+3. hides prior visible ingress with the same key for `LATEST` mode
+4. adds the new fact to the blackboard
+5. sets the activation condition for `activationKey`, when present
+6. activates matching catalog entries through the approver
+7. records the drained fact as active ingress for TTL tracking
 
-The safety path is:
+TTL expiry hides facts and emits a hidden-ingress event. It does not delete or
+mutate facts.
 
-1. safety fact is published
-2. approver accepts the safety lane
-3. cancellation token is tripped
-4. current action exits at a checkpoint
-5. ingress drains at the process seam
-6. safety agenda entry activates
-7. planner re-arbitrates
+Wake ingress moves a blocked process from `WAITING`, `STUCK`, or `PAUSED` back
+to `RUNNING`. Terminal statuses remain terminal.
 
-Runtime typed-fact activation must be deterministic and must not require LLM
-ranking. LLM-assisted deliberation may publish facts or propose agenda entries,
-but those entries pass through the same approval seam as code- or event-produced
-entries.
+Safety preempt is narrow:
 
-## Invariant Preservation
+1. a fact is published with `IngressWake.SAFETY_PREEMPT`
+2. the action-scope termination signal is tripped immediately
+3. a cooperative in-flight action exits at a checkpoint
+4. ingress drains at the process seam
+5. any matching safety agenda entry activates
+6. safety-lane planning preempts economic agenda entries
 
-- Preserve blackboard immutability: ingress adds and hides objects, never
-  mutates or removes them.
+Catalog entries without an `activationKey` activate at a process seam once per
+entry id. Keyed catalog entries activate when matching ingress is drained. An
+already active entry id is rejected.
+
+Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
+Direct runtime additions are not remembered as one-shot catalog activations, so a
+host or action can propose a fresh entry again after the previous entry is no
+longer active.
+
+## Planning Behavior
+
+Active agenda entries are projected as `AgendaPlanningGoal` values. The wrapper
+keeps the underlying goal's semantic name and carries agenda identity on
+`AgendaPlanningGoal.entry`.
+
+If any active agenda entry is in `AgendaLane.SAFETY`, only safety entries are
+projected for that planning cycle. Otherwise all active agenda entries are
+projected.
+
+When the active agenda is empty, planning falls back to the agent's base planning
+system. Completed resumable agenda goals are suppressed from that base planning
+system so a just-satisfied reusable goal is not immediately selected again from
+the agent's declared goals.
+
+## Completion Behavior
+
+Plain agent goals still complete the process normally.
+
+Agenda goals use their entry's `AgendaCompletionMode`:
+
+- `TERMINAL` sets a completed outcome and completes the process.
+- `RESUMABLE` removes the selected agenda entry, records the underlying goal as
+  completed for base-goal suppression, sets a continue outcome, and re-runs
+  arbitration.
+- `COMPOSITE_TERMINAL` completes only when `completionPredicate` returns true.
+  If the wrapped child goal is achieved before the composite predicate is true,
+  the process moves to `WAITING`.
+
+If a resumable agenda drains and no remaining plan can be found, the process
+becomes `TERMINATED` with an `EXHAUSTED` outcome rather than entering the normal
+recoverable stuck path.
+
+## Invariants
+
+- Preserve blackboard append/hide semantics: ingress adds and hides objects,
+  never mutates or removes them.
 - Preserve the OODA loop: normal evolution happens at process seams.
 - Preserve planner independence: Evolving is not a new `PlannerType`.
-- Preserve deterministic runtime activation: typed facts can activate agenda
-  entries without LLM involvement.
-- Preserve existing event integration: use `AgenticEventListener` rather than a
-  parallel event seam.
-- Preserve Java usability: public contracts need idiomatic Java construction and
-  call sites.
+- Preserve deterministic activation: typed facts and direct runtime proposals go
+  through the same approval seam.
+- Preserve event integration: ingress publish, drain, and hide use existing
+  process events.
+- Preserve Java usability: public contracts use constructors and
+  `@JvmOverloads` where needed.
 
-## Implementation Phases
+## Test Coverage
 
-### Phase 1: Iterative STUCK handling
+The POC has focused tests for:
 
-Replace recursive stuck-handler re-entry with an iterative loop that consults
-termination and outcome policies between attempts.
+- agenda projection without mutating `Agent.goals`
+- activation keys and one-shot unkeyed catalog activation
+- direct runtime agenda addition and approval rejection
+- duplicate goal names distinguished by agenda entry identity and bindings
+- safety-lane hard priority over economic entries
+- agenda-wrapped `NIRVANA` preserving Hybrid utility behavior
+- resumable completion, base-goal suppression, and exhausted agenda handling
+- composite terminal completion and waiting behavior
+- `CompletionPolicy` outcomes for completed, exhausted, and cancelled
+- ingress wake from `WAITING`, `STUCK`, and `PAUSED`
+- latest/coalesced ingress hide behavior and TTL hide behavior
+- safety preempt of a cooperative blocking action
+- Java construction of `EvolutionOptions`, `AgendaEntry`, and
+  `AgendaEntryApprover`
 
-This is a correctness improvement independent of the rest of Evolving mode.
+## Remaining Follow-Up
 
-### Phase 2: Cancellation token
-
-Add a pollable cancellation token to `ProcessContext` and action execution.
-
-Include Java fixtures showing token polling from Java action code.
-
-### Phase 3: Blackboard ingress
-
-Add typed ingress with append, latest, coalescing, activation keys, TTL hide,
-and process events.
-
-Ingress should preserve the blackboard's append/hide model and drain at process
-seams.
-
-### Phase 4: Goal agenda and completion
-
-Add immutable agenda entries, agenda approval, effective planning-system
-projection, and process outcome policy.
-
-Do not add a new planner type.
-
-### Phase 5: Documentation and examples
-
-Move stable user-facing material to `embabel-agent-docs` only after the runtime
-contracts have been validated.
-
-Use Asciidoctor syntax and examples from Embabel repositories, not application
-specific code.
-
-## Considerations
-
-- Keep public surface minimal. Make implementation classes internal where
-  possible and use `@ApiStatus.Internal` when public visibility is required for
-  technical reasons.
-- Use `*Options` for configuration bags and `*Policy` for behavioral strategy.
-- Keep `GoalAgenda` immutable and copy-on-write.
-- Do not rely on Kotlin extension functions for public API.
-- Avoid broad PRs. The implementation should be staged so maintainers can
-  review each seam independently.
-
-## Testing Strategy
-
-- Work test first.
-- Use MockK for Kotlin tests.
-- Use Mockito only for Java fixtures.
-- Add Java fixture tests for:
-  - `ProcessOptions.withEvolution`
-  - publishing a fact
-  - polling cancellation
-  - implementing `AgendaEntryApprover` as a Java lambda
-- Verify append/hide semantics for latest facts.
-- Verify activation keys prevent repeated activation unless explicitly rearmed.
-- Verify TTL expiry emits a replayable event and hides rather than deletes.
-- Verify safety preemption exits a blocking action at a checkpoint and
-  re-arbitrates to the safety entry.
-- Verify agenda completion distinguishes completed, exhausted, cancelled, and
-  keep-alive host stop.
-- Build the closest Maven module after each phase.
-
-## Progress Log
-
-### 2026-06-15
-
-- Created initial draft proposal for local POC and later upstream discussion.
+- Broaden user-facing examples once the API stabilizes beyond POC status.
+- Decide whether richer standing activity semantics are needed after the
+  agenda-wrapped `NIRVANA` path has more consumer mileage.
+- Revisit whether any API should be marked internal or moved before an upstream
+  PR.

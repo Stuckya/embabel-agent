@@ -96,7 +96,6 @@ enum class AgendaLane {
 enum class AgendaCompletionMode {
     TERMINAL,
     RESUMABLE,
-    KEEP_ALIVE,
     COMPOSITE_TERMINAL,
 }
 
