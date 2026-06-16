@@ -68,12 +68,13 @@ data class AgendaEntry @JvmOverloads constructor(
  *
  * The wrapped entry makes runtime bindings and source context visible from
  * [AgentProcess.goal] while preserving the original agent goal unchanged.
+ * The public goal name remains semantic; agenda identity is carried by [entry].
  */
 data class AgendaPlanningGoal(
     val entry: AgendaEntry,
 ) : ConditionGoal {
 
-    override val name: String = "${entry.goal.name}#${entry.id}"
+    override val name: String = entry.goal.name
 
     override val preconditions = entry.goal.preconditions
 

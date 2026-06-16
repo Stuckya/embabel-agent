@@ -15,6 +15,7 @@
  */
 package com.embabel.agent.core.support
 
+import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.api.dsl.agent
 import com.embabel.agent.api.event.ActionExecutionResultEvent
 import com.embabel.agent.core.AgendaCompletionMode
@@ -186,6 +187,15 @@ val SafetyPreemptAgent = agent("SafetyPreemptAgent", description = "Tests safety
         satisfiedBy = SafetyOutcome::class,
         value = { 0.1 },
     )
+}
+
+val UtilityAgendaAgent = agent("UtilityAgendaAgent", description = "Tests agenda utility planning") {
+    transformation<EconomicSignal, EconomicOutcome>(
+        name = "utility-work",
+        value = { 1.0 },
+    ) {
+        EconomicOutcome(it.input.name)
+    }
 }
 
 class EvolvingProcessModeTest {
@@ -455,6 +465,37 @@ class EvolvingProcessModeTest {
 
         val agendaGoal = agentProcess.goal as AgendaPlanningGoal
         assertEquals("rune platebody", agendaGoal.entry.bindings["item"])
+    }
+
+    @Test
+    fun `hybrid agenda nirvana entry selects available utility action`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += EconomicSignal("chop")
+        val nirvanaEntry = AgendaEntry(
+            id = "chop",
+            goal = NIRVANA,
+            completionMode = AgendaCompletionMode.KEEP_ALIVE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-agenda-nirvana-utility",
+            agent = UtilityAgendaAgent,
+            processOptions = ProcessOptions()
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolution(
+                    EvolutionOptions(
+                        agendaCatalog = GoalAgenda().withEntry(nirvanaEntry),
+                    )
+                ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.tick()
+
+        assertEquals(AgentProcessStatusCode.RUNNING, agentProcess.status)
+        assertEquals(EconomicOutcome("chop"), agentProcess.lastResult())
     }
 
     @Test

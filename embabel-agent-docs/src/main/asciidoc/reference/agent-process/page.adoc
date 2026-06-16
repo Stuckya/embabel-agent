@@ -157,6 +157,8 @@ Once activated, an entry is projected into the process planning system without
 adding a new planner type.
 The selected process goal is an `AgendaPlanningGoal`, whose `entry` exposes the
 agenda id, bindings, lane, source, and completion mode.
+The wrapper preserves the underlying goal name for planner semantics such as
+`NIRVANA`; agenda identity lives on `entry.id`.
 If any active entry is in the `SAFETY` lane, safety entries are planned before
 economic entries.
 
