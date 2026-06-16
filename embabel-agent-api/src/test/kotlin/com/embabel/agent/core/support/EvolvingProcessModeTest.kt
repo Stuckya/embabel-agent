@@ -730,6 +730,36 @@ class EvolvingProcessModeTest {
     }
 
     @Test
+    fun `reactivating resumable agenda entry does not hide prior goal output`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += SafetySignal("danger")
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry(
+            id = "rearmable-safety-entry",
+            goal = safetyGoal,
+            lane = AgendaLane.SAFETY,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-resumable-reactivation-does-not-hide-output",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(EvolutionOptions()),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+        agentProcess.addAgendaEntry(safetyEntry)
+        agentProcess.tick()
+        agentProcess.tick()
+        val safetyOutcome = agentProcess.objects.filterIsInstance<SafetyOutcome>().single()
+
+        agentProcess.addAgendaEntry(safetyEntry)
+
+        assertTrue(safetyOutcome in agentProcess.objects)
+    }
+
+    @Test
     fun `keep alive agenda entry parks process after goal is achieved`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
