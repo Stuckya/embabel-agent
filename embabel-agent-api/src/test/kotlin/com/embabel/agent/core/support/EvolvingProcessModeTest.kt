@@ -16,6 +16,7 @@
 package com.embabel.agent.core.support
 
 import com.embabel.agent.api.dsl.agent
+import com.embabel.agent.api.event.ActionExecutionResultEvent
 import com.embabel.agent.core.AgendaCompletionMode
 import com.embabel.agent.core.AgendaCompletionPredicate
 import com.embabel.agent.core.AgendaEntry
@@ -25,7 +26,9 @@ import com.embabel.agent.core.AgendaEntryApproved
 import com.embabel.agent.core.AgendaEntryApprover
 import com.embabel.agent.core.AgendaLane
 import com.embabel.agent.core.AgendaPlanningGoal
+import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.ActionStatusCode
 import com.embabel.agent.core.CompletionPolicy
 import com.embabel.agent.core.EvolutionOptions
 import com.embabel.agent.core.GoalAgenda
@@ -42,6 +45,10 @@ import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServ
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 data class EconomicSignal(
@@ -67,6 +74,25 @@ data class DuplicateFirstOutcome(
 data class DuplicateSecondOutcome(
     val name: String,
 )
+
+data class BlockingWorkSignal(
+    val name: String,
+)
+
+data class BlockingWorkOutcome(
+    val name: String,
+)
+
+object SafetyPreemptProbe {
+
+    lateinit var actionStarted: CountDownLatch
+    lateinit var cancellationObserved: CountDownLatch
+
+    fun reset() {
+        actionStarted = CountDownLatch(1)
+        cancellationObserved = CountDownLatch(1)
+    }
+}
 
 val EvolvingAgendaAgent = agent("EvolvingAgendaAgent", description = "Tests evolving agenda projection") {
     transformation<EconomicSignal, EconomicOutcome>(name = "economic-work") {
@@ -128,6 +154,37 @@ val ResumableSuppressionAgent = agent("ResumableSuppressionAgent", description =
         description = "Complete safety work",
         satisfiedBy = SafetyOutcome::class,
         value = { 1.0 },
+    )
+}
+
+val SafetyPreemptAgent = agent("SafetyPreemptAgent", description = "Tests safety preemption") {
+    transformation<BlockingWorkSignal, BlockingWorkOutcome>(name = "blocking-economic-work") {
+        SafetyPreemptProbe.actionStarted.countDown()
+        val token = AgentProcess.get()!!.processContext.cancellationToken
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            if (token.isCancellationRequested) {
+                SafetyPreemptProbe.cancellationObserved.countDown()
+                return@transformation BlockingWorkOutcome("cancelled")
+            }
+            Thread.sleep(10)
+        }
+        BlockingWorkOutcome("completed")
+    }
+    transformation<SafetySignal, SafetyOutcome>(name = "preempt-safety-work") {
+        SafetyOutcome(it.input.name)
+    }
+    goal(
+        name = "economic-goal",
+        description = "Complete blocking economic work",
+        satisfiedBy = BlockingWorkOutcome::class,
+        value = { 1.0 },
+    )
+    goal(
+        name = "safety-goal",
+        description = "Complete safety work",
+        satisfiedBy = SafetyOutcome::class,
+        value = { 0.1 },
     )
 }
 
@@ -463,12 +520,43 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
         agentProcess.tick()
 
-        assertEquals(AgentProcessStatusCode.RUNNING, agentProcess.status)
+        assertEquals(AgentProcessStatusCode.WAITING, agentProcess.status)
 
         agentProcess.addObject(EconomicOutcome("done"))
         agentProcess.tick()
 
         assertEquals(AgentProcessStatusCode.COMPLETED, agentProcess.status)
+    }
+
+    @Test
+    fun `incomplete composite terminal run parks instead of spinning on already satisfied child goal`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += SafetySignal("danger")
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val compositeEntry = AgendaEntry(
+            id = "composite-entry",
+            goal = safetyGoal,
+            completionMode = AgendaCompletionMode.COMPOSITE_TERMINAL,
+            completionPredicate = AgendaCompletionPredicate { process, _, _ ->
+                process.objects.any { it is EconomicOutcome }
+            },
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-composite-terminal-run",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(compositeEntry),
+                )
+            ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        assertRunReturnsWithin(agentProcess, AgentProcessStatusCode.WAITING)
+        assertEquals(ProcessOutcomeCode.CONTINUE, agentProcess.outcome.code)
     }
 
     @Test
@@ -528,6 +616,30 @@ class EvolvingProcessModeTest {
         agentProcess.run()
 
         assertEquals(AgentProcessStatusCode.WAITING, agentProcess.status)
+
+        agentProcess.ingress.publish(
+            EconomicSignal("wake"),
+            IngressOptions(wake = IngressWake.WAKE),
+        )
+
+        assertEquals(AgentProcessStatusCode.RUNNING, agentProcess.status)
+    }
+
+    @Test
+    fun `wake ingress makes a stuck process runnable again`() {
+        val agentProcess = SimpleAgentProcess(
+            id = "test-wake-stuck-process",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(EvolutionOptions()),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, agentProcess.status)
 
         agentProcess.ingress.publish(
             EconomicSignal("wake"),
@@ -618,7 +730,7 @@ class EvolvingProcessModeTest {
     }
 
     @Test
-    fun `keep alive agenda entry keeps process running after goal is achieved`() {
+    fun `keep alive agenda entry parks process after goal is achieved`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
@@ -644,8 +756,88 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
         agentProcess.tick()
 
-        assertEquals(AgentProcessStatusCode.RUNNING, agentProcess.status)
+        assertEquals(AgentProcessStatusCode.WAITING, agentProcess.status)
         assertEquals(ProcessOutcomeCode.CONTINUE, agentProcess.outcome.code)
+    }
+
+    @Test
+    fun `keep alive run parks instead of spinning on already satisfied goal`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += SafetySignal("danger")
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val keepAliveEntry = AgendaEntry(
+            id = "keep-alive-safety-entry",
+            goal = safetyGoal,
+            completionMode = AgendaCompletionMode.KEEP_ALIVE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-keep-alive-run",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(keepAliveEntry),
+                )
+            ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        assertRunReturnsWithin(agentProcess, AgentProcessStatusCode.WAITING)
+        assertEquals(ProcessOutcomeCode.CONTINUE, agentProcess.outcome.code)
+    }
+
+    @Test
+    fun `safety preempt marks cooperative in flight action terminated and replans to safety agenda`() {
+        SafetyPreemptProbe.reset()
+        val listener = EventSavingAgenticEventListener()
+        val blackboard = InMemoryBlackboard()
+        blackboard += BlockingWorkSignal("profitable")
+        val safetyGoal = SafetyPreemptAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry(
+            id = "preempt-safety-entry",
+            goal = safetyGoal,
+            lane = AgendaLane.SAFETY,
+            completionMode = AgendaCompletionMode.TERMINAL,
+            activationKey = "danger",
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-safety-preempt-end-to-end",
+            agent = SafetyPreemptAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                )
+            ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(listener),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val run = executor.submit<AgentProcess> { agentProcess.run() }
+            assertTrue(SafetyPreemptProbe.actionStarted.await(1, TimeUnit.SECONDS))
+
+            agentProcess.ingress.publish(
+                SafetySignal("danger"),
+                IngressOptions(wake = IngressWake.SAFETY_PREEMPT, activationKey = "danger"),
+            )
+
+            assertTrue(SafetyPreemptProbe.cancellationObserved.await(1, TimeUnit.SECONDS))
+            val result = run.get(2, TimeUnit.SECONDS)
+
+            assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+            assertTrue(result.lastResult() is SafetyOutcome)
+            val blockingActionResult = listener.processEvents
+                .filterIsInstance<ActionExecutionResultEvent>()
+                .single { it.action.name == "blocking-economic-work" }
+            assertEquals(ActionStatusCode.TERMINATED, blockingActionResult.actionStatus.status)
+        } finally {
+            agentProcess.terminateAgent("test cleanup")
+            executor.shutdownNow()
+        }
     }
 
     @Test
@@ -678,5 +870,24 @@ class EvolvingProcessModeTest {
 
         assertEquals(AgentProcessStatusCode.TERMINATED, agentProcess.status)
         assertEquals(ProcessOutcomeCode.EXHAUSTED, agentProcess.outcome.code)
+    }
+
+    private fun assertRunReturnsWithin(
+        agentProcess: SimpleAgentProcess,
+        expectedStatus: AgentProcessStatusCode,
+    ) {
+        val executor = Executors.newSingleThreadExecutor()
+        val run = executor.submit<AgentProcess> { agentProcess.run() }
+        try {
+            val result = run.get(500, TimeUnit.MILLISECONDS)
+            assertEquals(expectedStatus, result.status)
+        } catch (e: TimeoutException) {
+            agentProcess.terminateAgent("test cleanup after run timeout")
+            run.cancel(true)
+            throw AssertionError("run() did not return within 500 ms; possible tight loop", e)
+        } finally {
+            executor.shutdownNow()
+            executor.awaitTermination(1, TimeUnit.SECONDS)
+        }
     }
 }

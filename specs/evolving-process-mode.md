@@ -102,9 +102,11 @@ Completion modes:
 - terminal: satisfying the entry completes the process
 - resumable: satisfying the entry removes or marks the entry complete, then
   re-arbitrates
-- keep-alive: keeps the process alive until host stop or cancellation
+- keep-alive: keeps the process alive without completing it, parking in
+  `WAITING` after the goal is satisfied until the host ticks/runs/wakes it again
 - composite terminal: completes when a deterministic predicate over child
-  entries or facts is satisfied
+  entries or facts is satisfied; if the child goal is satisfied first, the
+  process waits rather than spinning on the same complete goal
 
 ### AgendaEntryApprover
 
@@ -146,7 +148,12 @@ from an arbitrary async path.
 Safety ingress is special but narrow. An approved safety fact may trip the
 cancellation token immediately so an in-flight action can exit at its next
 checkpoint. The blackboard and agenda still activate through the normal process
-seam.
+seam. A cooperative action that returns normally after observing an action-scope
+safety preempt is reported as action-terminated so the process re-arbitrates
+rather than treating the checkpoint exit as successful progress.
+
+Wake ingress moves a blocked process from `WAITING`, `STUCK`, or `PAUSED` back to
+`RUNNING`; terminal statuses remain terminal.
 
 The safety path is:
 

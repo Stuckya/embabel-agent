@@ -172,12 +172,28 @@ abstract class AbstractAgentProcess(
             )
         )
         if (options.wake != IngressWake.NONE) {
-            _status.compareAndSet(AgentProcessStatusCode.WAITING, AgentProcessStatusCode.RUNNING)
+            wakeIfBlocked()
         }
         if (options.wake == IngressWake.SAFETY_PREEMPT) {
             terminateAction("Safety ingress published: ${receipt.factType}")
         }
         return receipt
+    }
+
+    private fun wakeIfBlocked() {
+        while (true) {
+            val currentStatus = _status.get()
+            when (currentStatus) {
+                AgentProcessStatusCode.WAITING,
+                AgentProcessStatusCode.STUCK,
+                AgentProcessStatusCode.PAUSED,
+                    -> if (_status.compareAndSet(currentStatus, AgentProcessStatusCode.RUNNING)) {
+                    return
+                }
+
+                else -> return
+            }
+        }
     }
 
     private fun drainIngress() {
@@ -467,7 +483,7 @@ abstract class AbstractAgentProcess(
                         reason = "Composite agenda entry ${agendaEntry.id} is waiting for completion predicate",
                         goal = agendaEntry.goal,
                     )
-                    AgentProcessStatusCode.RUNNING
+                    AgentProcessStatusCode.WAITING
                 }
             }
 
@@ -488,7 +504,7 @@ abstract class AbstractAgentProcess(
                     reason = "Agenda entry ${agendaEntry.id} is keeping the process alive",
                     goal = agendaEntry.goal,
                 )
-                AgentProcessStatusCode.RUNNING
+                AgentProcessStatusCode.WAITING
             }
         }
     }
@@ -1017,6 +1033,7 @@ abstract class AbstractAgentProcess(
             logger.info("Action {} requested agent termination: {}", action.name, e.reason)
             ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.AGENT_TERMINATED)
         }
+        val actionStatusAfterCancellation = actionStatusAfterCooperativeActionTermination(actionStatus, timestamp)
         val runningTime = Duration.between(timestamp, Instant.now())
         _history += ActionInvocation(
             actionName = action.name,
@@ -1040,12 +1057,31 @@ abstract class AbstractAgentProcess(
 
         platformServices.eventListener.onProcessEvent(
             actionExecutionStartEvent.resultEvent(
-                actionStatus = actionStatus,
+                actionStatus = actionStatusAfterCancellation,
             )
         )
 
         logger.debug("New world state: {}", worldStateDeterminer.determineWorldState())
-        return actionStatus
+        return actionStatusAfterCancellation
+    }
+
+    private fun actionStatusAfterCooperativeActionTermination(
+        actionStatus: ActionStatus,
+        timestamp: Instant,
+    ): ActionStatus {
+        if (actionStatus.status != ActionStatusCode.SUCCEEDED) {
+            return actionStatus
+        }
+        val signal = terminationRequest
+        return if (signal != null &&
+            signal.scope == TerminationScope.ACTION &&
+            compareAndResetTerminationRequest(signal)
+        ) {
+            logger.info("Action cooperatively observed termination signal: {}", signal.reason)
+            ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.TERMINATED)
+        } else {
+            actionStatus
+        }
     }
 
     /**

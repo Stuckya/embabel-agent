@@ -163,9 +163,17 @@ economic entries.
 Agenda completion is controlled by `AgendaCompletionMode`.
 `TERMINAL` completes the process when the entry's goal is satisfied.
 `COMPOSITE_TERMINAL` completes the process only when its completion predicate is
-satisfied.
+satisfied. If the underlying goal is satisfied before the predicate is true, the
+process waits instead of repeatedly replanning the same already-satisfied goal.
 `RESUMABLE` removes the satisfied entry and lets the process re-arbitrate.
-`KEEP_ALIVE` keeps the process running rather than completing it.
+`KEEP_ALIVE` keeps the process alive rather than completing it; after the goal is
+satisfied the process parks in `WAITING` until a host tick, run, or wake event
+drives it again.
+
+`IngressWake.WAKE` makes a `WAITING`, `STUCK`, or `PAUSED` process runnable
+again. `IngressWake.SAFETY_PREEMPT` also trips the process cancellation token so
+cooperative blocking actions can exit at a checkpoint and the next process seam
+can re-arbitrate to any activated safety agenda entry.
 
 `CompletionPolicy` is separate from `EarlyTerminationPolicy`.
 It returns a `ProcessOutcome`, available from `AgentProcess.outcome`.
