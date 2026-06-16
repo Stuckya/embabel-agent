@@ -21,6 +21,7 @@ import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusReport
 import com.embabel.agent.core.InProcess
+import com.embabel.agent.core.IngressReceipt
 import com.embabel.agent.core.ToolGroupMetadata
 import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.chat.Message
@@ -72,6 +73,31 @@ class AgentProcessReadyToPlanEvent(
 class ReplanRequestedEvent(
     agentProcess: AgentProcess,
     val reason: String,
+) : AbstractAgentProcessEvent(agentProcess)
+
+class BlackboardIngressPublishedEvent(
+    agentProcess: AgentProcess,
+    val receipt: IngressReceipt,
+    val fact: Any,
+) : AbstractAgentProcessEvent(agentProcess)
+
+class BlackboardIngressDrainedEvent(
+    agentProcess: AgentProcess,
+    val receipt: IngressReceipt,
+    val fact: Any,
+) : AbstractAgentProcessEvent(agentProcess)
+
+enum class BlackboardIngressHideReason {
+    LATEST_REPLACED,
+    TTL_EXPIRED,
+}
+
+class BlackboardIngressHiddenEvent(
+    agentProcess: AgentProcess,
+    val receipt: IngressReceipt,
+    val fact: Any,
+    val reason: BlackboardIngressHideReason,
+    val replacementReceipt: IngressReceipt? = null,
 ) : AbstractAgentProcessEvent(agentProcess)
 
 class AgentProcessPlanFormulatedEvent(
@@ -207,7 +233,7 @@ class ToolCallResponseEvent internal constructor(
 
 /**
  * The agent process has finished.
- * It may have completed successfully or failed.
+ * It may have completed successfully, failed, or terminated.
  * Check the status code to determine the outcome.
  */
 sealed class AgentProcessFinishedEvent(
@@ -224,6 +250,10 @@ class AgentProcessCompletedEvent(
 }
 
 class AgentProcessFailedEvent(
+    agentProcess: AgentProcess,
+) : AgentProcessFinishedEvent(agentProcess)
+
+class AgentProcessTerminatedEvent(
     agentProcess: AgentProcess,
 ) : AgentProcessFinishedEvent(agentProcess)
 

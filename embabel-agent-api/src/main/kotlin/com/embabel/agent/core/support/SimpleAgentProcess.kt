@@ -84,6 +84,10 @@ open class SimpleAgentProcess(
                         .trimMargin()
                         .indentLines(1)
         )
+        if (hasExhaustedAgenda()) {
+            exhaustAgenda("Agenda exhausted with no remaining plan")
+            return this
+        }
         setStatus(AgentProcessStatusCode.STUCK)
         val earlyTermination = identifyEarlyTermination()
         if (earlyTermination != null) {
@@ -96,11 +100,13 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
+        val nextStatus = statusAfterGoalAchieved(plan.goal)
         logger.debug(
-            "✅ Process {} completed, achieving goal {} in {} seconds",
+            "✅ Process {} achieved goal {} in {} seconds; next status={}",
             this.id,
             plan.goal.name,
             this.runningTime.seconds,
+            nextStatus,
         )
         platformServices.eventListener.onProcessEvent(
             GoalAchievedEvent(
@@ -110,7 +116,7 @@ open class SimpleAgentProcess(
             )
         )
         logger.debug("Final blackboard: {}", blackboard.infoString())
-        setStatus(AgentProcessStatusCode.COMPLETED)
+        setStatus(nextStatus)
     }
 
     protected fun sendProcessRunningEvent(
@@ -130,7 +136,7 @@ open class SimpleAgentProcess(
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
-            system = agent.planningSystem,
+            system = effectivePlanningSystem(),
             excludedActionNames = replanBlacklist,
         )
         if (plan == null) {

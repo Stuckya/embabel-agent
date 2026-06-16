@@ -91,6 +91,47 @@ interface AgentProcess : Blackboard, Timestamped, Timed, OperationStatus<AgentPr
     val processOptions: ProcessOptions
 
     /**
+     * Typed ingress for facts that should be added to the blackboard at process seams.
+     */
+    val ingress: BlackboardIngress
+        get() = BlackboardIngress.NONE
+
+    /**
+     * Agenda entries currently projected into this process's effective planning system.
+     */
+    val goalAgenda: GoalAgenda
+        get() = GoalAgenda.EMPTY
+
+    /**
+     * Propose a runtime agenda entry for this process.
+     */
+    fun addAgendaEntry(entry: AgendaEntry): AgendaEntryApprovalResponse =
+        addAgendaEntry(entry, null)
+
+    /**
+     * Propose a runtime agenda entry for this process, optionally tied to a source fact.
+     */
+    fun addAgendaEntry(
+        entry: AgendaEntry,
+        sourceFact: Any?,
+    ): AgendaEntryApprovalResponse =
+        AgendaEntryNotApproved(
+            request = AgendaEntryApprovalRequest(
+                entry = entry,
+                sourceFact = sourceFact,
+                currentAgenda = goalAgenda,
+                agentProcess = this,
+            ),
+            reason = "Agenda evolution is not supported by this AgentProcess",
+        )
+
+    /**
+     * Outcome selected by evolving process completion policy or agenda completion.
+     */
+    val outcome: ProcessOutcome
+        get() = ProcessOutcome()
+
+    /**
      * Get the planner for this process
      */
     val planner: Planner<*, *, *>

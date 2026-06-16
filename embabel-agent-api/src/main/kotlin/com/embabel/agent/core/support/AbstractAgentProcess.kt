@@ -32,13 +32,17 @@ import com.embabel.agent.spi.ScheduledActionExecutionSchedule
 import com.embabel.agent.spi.support.AgenticEventListenerToolsStats
 import com.embabel.common.ai.model.EmbeddingServiceMetadata
 import com.embabel.common.ai.model.LlmMetadata
+import com.embabel.plan.Goal as PlanGoal
+import com.embabel.plan.PlanningSystem
 import com.embabel.plan.WorldState
+import com.embabel.plan.common.condition.ConditionPlanningSystem
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import com.fasterxml.jackson.annotation.JsonIgnore
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 
@@ -54,7 +58,7 @@ abstract class AbstractAgentProcess(
     @get:JsonIgnore
     protected val platformServices: PlatformServices,
     override val timestamp: Instant = Instant.now(),
-) : AgentProcess, Blackboard by blackboard {
+) : AgentProcess, ProcessCancellationTokenProvider, Blackboard by blackboard {
 
     protected val logger: Logger = LoggerFactory.getLogger(javaClass)
 
@@ -70,6 +74,11 @@ abstract class AbstractAgentProcess(
 
     override val failureInfo: Any?
         get() = _failureInfo
+
+    private var _outcome: ProcessOutcome = ProcessOutcome()
+
+    override val outcome: ProcessOutcome
+        get() = _outcome
 
     private val _terminationRequest = AtomicReference<TerminationSignal?>(null)
 
@@ -88,6 +97,401 @@ abstract class AbstractAgentProcess(
      */
     internal fun compareAndResetTerminationRequest(expected: TerminationSignal): Boolean =
         _terminationRequest.compareAndSet(expected, null)
+
+    // Agenda and outcome state is process-thread confined. External publish() calls
+    // only touch pending ingress under lock plus atomic status/termination signals.
+    private var _goalAgenda: GoalAgenda = GoalAgenda.EMPTY
+
+    private val activatedAgendaEntryIds = mutableSetOf<String>()
+
+    private val completedAgendaGoals = mutableSetOf<Goal>()
+
+    override val goalAgenda: GoalAgenda
+        get() = _goalAgenda
+
+    override val cancellationToken: ProcessCancellationToken = object : ProcessCancellationToken {
+        override val isCancellationRequested: Boolean
+            get() = terminationRequest != null ||
+                    status == AgentProcessStatusCode.TERMINATED ||
+                    status == AgentProcessStatusCode.KILLED
+
+        override val reason: String?
+            get() = terminationRequest?.reason
+    }
+
+    private data class PendingBlackboardIngress(
+        val fact: Any,
+        val receipt: IngressReceipt,
+    )
+
+    private data class ActiveBlackboardIngress(
+        val fact: Any,
+        val key: String,
+        val expiresAt: Instant?,
+        val receipt: IngressReceipt,
+    )
+
+    private val pendingIngressLock = Any()
+
+    private val pendingIngress = mutableListOf<PendingBlackboardIngress>()
+
+    private val activeIngress = CopyOnWriteArrayList<ActiveBlackboardIngress>()
+
+    override val ingress: BlackboardIngress = object : BlackboardIngress {
+
+        override fun publish(
+            fact: Any,
+            options: IngressOptions,
+        ): IngressReceipt = publishIngress(fact, options)
+    }
+
+    private fun publishIngress(
+        fact: Any,
+        options: IngressOptions,
+    ): IngressReceipt {
+        val receipt = IngressReceipt(
+            id = UUID.randomUUID().toString(),
+            factType = fact.javaClass.name,
+            publishedAt = Instant.now(),
+            options = options,
+        )
+        synchronized(pendingIngressLock) {
+            options.coalesceKey?.let { coalesceKey ->
+                pendingIngress.removeIf { it.receipt.options.coalesceKey == coalesceKey }
+            }
+            pendingIngress += PendingBlackboardIngress(
+                fact = fact,
+                receipt = receipt,
+            )
+        }
+        platformServices.eventListener.onProcessEvent(
+            BlackboardIngressPublishedEvent(
+                agentProcess = this,
+                receipt = receipt,
+                fact = fact,
+            )
+        )
+        if (options.wake != IngressWake.NONE) {
+            _status.compareAndSet(AgentProcessStatusCode.WAITING, AgentProcessStatusCode.RUNNING)
+        }
+        if (options.wake == IngressWake.SAFETY_PREEMPT) {
+            terminateAction("Safety ingress published: ${receipt.factType}")
+        }
+        return receipt
+    }
+
+    private fun drainIngress() {
+        val now = Instant.now()
+        expireIngress(now)
+        val toDrain = synchronized(pendingIngressLock) {
+            pendingIngress.toList().also {
+                pendingIngress.clear()
+            }
+        }
+        toDrain.forEach { drainIngress(it, now) }
+        expireIngress(now)
+    }
+
+    private fun drainIngress(pending: PendingBlackboardIngress, now: Instant) {
+        val options = pending.receipt.options
+        val key = ingressKey(pending.fact, options)
+        if (options.mode == IngressMode.LATEST) {
+            hideVisibleIngress(
+                key = key,
+                reason = BlackboardIngressHideReason.LATEST_REPLACED,
+                replacementReceipt = pending.receipt,
+            )
+        }
+        addObject(pending.fact)
+        options.activationKey?.let {
+            blackboard.setCondition(it, true)
+            activateAgendaEntries(
+                activationKey = it,
+                sourceFact = pending.fact,
+            )
+        }
+        activeIngress += ActiveBlackboardIngress(
+            fact = pending.fact,
+            key = key,
+            expiresAt = options.ttl?.let { now.plus(it) },
+            receipt = pending.receipt,
+        )
+        platformServices.eventListener.onProcessEvent(
+            BlackboardIngressDrainedEvent(
+                agentProcess = this,
+                receipt = pending.receipt,
+                fact = pending.fact,
+            )
+        )
+    }
+
+    private fun activateAgendaEntries(
+        activationKey: String?,
+        sourceFact: Any?,
+    ) {
+        val now = Instant.now()
+        processOptions.evolution.agendaCatalog.entries
+            .filter { it.activationKey == activationKey }
+            .filterNot { it.isExpired(now) }
+            .forEach {
+                activateAgendaEntry(
+                    entry = it,
+                    sourceFact = sourceFact,
+                    rememberActivation = activationKey == null,
+                )
+            }
+    }
+
+    private fun activateAgendaEntry(
+        entry: AgendaEntry,
+        sourceFact: Any?,
+        rememberActivation: Boolean,
+    ): AgendaEntryApprovalResponse {
+        val request = AgendaEntryApprovalRequest(
+            entry = entry,
+            sourceFact = sourceFact,
+            sourceType = sourceFact?.javaClass?.name,
+            lane = entry.lane,
+            bindings = entry.bindings,
+            currentAgenda = _goalAgenda,
+            agentProcess = this,
+        )
+        if (rememberActivation && activatedAgendaEntryIds.contains(entry.id)) {
+            return AgendaEntryNotApproved(
+                request = request,
+                reason = "Agenda entry ${entry.id} was already activated",
+            )
+        }
+        if (_goalAgenda.entries.any { it.id == entry.id }) {
+            return AgendaEntryNotApproved(
+                request = request,
+                reason = "Agenda entry ${entry.id} is already active",
+            )
+        }
+        val response = processOptions.evolution.agendaEntryApprover.approve(request)
+        if (response.approved) {
+            _goalAgenda = _goalAgenda.withEntry(entry)
+            if (rememberActivation) {
+                activatedAgendaEntryIds += entry.id
+            }
+        }
+        return response
+    }
+
+    override fun addAgendaEntry(
+        entry: AgendaEntry,
+        sourceFact: Any?,
+    ): AgendaEntryApprovalResponse =
+        activateAgendaEntry(
+            entry = entry,
+            sourceFact = sourceFact,
+            rememberActivation = false,
+        )
+
+    private fun expireAgenda(now: Instant) {
+        _goalAgenda = _goalAgenda.expire(now)
+    }
+
+    private fun shouldRunEvolutionCycle(): Boolean {
+        val evolution = processOptions.evolution
+        return _goalAgenda.entries.isNotEmpty() ||
+                activeIngress.isNotEmpty() ||
+                hasPendingIngress() ||
+                evolution.agendaCatalog.entries.isNotEmpty() ||
+                evolution.completionPolicy !== CompletionPolicy.CONTINUE
+    }
+
+    private fun hasPendingIngress(): Boolean =
+        synchronized(pendingIngressLock) {
+            pendingIngress.isNotEmpty()
+        }
+
+    protected fun effectivePlanningSystem(): PlanningSystem {
+        val activeEntries = if (goalAgenda.entries.any { it.lane == AgendaLane.SAFETY }) {
+            goalAgenda.entries.filter { it.lane == AgendaLane.SAFETY }
+        } else {
+            goalAgenda.entries
+        }
+        val activeGoals = activeEntries.map { AgendaPlanningGoal(it) }.toSet()
+        return if (activeGoals.isEmpty()) {
+            basePlanningSystem()
+        } else {
+            ConditionPlanningSystem(
+                actions = agent.actions.toSet(),
+                goals = activeGoals,
+            )
+        }
+    }
+
+    private fun basePlanningSystem(): PlanningSystem {
+        if (completedAgendaGoals.isEmpty()) {
+            return agent.planningSystem
+        }
+        val base = agent.planningSystem
+        return object : PlanningSystem {
+            override val actions = base.actions
+            override val goals = base.goals
+                .filterNot { goal -> completedAgendaGoals.any { completedGoal -> completedGoal == goal } }
+                .toSet()
+
+            override fun knownConditions(): Set<String> = base.knownConditions()
+
+            override fun infoString(
+                verbose: Boolean?,
+                indent: Int,
+            ): String = base.infoString(verbose, indent)
+        }
+    }
+
+    private fun ingressKey(
+        fact: Any,
+        options: IngressOptions,
+    ): String = options.coalesceKey ?: fact.javaClass.name
+
+    private fun expireIngress(now: Instant) {
+        activeIngress
+            .filter { it.expiresAt != null && !it.expiresAt.isAfter(now) }
+            .forEach {
+                hideIngress(
+                    ingress = it,
+                    reason = BlackboardIngressHideReason.TTL_EXPIRED,
+                    replacementReceipt = null,
+                )
+            }
+    }
+
+    private fun hideVisibleIngress(
+        key: String,
+        reason: BlackboardIngressHideReason,
+        replacementReceipt: IngressReceipt?,
+    ) {
+        val visibleObjects = blackboard.objects
+        activeIngress
+            .filter { it.key == key && visibleObjects.contains(it.fact) }
+            .forEach {
+                hideIngress(
+                    ingress = it,
+                    reason = reason,
+                    replacementReceipt = replacementReceipt,
+                )
+            }
+    }
+
+    private fun hideIngress(
+        ingress: ActiveBlackboardIngress,
+        reason: BlackboardIngressHideReason,
+        replacementReceipt: IngressReceipt?,
+    ) {
+        blackboard.hide(ingress.fact)
+        activeIngress.remove(ingress)
+        platformServices.eventListener.onProcessEvent(
+            BlackboardIngressHiddenEvent(
+                agentProcess = this,
+                receipt = ingress.receipt,
+                fact = ingress.fact,
+                reason = reason,
+                replacementReceipt = replacementReceipt,
+            )
+        )
+    }
+
+    protected fun applyCompletionPolicy(): Boolean =
+        applyProcessOutcome(processOptions.evolution.completionPolicy.evaluate(this, goalAgenda))
+
+    protected fun hasExhaustedAgenda(): Boolean =
+        _goalAgenda.entries.isEmpty() && completedAgendaGoals.isNotEmpty()
+
+    protected fun exhaustAgenda(reason: String): Boolean =
+        applyProcessOutcome(
+            ProcessOutcome(
+                code = ProcessOutcomeCode.EXHAUSTED,
+                reason = reason,
+            )
+        )
+
+    protected fun applyProcessOutcome(outcome: ProcessOutcome): Boolean {
+        _outcome = outcome
+        return when (outcome.code) {
+            ProcessOutcomeCode.CONTINUE -> false
+            ProcessOutcomeCode.COMPLETED -> {
+                setStatus(AgentProcessStatusCode.COMPLETED)
+                true
+            }
+
+            ProcessOutcomeCode.EXHAUSTED -> {
+                _failureInfo = outcome
+                setStatus(AgentProcessStatusCode.TERMINATED)
+                true
+            }
+
+            ProcessOutcomeCode.CANCELLED -> {
+                _failureInfo = outcome
+                setStatus(AgentProcessStatusCode.TERMINATED)
+                true
+            }
+        }
+    }
+
+    protected fun statusAfterGoalAchieved(goal: PlanGoal): AgentProcessStatusCode {
+        val agendaEntry = (goal as? AgendaPlanningGoal)?.entry
+            ?: _goalAgenda.entries.firstOrNull { it.goal == goal }
+        if (agendaEntry == null) {
+            _outcome = ProcessOutcome(
+                code = ProcessOutcomeCode.COMPLETED,
+                reason = "Goal ${goal.name} completed",
+                goal = goal as? Goal,
+            )
+            return AgentProcessStatusCode.COMPLETED
+        }
+        return when (agendaEntry.completionMode) {
+            AgendaCompletionMode.TERMINAL -> {
+                _outcome = ProcessOutcome(
+                    code = ProcessOutcomeCode.COMPLETED,
+                    reason = "Agenda entry ${agendaEntry.id} completed",
+                    goal = agendaEntry.goal,
+                )
+                AgentProcessStatusCode.COMPLETED
+            }
+
+            AgendaCompletionMode.COMPOSITE_TERMINAL -> {
+                if (agendaEntry.completionPredicate?.isComplete(this, agendaEntry, _goalAgenda) == true) {
+                    _outcome = ProcessOutcome(
+                        code = ProcessOutcomeCode.COMPLETED,
+                        reason = "Composite agenda entry ${agendaEntry.id} completed",
+                        goal = agendaEntry.goal,
+                    )
+                    AgentProcessStatusCode.COMPLETED
+                } else {
+                    _outcome = ProcessOutcome(
+                        code = ProcessOutcomeCode.CONTINUE,
+                        reason = "Composite agenda entry ${agendaEntry.id} is waiting for completion predicate",
+                        goal = agendaEntry.goal,
+                    )
+                    AgentProcessStatusCode.RUNNING
+                }
+            }
+
+            AgendaCompletionMode.RESUMABLE -> {
+                _goalAgenda = _goalAgenda.withoutEntry(agendaEntry.id)
+                completedAgendaGoals += agendaEntry.goal
+                _outcome = ProcessOutcome(
+                    code = ProcessOutcomeCode.CONTINUE,
+                    reason = "Agenda entry ${agendaEntry.id} completed; continuing",
+                    goal = agendaEntry.goal,
+                )
+                AgentProcessStatusCode.RUNNING
+            }
+
+            AgendaCompletionMode.KEEP_ALIVE -> {
+                _outcome = ProcessOutcome(
+                    code = ProcessOutcomeCode.CONTINUE,
+                    reason = "Agenda entry ${agendaEntry.id} is keeping the process alive",
+                    goal = agendaEntry.goal,
+                )
+                AgentProcessStatusCode.RUNNING
+            }
+        }
+    }
 
     override fun terminateAgent(reason: String) {
         // Cascade to children first
@@ -326,55 +730,73 @@ abstract class AbstractAgentProcess(
             return this
         }
 
-        if (agent.goals.isEmpty() && processOptions.plannerType.needsGoals) {
+        if (
+            agent.goals.isEmpty() &&
+            processOptions.evolution.agendaCatalog.entries.isEmpty() &&
+            processOptions.plannerType.needsGoals
+        ) {
             logger.info("🛑 Process {} has no goals: {}", this.id, agent.goals)
             error("Agent ${agent.name} has no goals: ${agent.infoString(verbose = true)}")
         }
 
-        tick()
-
-        while (status == AgentProcessStatusCode.RUNNING) {
-            val earlyTermination = identifyEarlyTermination()
-            if (earlyTermination != null) {
-                return this
-            }
+        var replanAfterStuckHandling: Boolean
+        do {
+            replanAfterStuckHandling = false
             tick()
-        }
-        when (status) {
-            AgentProcessStatusCode.NOT_STARTED -> {
-                logger.debug("Process {} is not started: {}", this.id, status)
+            while (status == AgentProcessStatusCode.RUNNING) {
+                val earlyTermination = identifyEarlyTermination()
+                if (earlyTermination != null) {
+                    return this
+                }
+                tick()
             }
+            when (status) {
+                AgentProcessStatusCode.NOT_STARTED -> {
+                    logger.debug("Process {} is not started: {}", this.id, status)
+                }
 
-            AgentProcessStatusCode.RUNNING -> {
-                logger.debug("Process {} is happily running: {}", this.id, status)
-            }
+                AgentProcessStatusCode.RUNNING -> {
+                    logger.debug("Process {} is happily running: {}", this.id, status)
+                }
 
-            AgentProcessStatusCode.COMPLETED -> {
-                platformServices.eventListener.onProcessEvent(AgentProcessCompletedEvent(this))
-            }
+                AgentProcessStatusCode.COMPLETED -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessCompletedEvent(this))
+                }
 
-            AgentProcessStatusCode.FAILED -> {
-                platformServices.eventListener.onProcessEvent(AgentProcessFailedEvent(this))
-            }
+                AgentProcessStatusCode.FAILED -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessFailedEvent(this))
+                }
 
-            AgentProcessStatusCode.TERMINATED, AgentProcessStatusCode.KILLED -> {
-                // Event will have been raised at the point of termination
-            }
+                AgentProcessStatusCode.TERMINATED -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessTerminatedEvent(this))
+                }
 
-            AgentProcessStatusCode.WAITING -> {
-                platformServices.eventListener.onProcessEvent(AgentProcessWaitingEvent(this))
-            }
+                AgentProcessStatusCode.KILLED -> {
+                    // Event will have been raised at the point of kill
+                }
 
-            AgentProcessStatusCode.PAUSED -> {
-                platformServices.eventListener.onProcessEvent(AgentProcessPausedEvent(this))
-                handleStuck(agent)
-            }
+                AgentProcessStatusCode.WAITING -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessWaitingEvent(this))
+                }
 
-            AgentProcessStatusCode.STUCK -> {
-                platformServices.eventListener.onProcessEvent(AgentProcessStuckEvent(this))
-                handleStuck(agent)
+                AgentProcessStatusCode.PAUSED -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessPausedEvent(this))
+                    replanAfterStuckHandling = handleStuck(agent)
+                }
+
+                AgentProcessStatusCode.STUCK -> {
+                    platformServices.eventListener.onProcessEvent(AgentProcessStuckEvent(this))
+                    replanAfterStuckHandling = handleStuck(agent)
+                }
             }
-        }
+            if (replanAfterStuckHandling) {
+                val earlyTermination = identifyEarlyTermination()
+                if (earlyTermination != null) {
+                    return this
+                }
+                setStatus(AgentProcessStatusCode.RUNNING)
+            }
+        } while (replanAfterStuckHandling)
         return this
     }
 
@@ -428,7 +850,7 @@ abstract class AbstractAgentProcess(
     /**
      * Try to resolve a stuck process using StuckHandler if provided
      */
-    protected fun handleStuck(agent: Agent) {
+    protected fun handleStuck(agent: Agent): Boolean {
         val stuckHandler = agent.stuckHandler
         if (stuckHandler == null) {
             if (processOptions.plannerType.needsGoals) {
@@ -442,24 +864,25 @@ abstract class AbstractAgentProcess(
                 // This is not an error. It's a common state for chatbots, for example.
                 logger.debug("Process {} is paused, with no available actions", this.id)
             }
-            return
+            return false
         }
         val result = stuckHandler.handleStuck(this)
         platformServices.eventListener.onProcessEvent(result)
-        when (result.code) {
+        return when (result.code) {
             StuckHandlingResultCode.REPLAN -> {
                 if (finished) {
                     logger.info("Process {} is {} during stuck handling, will not replan", this.id, status)
-                    return
+                    false
+                } else {
+                    logger.info("Process {} unstuck and will replan: {}", this.id, result.message)
+                    true
                 }
-                logger.info("Process {} unstuck and will replan: {}", this.id, result.message)
-                setStatus(AgentProcessStatusCode.RUNNING)
-                run()
             }
 
             StuckHandlingResultCode.NO_RESOLUTION -> {
                 logger.warn("Process {} stuck: {}", this.id, result.message)
                 setStatus(AgentProcessStatusCode.STUCK)
+                false
             }
         }
     }
@@ -469,6 +892,18 @@ abstract class AbstractAgentProcess(
             return this
         }
 
+        if (shouldRunEvolutionCycle()) {
+            expireAgenda(Instant.now())
+            activateAgendaEntries(
+                activationKey = null,
+                sourceFact = null,
+            )
+            drainIngress()
+            if (applyCompletionPolicy()) {
+                platformServices.agentProcessRepository.update(this)
+                return this
+            }
+        }
         val worldState = worldStateDeterminer.determineWorldState()
         _lastWorldState = worldState
         platformServices.eventListener.onProcessEvent(

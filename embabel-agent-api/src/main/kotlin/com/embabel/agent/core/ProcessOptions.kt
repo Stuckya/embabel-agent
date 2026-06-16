@@ -213,6 +213,7 @@ constructor(
  * @param toolCallContext out-of-band metadata (e.g., auth tokens, tenant IDs) passed to tools
  * at call time. This context is propagated to all tools, including MCP tools where it bridges
  * to Spring AI's ToolContext and ultimately to MCP's McpMeta.
+ * @param evolution options for evolving the process agenda at process seams.
  */
 data class ProcessOptions @JvmOverloads constructor(
     val contextId: ContextId? = null,
@@ -231,6 +232,7 @@ data class ProcessOptions @JvmOverloads constructor(
     val outputChannel: OutputChannel = DevNullOutputChannel,
     val plannerType: PlannerType = PlannerType.GOAP,
     val toolCallContext: ToolCallContext = ToolCallContext.EMPTY,
+    val evolution: EvolutionOptions = EvolutionOptions(),
 ) {
 
     /**
@@ -301,6 +303,9 @@ data class ProcessOptions @JvmOverloads constructor(
      */
     fun withToolCallContext(context: Map<String, Any>): ProcessOptions =
         this.copy(toolCallContext = ToolCallContext.of(context))
+
+    fun withEvolution(evolution: EvolutionOptions): ProcessOptions =
+        this.copy(evolution = evolution)
 
     companion object {
 

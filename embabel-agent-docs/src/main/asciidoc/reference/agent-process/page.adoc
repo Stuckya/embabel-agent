@@ -138,11 +138,119 @@ val processOptions = ProcessOptions()
 
 See <<reference.tools__tool-call-context>> for how tools receive this context.
 
+[[reference.agent-process__evolution-options]]
+==== EvolutionOptions
+
+`ProcessOptions` can also carry `EvolutionOptions`, an experimental overlay for
+evolving a process agenda at process seams.
+The agenda is projected into the effective planning system for the process; it
+does not mutate the agent's declared goals.
+
+`GoalAgenda` is immutable.
+Use `withEntry`, `withoutEntry`, or `expire` to produce a new agenda.
+`EvolutionOptions.agendaCatalog` is an activatable catalog: entries without an
+`activationKey` are activated at a process seam, and keyed entries are activated
+when matching blackboard ingress is drained.
+Runtime code can also propose entries directly with `AgentProcess.addAgendaEntry`.
+An `AgendaEntryApprover` can approve or veto either path.
+Once activated, an entry is projected into the process planning system without
+adding a new planner type.
+The selected process goal is an `AgendaPlanningGoal`, whose `entry` exposes the
+agenda id, bindings, lane, source, and completion mode.
+If any active entry is in the `SAFETY` lane, safety entries are planned before
+economic entries.
+
+Agenda completion is controlled by `AgendaCompletionMode`.
+`TERMINAL` completes the process when the entry's goal is satisfied.
+`COMPOSITE_TERMINAL` completes the process only when its completion predicate is
+satisfied.
+`RESUMABLE` removes the satisfied entry and lets the process re-arbitrate.
+`KEEP_ALIVE` keeps the process running rather than completing it.
+
+`CompletionPolicy` is separate from `EarlyTerminationPolicy`.
+It returns a `ProcessOutcome`, available from `AgentProcess.outcome`.
+`COMPLETED` maps to a completed process.
+`EXHAUSTED` and `CANCELLED` map to a terminated process.
+A drained resumable agenda with no remaining plan is exhausted rather than stuck.
+
+The following Java snippet is from `EvolutionOptionsJavaTest`:
+
+[source,java]
+----
+Goal goal = Goal.createInstance("Handle Java evolution result", JavaEvolutionResult.class, "java-evolution-goal");
+AgendaEntry entry = new AgendaEntry(
+    "java-entry",
+    goal,
+    Map.of("tenant", "test"),
+    "java-test",
+    AgendaLane.ECONOMIC,
+    AgendaCompletionMode.TERMINAL,
+    "java-activation",
+    null,
+    Instant.now()
+);
+AgendaEntryApprover approver = request -> new AgendaEntryApproved(request);
+EvolutionOptions evolution = new EvolutionOptions(
+    GoalAgenda.EMPTY.withEntry(entry),
+    approver
+);
+
+ProcessOptions options = ProcessOptions.DEFAULT.withEvolution(evolution);
+----
+
+The following Kotlin snippet is from `EvolvingProcessModeTest`:
+
+[source,kotlin]
+----
+val safetyEntry = AgendaEntry(
+    id = "safety-entry",
+    goal = safetyGoal,
+    source = "test",
+    lane = AgendaLane.SAFETY,
+    completionMode = AgendaCompletionMode.TERMINAL,
+    activationKey = "danger",
+)
+
+val agentProcess = SimpleAgentProcess(
+    id = "test-evolving-agenda",
+    agent = EvolvingAgendaAgent,
+    processOptions = ProcessOptions().withEvolution(
+        EvolutionOptions(
+            agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+        )
+    ),
+    blackboard = blackboard,
+    platformServices = dummyPlatformServices(),
+    plannerFactory = DefaultPlannerFactory,
+    parentId = null,
+)
+
+agentProcess.ingress.publish(
+    SafetySignal("danger"),
+    IngressOptions(activationKey = "danger"),
+)
+----
+
+The following completion-policy snippet is from `EvolvingProcessModeTest`:
+
+[source,kotlin]
+----
+EvolutionOptions(
+    completionPolicy = CompletionPolicy { _, _ ->
+        ProcessOutcome(
+            code = outcomeCode,
+            reason = "policy selected $outcomeCode",
+        )
+    },
+)
+
+agentProcess.run()
+
+assertEquals(outcomeCode, agentProcess.outcome.code)
+----
+
 
 [graphviz, embabel_execution_context.dot, png]
 ----
 include::../diagrams/architecture/embabel_execution_context.dot[]
 ----
-
-
-

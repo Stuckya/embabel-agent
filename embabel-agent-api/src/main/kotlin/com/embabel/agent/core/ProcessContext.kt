@@ -34,6 +34,13 @@ data class ProcessContext(
     processOptions.listeners + platformServices.eventListener,
 ) {
 
+    val cancellationToken: ProcessCancellationToken
+        get() = (agentProcess as? ProcessCancellationTokenProvider)?.cancellationToken
+            ?: ProcessCancellationToken.NONE
+
+    val ingress: BlackboardIngress
+        get() = agentProcess.ingress
+
     val blackboard: Blackboard
         get() = agentProcess
 }

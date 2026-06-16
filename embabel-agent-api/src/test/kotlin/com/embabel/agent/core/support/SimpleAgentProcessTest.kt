@@ -24,12 +24,23 @@ import com.embabel.agent.api.common.StuckHandlingResultCode
 import com.embabel.agent.api.dsl.Frog
 import com.embabel.agent.api.dsl.agent
 import com.embabel.agent.api.dsl.evenMoreEvilWizard
+import com.embabel.agent.api.event.AgentProcessReadyToPlanEvent
+import com.embabel.agent.api.event.BlackboardIngressDrainedEvent
+import com.embabel.agent.api.event.BlackboardIngressHiddenEvent
+import com.embabel.agent.api.event.BlackboardIngressHideReason
+import com.embabel.agent.api.event.BlackboardIngressPublishedEvent
 import com.embabel.agent.api.event.ObjectAddedEvent
 import com.embabel.agent.api.event.ObjectBoundEvent
 import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EarlyTermination
+import com.embabel.agent.core.EarlyTerminationPolicy
 import com.embabel.agent.core.IoBinding
+import com.embabel.agent.core.IngressMode
+import com.embabel.agent.core.IngressOptions
+import com.embabel.agent.core.IngressWake
+import com.embabel.agent.core.ProcessControl
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.hitl.ConfirmationRequest
 import com.embabel.agent.core.hitl.confirm
@@ -42,11 +53,14 @@ import com.embabel.agent.test.common.EventSavingAgenticEventListener
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServices
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import java.io.IOException
+import java.time.Duration
+import java.util.concurrent.atomic.AtomicInteger
 
 @com.embabel.agent.api.annotation.Agent(
     description = "waiting agent",
@@ -289,6 +303,60 @@ class SimpleAgentProcessTest {
             )
         }
 
+        @Test
+        fun `repeated stuck replans consult termination policy without recursive stack growth`() {
+            val listener = EventSavingAgenticEventListener()
+            val stuckHandlerCalls = AtomicInteger()
+            val maxRunFrames = AtomicInteger()
+            val terminateAfterFourStuckReplans = object : EarlyTerminationPolicy {
+                override fun shouldTerminate(agentProcess: AgentProcess): EarlyTermination? =
+                    if (
+                        agentProcess.status == AgentProcessStatusCode.STUCK &&
+                        stuckHandlerCalls.get() >= 4
+                    ) {
+                        EarlyTermination(
+                            agentProcess = agentProcess,
+                            error = false,
+                            reason = "Repeated stuck replan budget reached",
+                            policy = this,
+                        )
+                    } else null
+            }
+            val stuckHandler = StuckHandler {
+                stuckHandlerCalls.incrementAndGet()
+                val runFrames = Thread.currentThread().stackTrace.count {
+                    it.className == AbstractAgentProcess::class.java.name && it.methodName == "run"
+                }
+                maxRunFrames.updateAndGet { previous -> maxOf(previous, runFrames) }
+                StuckHandlerResult(
+                    message = "Try again",
+                    handler = null,
+                    code = StuckHandlingResultCode.REPLAN,
+                    agentProcess = it,
+                )
+            }
+            val agentProcess = SimpleAgentProcess(
+                id = "test",
+                agent = DslWaitingAgent.copy(stuckHandler = stuckHandler),
+                processOptions = ProcessOptions().withProcessControl(
+                    ProcessControl(earlyTerminationPolicy = terminateAfterFourStuckReplans)
+                ),
+                blackboard = InMemoryBlackboard(),
+                platformServices = dummyPlatformServices(listener),
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+            )
+            val result = agentProcess.run()
+
+            assertEquals(AgentProcessStatusCode.TERMINATED, result.status)
+            assertEquals(4, stuckHandlerCalls.get())
+            assertEquals(1, maxRunFrames.get())
+            assertEquals(
+                4,
+                listener.processEvents.filterIsInstance<AgentProcessReadyToPlanEvent>().size,
+            )
+        }
+
         private fun unstick(agent: Agent) {
             var called = false
             val stuckHandler = StuckHandler {
@@ -323,6 +391,139 @@ class SimpleAgentProcessTest {
             return agentProcess.run()
         }
 
+    }
+
+    @Nested
+    inner class BlackboardIngress {
+
+        @Test
+        fun `publish queues typed facts until tick drains ingress`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            val agentProcess = createProcess(listener, blackboard)
+            val dog = Dog("Duke")
+
+            val receipt = agentProcess.processContext.ingress.publish(
+                dog,
+                IngressOptions(activationKey = "dog-arrived"),
+            )
+
+            assertEquals(Dog::class.java.name, receipt.factType)
+            assertFalse(blackboard.objects.contains(dog))
+
+            val result = agentProcess.tick()
+
+            assertEquals(AgentProcessStatusCode.STUCK, result.status)
+            assertTrue(blackboard.objects.contains(dog))
+            assertEquals(true, blackboard.getCondition("dog-arrived"))
+
+            val published = listener.processEvents.filterIsInstance<BlackboardIngressPublishedEvent>().single()
+            val drained = listener.processEvents.filterIsInstance<BlackboardIngressDrainedEvent>().single()
+            assertEquals(receipt, published.receipt)
+            assertEquals(receipt, drained.receipt)
+            assertEquals(dog, drained.fact)
+        }
+
+        @Test
+        fun `pending ingress coalesces by key before drain`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            val agentProcess = createProcess(listener, blackboard)
+            val first = Dog("Duke")
+            val second = Dog("Monty")
+
+            agentProcess.ingress.publish(first, IngressOptions(coalesceKey = "dog"))
+            val secondReceipt = agentProcess.ingress.publish(second, IngressOptions(coalesceKey = "dog"))
+
+            agentProcess.tick()
+
+            assertFalse(blackboard.objects.contains(first))
+            assertTrue(blackboard.objects.contains(second))
+            assertEquals(
+                listOf(secondReceipt),
+                listener.processEvents.filterIsInstance<BlackboardIngressDrainedEvent>().map { it.receipt },
+            )
+        }
+
+        @Test
+        fun `latest ingress hides older visible facts with same key`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            val agentProcess = createProcess(listener, blackboard)
+            val first = Dog("Duke")
+            val second = Dog("Monty")
+
+            val firstReceipt = agentProcess.ingress.publish(
+                first,
+                IngressOptions(mode = IngressMode.LATEST, coalesceKey = "dog"),
+            )
+            agentProcess.tick()
+            val secondReceipt = agentProcess.ingress.publish(
+                second,
+                IngressOptions(mode = IngressMode.LATEST, coalesceKey = "dog"),
+            )
+            agentProcess.tick()
+
+            assertFalse(blackboard.objects.contains(first))
+            assertTrue(blackboard.objects.contains(second))
+            val hidden = listener.processEvents.filterIsInstance<BlackboardIngressHiddenEvent>().single()
+            assertEquals(firstReceipt, hidden.receipt)
+            assertEquals(secondReceipt, hidden.replacementReceipt)
+            assertEquals(BlackboardIngressHideReason.LATEST_REPLACED, hidden.reason)
+        }
+
+        @Test
+        fun `ttl expiry hides fact at process seam and emits event`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            val agentProcess = createProcess(listener, blackboard)
+            val dog = Dog("Duke")
+
+            val receipt = agentProcess.ingress.publish(
+                dog,
+                IngressOptions(ttl = Duration.ZERO),
+            )
+
+            agentProcess.tick()
+
+            assertFalse(blackboard.objects.contains(dog))
+            val hidden = listener.processEvents.filterIsInstance<BlackboardIngressHiddenEvent>().single()
+            assertEquals(receipt, hidden.receipt)
+            assertEquals(dog, hidden.fact)
+            assertEquals(BlackboardIngressHideReason.TTL_EXPIRED, hidden.reason)
+        }
+
+        @Test
+        fun `safety preempt ingress trips cancellation token before process seam`() {
+            val blackboard = InMemoryBlackboard()
+            val agentProcess = createProcess(EventSavingAgenticEventListener(), blackboard)
+            val dog = Dog("Duke")
+
+            agentProcess.ingress.publish(
+                dog,
+                IngressOptions(wake = IngressWake.SAFETY_PREEMPT),
+            )
+
+            assertTrue(agentProcess.processContext.cancellationToken.isCancellationRequested)
+            assertFalse(blackboard.objects.contains(dog))
+
+            agentProcess.tick()
+
+            assertTrue(blackboard.objects.contains(dog))
+        }
+
+        private fun createProcess(
+            listener: EventSavingAgenticEventListener,
+            blackboard: InMemoryBlackboard,
+        ) = SimpleAgentProcess(
+            id = "test",
+            agent = DslWaitingAgent,
+            processOptions = ProcessOptions(),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(listener),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
     }
 
     @Nested
