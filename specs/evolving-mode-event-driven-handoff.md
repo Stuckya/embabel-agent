@@ -76,20 +76,23 @@ EvolvingInvocation.on(agentPlatform)
     ))
     .withEventSource(domainEvents)  // Optional adapter over fact ingress
     .withEvolution(evolution -> evolution
-        .onFact(StorageNeeded.class)
-            .addRuntimeGoal(StorageCompleted.class)
-            .lane(Lane.ECONOMIC)
+        .onFact(BufferFlushNeeded.class)
+            .addRuntimeGoal(BufferFlushed.class)
             .resumable()
 
         .onFact(HazardDetected.class)
             .addRuntimeGoal(HazardHandled.class)
-            .lane(Lane.SAFETY)
-            .preemptive()
+            .interrupt()
+
+        .onFact(TransientOpportunity.class)
+            .addRuntimeGoal(OpportunityHandled.class)
+            .resumable()
+            .expires(Duration.ofSeconds(30))
     )
     .run(objective);
 ```
 
-`.addRuntimeGoal(StorageCompleted.class)` compiles to a process-local agenda
+`.addRuntimeGoal(BufferFlushed.class)` compiles to a process-local agenda
 entry wrapping a canonical goal from the active scope. Ambiguous output-type
 matches should fail unless the rule names the declared goal explicitly.
 
@@ -128,7 +131,7 @@ World-affecting action:
 Fact derivation:
   BufferSnapshot -> BufferFull
   Objective -> StorageDestination
-  BufferFull + StorageDestination -> StorageNeeded
+  BufferFull + StorageDestination -> BufferFlushNeeded
 ```
 
 A world-affecting action should be planner-selected.
@@ -147,12 +150,12 @@ Possible API:
 
 ```java
 @DerivesFact
-Optional<StorageNeeded> storageNeeded(
+Optional<BufferFlushNeeded> bufferFlushNeeded(
     BufferSnapshot buffer,
     StorageDestination destination
 ) {
     return buffer.isFull()
-        ? Optional.of(new StorageNeeded(destination))
+        ? Optional.of(new BufferFlushNeeded(destination))
         : Optional.empty();
 }
 ```
@@ -166,7 +169,7 @@ Framework-owned lifecycle:
 - no external side effects
 - does not compete with planner-selected actions
 
-This removes sentinel facts such as `StorageNeeded.none()` and manual lifecycle
+This removes sentinel facts such as `BufferFlushNeeded.none()` and manual lifecycle
 APIs such as `clearActivationKey("buffer-full")`.
 
 ## Fact Derivation Is A Dataflow Graph
@@ -175,7 +178,7 @@ The examples are already chained:
 
 ```text
 Objective -> StorageDestination
-BufferSnapshot + StorageDestination -> StorageNeeded
+BufferSnapshot + StorageDestination -> BufferFlushNeeded
 ```
 
 That means `@DerivesFact` is not just "run all derivations." It is a small
@@ -197,7 +200,7 @@ unclear retraction semantics.
 `Optional<T>` is a good shape for singleton level facts:
 
 ```text
-BufferSnapshot(full) -> Optional<StorageNeeded>
+BufferSnapshot(full) -> Optional<BufferFlushNeeded>
 BufferSnapshot(notFull) -> Optional.empty()
 ```
 
@@ -232,8 +235,8 @@ Avoid:
 
 ```java
 @DerivesFact
-StorageNeeded storageNeeded(BufferSnapshot buffer, CollectSamplesUntil objective) {
-    return new StorageNeeded(objective.storageDestination());
+BufferFlushNeeded bufferFlushNeeded(BufferSnapshot buffer, CollectSamplesUntil objective) {
+    return new BufferFlushNeeded(objective.storageDestination());
 }
 ```
 
@@ -246,12 +249,12 @@ StorageDestination storageDestination(CollectSamplesUntil objective) {
 }
 
 @DerivesFact
-Optional<StorageNeeded> storageNeeded(
+Optional<BufferFlushNeeded> bufferFlushNeeded(
     BufferSnapshot buffer,
     StorageDestination destination
 ) {
     return buffer.isFull()
-        ? Optional.of(new StorageNeeded(destination))
+        ? Optional.of(new BufferFlushNeeded(destination))
         : Optional.empty();
 }
 ```
@@ -266,10 +269,10 @@ Objective facts:
   Objective -> StorageDestination
 
 Need derivation:
-  BufferFull + StorageDestination -> StorageNeeded
+  BufferFull + StorageDestination -> BufferFlushNeeded
 
 Storage capability:
-  StorageNeeded -> ArrivedAt -> StorageCompleted
+  BufferFlushNeeded -> ArrivedAt -> BufferFlushed
 ```
 
 This keeps reusable capability modules objective-agnostic.
@@ -283,10 +286,9 @@ Preferred:
 
 ```java
 .withEvolution(evolution -> evolution
-    .onFact(StorageNeeded.class)
-        .addRuntimeGoal(StorageCompleted.class)
-        .includeFact(StorageNeeded.class)
-        .lane(Lane.ECONOMIC)
+    .onFact(BufferFlushNeeded.class)
+        .addRuntimeGoal(BufferFlushed.class)
+        .includeFact(BufferFlushNeeded.class)
         .resumable()
 )
 ```
@@ -316,74 +318,78 @@ planner satisfies runtime goals
 
 The lifecycle of runtime goals should be framework-owned.
 
-When an evolution rule says `StorageNeeded -> StorageCompleted runtime goal`,
-the framework should define what happens when `StorageNeeded` disappears.
+When an evolution rule says `BufferFlushNeeded -> BufferFlushed runtime goal`,
+the framework should define what happens when `BufferFlushNeeded` disappears.
 
 Recommended default:
 
 - when the source fact retracts, stop planning new work toward the runtime goal
 - do not interrupt an active action by default
-- interrupt only when the rule is safety/preemptive or explicitly configured to
-  cancel on retraction
+- interrupt only when the rule is marked `interrupt()` or explicitly configured
+  to cancel on retraction
 
 This cannot be left to consumer-side `none()` facts or manual clear calls.
 
-## Execution-Level Preemption
+## Execution-Level Interrupts
 
-Plan-level preemption is not enough.
+Plan-level selection is not enough for interrupting work.
 
-If `HazardDetected` arrives while a long-running economic action is already
-executing, it is not enough for the next plan to prefer the safety goal. The
-running action must have a way to yield or be interrupted.
+If `HazardDetected` arrives while a long-running ordinary action is already
+executing, it is not enough for the next plan to prefer `HazardHandled`. The
+running action must have a way to yield or be interrupted at a cooperative
+checkpoint.
 
 The same issue applies when a runtime goal is retracted mid-action. For example,
-`StorageNeeded` might disappear while `navigateToStorage` is still running.
+`BufferFlushNeeded` might disappear while `navigateToDestination` is still
+running.
 
 Evolving Mode therefore needs an execution-level interrupt contract in addition
 to runtime goal arbitration:
 
-- long-running actions observe a cancellation/preemption signal
+- long-running actions observe a cancellation/interrupt signal
 - actions define safe yield checkpoints
-- safety lane preemption trips that signal
+- an `interrupt()` runtime goal trips that signal
 - the process replans after the action exits at a checkpoint
 
 Acceptance test to add:
 
 ```text
-Given a long-running economic action is executing
-When a safety fact enters the process
-Then the economic action exits within N ticks/checkpoints
-And the safety runtime goal is planned next
+Given a long-running ordinary action is executing
+When a hazard fact enters the process
+Then the ordinary action exits within N ticks/checkpoints
+And the interrupting runtime goal is planned next
 ```
 
-Without this test, "safety preempts economic work" can pass at the planner level
+Without this test, "hazards interrupt ordinary work" can pass at the planner level
 while failing in real behavior.
 
-## Priority Model
+## Runtime Goal Behavior Vocabulary
 
-Avoid global numeric priority as the default.
+Avoid global numeric priority as the default. Evolving Mode should change the
+effective planning system visible to GOAP, Utility, or Hybrid planners rather
+than introduce a second planner-independent scoring model.
 
-This becomes cross-skill calibration debt:
-
-```java
-priority(Priority.economic(60))
-priority(Priority.opportunity(70))
-```
-
-Prefer lanes plus small local ordering:
+Use lifecycle and execution behavior instead:
 
 ```java
-.lane(Lane.SAFETY)
-.order(Order.URGENT)
-
-.lane(Lane.ECONOMIC)
-.order(Order.NORMAL)
-
-.lane(Lane.OPPORTUNITY)
-.order(Order.LOW)
+.resumable()
+.terminal()
+.interrupt()
+.expires(Duration.ofSeconds(30))
 ```
 
-Safety should be able to preempt economic work without relying on numeric tuning.
+Suggested meanings:
+
+- `resumable()`: completion removes this runtime goal and the process
+  re-arbitrates remaining work
+- `terminal()`: completion can complete the process or parent objective
+- `interrupt()`: this runtime goal may request cooperative interruption of
+  in-flight work at checkpoints
+- `expires(Duration)`: remove this runtime goal if it remains incomplete past
+  the duration
+
+Advanced planner-specific ranking or value policies can still exist below this
+interface, but they should not be the default Evolving Mode vocabulary.
 
 ## Side-Effect Discipline
 
@@ -397,7 +403,7 @@ Bad:
 
 ```java
 @DerivesFact
-ArrivedAt arrived(StorageNeeded need) {
+ArrivedAt arrived(BufferFlushNeeded need) {
     return navigation.advanceToward(need.destination());
 }
 ```
@@ -406,7 +412,7 @@ Good:
 
 ```java
 @Action
-NavigationProgress navigate(StorageNeeded need) {
+NavigationProgress navigate(BufferFlushNeeded need) {
     return navigation.advanceToward(need.destination());
 }
 ```
@@ -436,8 +442,8 @@ The public model should be facts and runtime goals, not latches.
    - duplicate behavior is explicit and tested
 
 3. Fact derivation creates and retracts singleton facts
-   - `BufferSnapshot(full)` derives `StorageNeeded`
-   - `BufferSnapshot(notFull)` retracts previous `StorageNeeded`
+   - `BufferSnapshot(full)` derives `BufferFlushNeeded`
+   - `BufferSnapshot(notFull)` retracts previous `BufferFlushNeeded`
    - no manual clear call
 
 4. Fact derivation handles keyed sets
@@ -446,18 +452,18 @@ The public model should be facts and runtime goals, not latches.
    - only the matching keyed fact is retracted
 
 5. Runtime goal follows fact lifecycle
-   - `StorageNeeded` creates `StorageCompleted` runtime goal
-   - when `StorageNeeded` disappears, the runtime goal follows the configured
+   - `BufferFlushNeeded` creates `BufferFlushed` runtime goal
+   - when `BufferFlushNeeded` disappears, the runtime goal follows the configured
      lifecycle rule
 
 6. Derivations do not compete with actions
    - a collecting action can continue running
    - derivation still updates facts at planning ticks
 
-7. Execution-level safety preemption
-   - a safety fact arrives during a long-running economic action
-   - the economic action exits within N ticks/checkpoints
-   - the safety runtime goal is planned next
+7. Execution-level interrupt
+   - a hazard fact arrives during a long-running ordinary action
+   - the ordinary action exits within N ticks/checkpoints
+   - the interrupting runtime goal is planned next
 
 8. Planner composes across capabilities
    - collection capability emits or depends on generic facts
