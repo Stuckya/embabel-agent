@@ -59,7 +59,7 @@ class AbstractAgentProcessTerminationRaceTest {
         val process = newProcess()
 
         // Post signal-A
-        process.terminateAction("signal-A")
+        process.terminateAgent("signal-A")
         val observed = process.terminationRequest!!
         assertEquals("signal-A", observed.reason)
 
@@ -88,12 +88,12 @@ class AbstractAgentProcessTerminationRaceTest {
         val process = newProcess()
 
         // t=0 — consumer observes signal-A
-        process.terminateAction("signal-A")
+        process.terminateAgent("signal-A")
         val observedByConsumer = process.terminationRequest!!
         assertEquals("signal-A", observedByConsumer.reason)
 
         // t=1 — another writer overwrites with signal-B
-        process.terminateAction("signal-B")
+        process.terminateAgent("signal-B")
 
         // t=2 — consumer attempts a CAS reset against the signal it observed (A).
         //       Slot now holds B, so CAS must fail and leave B untouched.
@@ -115,7 +115,7 @@ class AbstractAgentProcessTerminationRaceTest {
     fun `multi-thread - unconditional reset across threads clobbers concurrent signal`() {
         val process = newProcess()
         // Seed the slot: both threads will start from slot = signal-A.
-        process.terminateAction("signal-A")
+        process.terminateAgent("signal-A")
 
         // Two rendezvous points (each blocks both threads until both arrive).
         // We use them to force the exact interleave we want to prove buggy,
@@ -164,7 +164,7 @@ class AbstractAgentProcessTerminationRaceTest {
                 afterConsumerRead.await(5, TimeUnit.SECONDS)
 
                 // (F) Post signal-B — slot transitions A → B.
-                process.terminateAction("signal-B")
+                process.terminateAgent("signal-B")
 
                 // (G) Tell the consumer "B is in the slot, you can now do your reset".
                 afterExternalWrite.await(5, TimeUnit.SECONDS)

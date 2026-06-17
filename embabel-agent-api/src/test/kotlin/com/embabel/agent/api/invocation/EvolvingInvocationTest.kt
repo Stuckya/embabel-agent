@@ -24,6 +24,8 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.EvolutionOptions
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalAgenda
+import com.embabel.agent.core.IngressOptions
+import com.embabel.agent.core.IngressWake
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyAgentPlatform
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -38,6 +40,8 @@ data class SampleStored(val zone: String)
 data class CollectSamplesUntil(val zone: String, val target: Int)
 
 data class OutOfScopeResult(val name: String)
+
+data class CollectionActivated(val zone: String)
 
 val CollectionCapabilitiesAgent = agent("CollectionCapabilitiesAgent", description = "Tests evolving invocation") {
     transformation<SampleAvailable, SampleStored>(name = "collect-sample") {
@@ -109,6 +113,91 @@ class EvolvingInvocationTest {
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         assertEquals(SampleStored("zone-a"), result.lastResult())
         assertTrue(result.objects.contains(objective))
+    }
+
+    @Test
+    fun `createProcess prepares objective-authored evolution without starting it`() {
+        val agentPlatform = dummyAgentPlatform()
+        val objective = CollectSamplesUntil(zone = "zone-a", target = 1)
+        val scopeGoal = CollectionCapabilitiesAgent.goals.single {
+            it.outputType?.name == SampleStored::class.java.name
+        }
+        val forgedGoal = scopeGoal
+            .copy(pre = setOf("impossible-precondition"))
+            .withFixedValue(99.0)
+        val objectiveAuthor = ObjectiveAuthor { request ->
+            val collectSamplesUntil = request.objectiveAs<CollectSamplesUntil>()
+            ObjectivePlan(
+                id = "manual-collect-zone-a",
+                agendaEntries = listOf(
+                    AgendaEntry(
+                        id = "manual-collect-sample",
+                        goal = forgedGoal,
+                        activationKey = "collect-sample",
+                        completionMode = AgendaCompletionMode.TERMINAL,
+                    )
+                ),
+                initialFacts = listOf(SampleAvailable(collectSamplesUntil.zone)),
+            )
+        }
+
+        val process = EvolvingInvocation.on(agentPlatform)
+            .withScope(CollectionCapabilitiesAgent)
+            .withObjectiveAuthor(objectiveAuthor)
+            .createProcess(objective)
+
+        assertEquals(AgentProcessStatusCode.NOT_STARTED, process.status)
+        assertTrue(process.objects.contains(objective))
+        assertTrue(process.objects.contains(SampleAvailable("zone-a")))
+        assertEquals(scopeGoal, process.processOptions.evolution.agendaCatalog.entries.single().goal)
+
+        process.tick()
+        process.ingress.publish(
+            CollectionActivated("zone-a"),
+            IngressOptions(activationKey = "collect-sample", wake = IngressWake.WAKE),
+        )
+        process.tick()
+        process.tick()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, process.status)
+        assertEquals(SampleStored("zone-a"), process.lastResult())
+    }
+
+    @Test
+    fun `createProcess map prepares bindings and objective plan initial facts`() {
+        val agentPlatform = dummyAgentPlatform()
+        val scopeGoal = CollectionCapabilitiesAgent.goals.single {
+            it.outputType?.name == SampleStored::class.java.name
+        }
+        val objectiveAuthor = ObjectiveAuthor { request ->
+            @Suppress("UNCHECKED_CAST")
+            val bindings = request.objective as Map<String, Any>
+            ObjectivePlan(
+                id = "map-collect-zone-a",
+                agendaEntries = listOf(
+                    AgendaEntry(
+                        id = "map-collect-sample",
+                        goal = scopeGoal,
+                        completionMode = AgendaCompletionMode.TERMINAL,
+                    )
+                ),
+                initialFacts = listOf(SampleAvailable(bindings.getValue("zone") as String)),
+            )
+        }
+
+        val process = EvolvingInvocation.on(agentPlatform)
+            .withScope(CollectionCapabilitiesAgent)
+            .withObjectiveAuthor(objectiveAuthor)
+            .createProcess(mapOf("zone" to "zone-a"))
+
+        assertEquals(AgentProcessStatusCode.NOT_STARTED, process.status)
+        assertEquals("zone-a", process["zone"])
+        assertTrue(process.objects.contains(SampleAvailable("zone-a")))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(SampleStored("zone-a"), result.lastResult())
     }
 
     @Test

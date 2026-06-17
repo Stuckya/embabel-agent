@@ -229,6 +229,7 @@ class EmbeddingTrackingIntegrationTest(
                 // 500 000 × $0.02/1M = $0.01
                 assertEquals(0.01, agentProcess.totalCost(), 1e-9)
             } finally {
+                AgentProcessAccessor.reset()
                 executor.shutdown()
                 executor.awaitTermination(2, TimeUnit.SECONDS)
             }

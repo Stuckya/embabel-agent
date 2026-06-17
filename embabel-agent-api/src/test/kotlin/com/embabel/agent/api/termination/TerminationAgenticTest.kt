@@ -21,6 +21,7 @@ import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.dsl.Frog
 import com.embabel.agent.api.dsl.agent
 import com.embabel.agent.core.AgentProcess
+import com.embabel.agent.core.AgentProcessCallback
 import com.embabel.agent.api.tool.TerminateActionException
 import com.embabel.agent.api.tool.TerminateAgentException
 import com.embabel.agent.core.AgentProcessStatusCode
@@ -188,6 +189,31 @@ fun workerThreadCancellationTokenProbeAgent(
     goal(
         name = "worker_thread_probe_goal",
         description = "Observe current-action cancellation from a delegated worker thread",
+        satisfiedBy = WorkerThreadCancellationResult::class,
+    )
+}
+
+fun workerThreadProcessContextProbeAgent(
+    sawCancellation: AtomicBoolean,
+) = agent("WorkerThreadProcessContextProbe", description = "Agent with worker-thread process context probe") {
+    transformation<UserInput, WorkerThreadCancellationResult>(name = "worker_thread_process_context_probe") {
+        val delegatedContext = it.processContext
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            delegatedContext.terminateAction("current action cancellation")
+            val workerSawCancellation = executor.submit<Boolean> {
+                val token = delegatedContext.cancellationToken
+                token.isCancellationRequested && token.reason == "current action cancellation"
+            }.get(5, TimeUnit.SECONDS)
+            sawCancellation.set(workerSawCancellation)
+            WorkerThreadCancellationResult(workerSawCancellation)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+    goal(
+        name = "worker_thread_process_context_probe_goal",
+        description = "Observe current-action cancellation from delegated worker ProcessContext access",
         satisfiedBy = WorkerThreadCancellationResult::class,
     )
 }
@@ -395,6 +421,28 @@ class TerminationAgenticTest {
         }
 
         @Test
+        fun `terminateAction before process start does not cancel first action`() {
+            val sawCancellation = AtomicBoolean(false)
+            val blackboard = InMemoryBlackboard()
+            blackboard += UserInput("TestUser")
+            val agentProcess = SimpleAgentProcess(
+                id = "test-pre-start-action-cancellation",
+                agent = delayedCancellationProbeAgent(sawCancellation),
+                processOptions = ProcessOptions(),
+                blackboard = blackboard,
+                platformServices = dummyPlatformServices(),
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+            )
+
+            agentProcess.terminateAction("no active action before start")
+            val result = agentProcess.run()
+
+            assertThat(result.status).isEqualTo(AgentProcessStatusCode.COMPLETED)
+            assertThat(sawCancellation.get()).isFalse()
+        }
+
+        @Test
         fun `ACTION signal targeted during scheduled pause is cleared when action parks`() {
             val sawCancellation = AtomicBoolean(false)
             lateinit var agentProcess: SimpleAgentProcess
@@ -429,6 +477,27 @@ class TerminationAgenticTest {
             val agentProcess = SimpleAgentProcess(
                 id = "test-worker-thread-cancellation-token",
                 agent = workerThreadCancellationTokenProbeAgent(sawCancellation),
+                processOptions = ProcessOptions(),
+                blackboard = blackboard,
+                platformServices = dummyPlatformServices(),
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+            )
+
+            val result = agentProcess.run()
+
+            assertThat(result.status).isEqualTo(AgentProcessStatusCode.COMPLETED)
+            assertThat(sawCancellation.get()).isTrue()
+        }
+
+        @Test
+        fun `delegated process context observes current action termination from worker thread`() {
+            val sawCancellation = AtomicBoolean(false)
+            val blackboard = InMemoryBlackboard()
+            blackboard += UserInput("TestUser")
+            val agentProcess = SimpleAgentProcess(
+                id = "test-worker-thread-process-context-token",
+                agent = workerThreadProcessContextProbeAgent(sawCancellation),
                 processOptions = ProcessOptions(),
                 blackboard = blackboard,
                 platformServices = dummyPlatformServices(),
@@ -614,6 +683,54 @@ class TerminationAgenticTest {
 
                 assertThat(result.status).isEqualTo(AgentProcessStatusCode.COMPLETED)
                 assertThat(probe.siblingSawCancellation.get()).isFalse()
+            } finally {
+                actionExecutor.shutdownNow()
+            }
+        }
+
+        @Test
+        fun `terminateAction before concurrent actions have tokens does not cancel launched actions`() {
+            val sawCancellation = AtomicBoolean(false)
+            val blackboard = InMemoryBlackboard()
+            blackboard += UserInput("TestUser")
+            val actionExecutor = Executors.newSingleThreadExecutor()
+            val platformServices = (dummyPlatformServices() as SpringContextPlatformServices).copy(
+                asyncer = ExecutorAsyncer(actionExecutor),
+            )
+            val agentProcess = ConcurrentAgentProcess(
+                id = "test-empty-target-action-termination",
+                agent = delayedCancellationProbeAgent(sawCancellation),
+                processOptions = ProcessOptions(),
+                blackboard = blackboard,
+                platformServices = platformServices,
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+                callbacks = listOf(
+                    object : AgentProcessCallback {
+                        override fun beforeActionLaunched(process: AgentProcess) {
+                            process.terminateAction("no active actions yet")
+                        }
+
+                        override fun onActionLaunched(
+                            process: AgentProcess,
+                            action: com.embabel.agent.core.Action,
+                        ) {
+                        }
+
+                        override fun onActionCompleted(
+                            process: AgentProcess,
+                            action: com.embabel.agent.core.Action,
+                        ) {
+                        }
+                    }
+                ),
+            )
+
+            try {
+                val result = agentProcess.run()
+
+                assertThat(result.status).isEqualTo(AgentProcessStatusCode.COMPLETED)
+                assertThat(sawCancellation.get()).isFalse()
             } finally {
                 actionExecutor.shutdownNow()
             }

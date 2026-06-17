@@ -502,7 +502,7 @@ class SimpleAgentProcessTest {
         }
 
         @Test
-        fun `safety preempt ingress trips cancellation token before process seam`() {
+        fun `safety preempt ingress without active action does not create unscoped cancellation`() {
             val blackboard = InMemoryBlackboard()
             val agentProcess = createProcess(EventSavingAgenticEventListener(), blackboard)
             val dog = Dog("Duke")
@@ -512,7 +512,7 @@ class SimpleAgentProcessTest {
                 IngressOptions(wake = IngressWake.SAFETY_PREEMPT),
             )
 
-            assertTrue(agentProcess.processContext.cancellationToken.isCancellationRequested)
+            assertFalse(agentProcess.processContext.cancellationToken.isCancellationRequested)
             assertFalse(blackboard.objects.contains(dog))
 
             agentProcess.tick()

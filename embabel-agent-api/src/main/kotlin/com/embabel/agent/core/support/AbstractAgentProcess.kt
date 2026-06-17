@@ -181,8 +181,7 @@ abstract class AbstractAgentProcess(
         val request = _terminationRequest.get() ?: return false
         return when (request.signal.scope) {
             TerminationScope.AGENT -> true
-            TerminationScope.ACTION -> request.actionTokens.isEmpty() ||
-                    (actionToken?.let { it in request.actionTokens } ?: false)
+            TerminationScope.ACTION -> actionToken?.let { it in request.actionTokens } ?: false
         }
     }
 
@@ -605,6 +604,10 @@ abstract class AbstractAgentProcess(
     override fun terminateAction(reason: String) {
         val actionTokens = currentActionToken.get()?.let { setOf(it) }
             ?: activeActionTokens.toSet()
+        if (actionTokens.isEmpty()) {
+            logger.debug("Ignoring action termination request with no active action: {}", reason)
+            return
+        }
         setTerminationRequest(
             signal = TerminationSignal(TerminationScope.ACTION, reason),
             actionTokens = actionTokens,
@@ -1070,6 +1073,7 @@ abstract class AbstractAgentProcess(
         val actionToken = UUID.randomUUID().toString()
         activeActionTokens += actionToken
         currentActionToken.set(actionToken)
+        val actionProcessContext = processContext.withCancellationToken(cancellationToken)
         try {
             val actionExecutionStartEvent = ActionExecutionStartEvent(
                 agentProcess = this,
@@ -1129,7 +1133,7 @@ abstract class AbstractAgentProcess(
                             }
 
                             effectiveAction.execute(
-                                processContext = processContext,
+                                processContext = actionProcessContext,
                             )
                         }
                 }

@@ -34,9 +34,15 @@ data class ProcessContext(
     processOptions.listeners + platformServices.eventListener,
 ) {
 
+    private var cancellationTokenOverride: ProcessCancellationToken? = null
+
     val cancellationToken: ProcessCancellationToken
-        get() = (agentProcess as? ProcessCancellationTokenProvider)?.cancellationToken
+        get() = cancellationTokenOverride
+            ?: (agentProcess as? ProcessCancellationTokenProvider)?.cancellationToken
             ?: ProcessCancellationToken.NONE
+
+    internal fun withCancellationToken(cancellationToken: ProcessCancellationToken): ProcessContext =
+        copy().also { it.cancellationTokenOverride = cancellationToken }
 
     val ingress: BlackboardIngress
         get() = agentProcess.ingress

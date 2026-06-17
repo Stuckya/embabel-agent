@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+@file:JvmName("Nirvana")
+
 package com.embabel.agent.core.support
 
 import com.embabel.agent.core.Goal
@@ -23,6 +25,7 @@ import com.embabel.plan.utility.UtilityPlanner
  * It's important that this goal cannot be satisfied, to prevent the plan from completing prematurely.
  * A plan may complete by satisfying another goal, but not by reaching nirvana.
  */
+@JvmField
 val NIRVANA = Goal(
     name = UtilityPlanner.NIRVANA,
     description = "Nirvana: Nothing more to do",

@@ -156,6 +156,10 @@ The POC public interface is `EvolvingInvocation`, parallel to
 It implements the existing `ScopedInvocation` and `BaseInvocation` contracts,
 inheriting `withScope`, `withProcessOptions`, `withAgentName`, `run`, and
 `runAsync` rather than introducing a separate invocation shape.
+`run` and `runAsync` create and start the process.
+Reactive callers that need an unstarted process can use `createProcess`, publish
+ingress before or after the first tick, and then drive `tick` or `run`
+themselves.
 The objective-authoring seam is `ObjectiveAuthor`, avoiding collision with
 Embabel's existing planner abstraction.
 An `ObjectiveAuthor` receives an `ObjectiveAuthorRequest` containing the
@@ -213,6 +217,13 @@ running inside the process, while ingress is external async fact publication int
 a running process.
 Ingress is not a replacement for replanning; it covers the opposite direction of
 state change.
+For external world state, prefer explicit ingress semantics over permanent
+append-only boolean facts.
+Use `IngressMode.LATEST`, `coalesceKey`, and `ttl` when a visible fact should
+replace or expire older facts.
+Use `activationKey` when an event should activate a runtime agenda entry.
+Avoid relying on append-only facts as mutable booleans unless the hide or
+coalesce behavior is explicit.
 
 Agenda completion is controlled by `AgendaCompletionMode`.
 `TERMINAL` completes the process when the entry's goal is satisfied.
@@ -228,9 +239,10 @@ Future composite completion should decide whether it can be represented as a
 because it needs `AgentProcess`, `AgendaEntry`, and `GoalAgenda` context.
 
 `IngressWake.WAKE` makes a `WAITING`, `STUCK`, or `PAUSED` process runnable
-again. `IngressWake.SAFETY_PREEMPT` also trips the process cancellation token so
-cooperative blocking actions can exit at a checkpoint and the next process seam
-can re-arbitrate to any activated safety agenda entry.
+again. `IngressWake.SAFETY_PREEMPT` also targets currently active actions for
+cancellation so cooperative blocking actions can exit at a checkpoint and the
+next process seam can re-arbitrate to any activated safety agenda entry. If no
+action is active, it does not create a cancellation request for a future action.
 `SAFETY_PREEMPT` reuses existing termination machinery via
 `AgentProcess.terminateAction`, backed by
 `TerminationSignal(TerminationScope.ACTION)`.
@@ -251,17 +263,12 @@ The following Java snippet is from `EvolutionOptionsJavaTest`:
 [source,java]
 ----
 Goal goal = Goal.createInstance("Handle Java evolution result", JavaEvolutionResult.class, "java-evolution-goal");
-AgendaEntry entry = new AgendaEntry(
-    "java-entry",
-    goal,
-    Map.of("tenant", "test"),
-    "java-test",
-    AgendaLane.ECONOMIC,
-    AgendaCompletionMode.TERMINAL,
-    "java-activation",
-    null,
-    Instant.now()
-);
+AgendaEntry entry = AgendaEntry.of("java-entry", goal)
+    .withBindings(Map.of("tenant", "test"))
+    .withSource("java-test")
+    .withLane(AgendaLane.ECONOMIC)
+    .withCompletionMode(AgendaCompletionMode.TERMINAL)
+    .withActivationKey("java-activation");
 AgendaEntryApprover approver = request -> new AgendaEntryApproved(request);
 EvolutionOptions evolution = new EvolutionOptions(
     GoalAgenda.EMPTY.withEntry(entry),

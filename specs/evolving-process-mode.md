@@ -133,8 +133,27 @@ EvolvingInvocation.on(agentPlatform)
 use. `withEvolution(...)` is the low-level escape hatch backed by
 `EvolutionOptions`; it is useful for tests, explicit control, and advanced
 callers.
+`run(...)` and `runAsync(...)` create and start a process. Reactive systems that
+need to publish ingress before the first tick, or drive `tick()`/`run()` from an
+external loop, can call `createProcess(...)` to receive a configured but
+unstarted `AgentProcess`.
 Scope instances may be `@EmbabelComponent` or `@Agent` instances, including
 domain capability modules packaged with those annotations.
+
+Manual-drive shape, matching the POC test fixture:
+
+```kotlin
+val process = EvolvingInvocation.on(agentPlatform)
+    .withScope(CollectionCapabilitiesAgent)
+    .withObjectiveAuthor(objectiveAuthor)
+    .createProcess(CollectSamplesUntil(zone = "zone-a", target = 1))
+
+process.ingress.publish(
+    CollectionActivated("zone-a"),
+    IngressOptions(activationKey = "collect-sample", wake = IngressWake.WAKE),
+)
+process.tick()
+```
 
 ## LLM Objective Authoring
 
@@ -272,14 +291,26 @@ through the approver.
 `BlackboardIngress.publish` is safe to call from non-process threads. It queues
 pending ingress under lock and does not mutate the blackboard directly. Normal
 blackboard writes happen at process seams. `SAFETY_PREEMPT` is the narrow
-exception: it may signal the current action immediately so cooperative actions
-can exit at their next checkpoint.
+exception: it may signal currently active actions immediately so cooperative
+actions can exit at their next checkpoint. If no action is active, it does not
+create cancellation for a future action.
 
 `BlackboardIngress` is distinct from `ReplanRequestedException`.
 `ReplanRequestedException` is initiated by an action or tool loop that is already
 running inside the process. Ingress is external async fact publication into a
 running process. It is not reinventing replanning; it covers the opposite
 direction of state change.
+
+Consumer dogfooding found that append-only blackboard facts are a poor fit for
+mutable world-state booleans unless hiding, coalescing, or TTL semantics are
+explicit. Prefer one of these patterns:
+
+- use `IngressMode.LATEST`, `coalesceKey`, and `ttl` for external facts whose
+  visible state should replace or expire older facts
+- use `activationKey` when an external event should activate a runtime agenda
+  entry
+- avoid modeling toggled state as permanent append-only facts unless the
+  corresponding hide/coalesce rule is part of the design
 
 ### GoalAgenda
 
@@ -378,9 +409,11 @@ completion.
 ### ProcessCancellationToken
 
 `ProcessContext.cancellationToken` exposes a pollable token for blocking action
-code. `IngressWake.SAFETY_PREEMPT` trips an action-scope termination signal
-immediately, so cooperative blocking actions can exit at bounded checkpoints.
-The current primitive is `AgentProcess.terminateAction`, backed by
+code. During action execution, the action receives a `ProcessContext` whose
+token is scoped to that action and can be passed to delegated worker threads.
+`IngressWake.SAFETY_PREEMPT` trips action-scope termination signals for actions
+active at publish time, so cooperative blocking actions can exit at bounded
+checkpoints. The current primitive is `AgentProcess.terminateAction`, backed by
 `TerminationSignal(TerminationScope.ACTION)`.
 
 If an action returns normally after observing an action-scope termination signal,
@@ -411,7 +444,7 @@ to `RUNNING`. Terminal statuses remain terminal.
 Safety preempt is narrow:
 
 1. a fact is published with `IngressWake.SAFETY_PREEMPT`
-2. the action-scope termination signal is tripped immediately
+2. action-scope termination is signalled for actions active at publish time
 3. a cooperative in-flight action exits at a checkpoint
 4. ingress drains at the process seam
 5. any matching safety agenda entry activates
@@ -482,6 +515,9 @@ recoverable stuck path.
 The POC has focused tests for:
 
 - agenda projection without mutating `Agent.goals`
+- `EvolvingInvocation.createProcess(...)` creating an unstarted process with
+  objective-authored evolution, initial facts, canonicalized goals, and manual
+  ingress/tick control
 - activation keys and one-shot unkeyed catalog activation
 - direct runtime agenda addition and approval rejection
 - duplicate goal names distinguished by agenda entry identity and bindings
@@ -495,6 +531,8 @@ The POC has focused tests for:
 - safety preempt of a cooperative blocking action
 - Java construction of `EvolutionOptions`, `AgendaEntry`, and
   `AgendaEntryApprover`
+- Java use of `ObjectiveAuthorRequest.objectiveAs(Class<T>)`,
+  `AgendaEntry.of(...).with...`, and `Nirvana.NIRVANA`
 
 ## POC Boundary and Cleanup Direction
 
@@ -527,7 +565,7 @@ These should remain available as low-level escape hatches and test hooks, but
 normal users should enter through `EvolvingInvocation`, not manual agenda
 mutation.
 
-Revisit after the `CollectSamplesUntil` dogfood test runs:
+Revisit after more consumer dogfood and framework-level acceptance coverage:
 
 - `activationKey`: currently a stringly ingress-to-agenda bridge. It may stay
   low-level, but objective handlers or `ObjectiveAuthor` should own higher
@@ -546,9 +584,10 @@ Revisit after the `CollectSamplesUntil` dogfood test runs:
   `AgentProcess` path. `EvolvingInvocation` creates a synthetic agent whose
   planner-visible goals come from the agenda, which should reduce this
   suppression's role for normal evolving usage.
-- agenda-wrapped `NIRVANA`: keep until `CollectSamplesUntil` proves continuous
-  work. If it remains awkward, replace it with first-class recurring or standing
-  activity semantics.
+- agenda-wrapped `NIRVANA`: consumer dogfood has validated this path for
+  continuous utility work, but keep watching whether it remains natural enough
+  for framework-level examples. If it becomes awkward, replace it with
+  first-class recurring or standing activity semantics.
 
 Guiding principle:
 
@@ -569,9 +608,9 @@ Guiding principle:
   current `ObjectiveAuthor` returns an `ObjectivePlan` that already carries
   agenda entries, which avoids manual runtime `GoalAgenda` mutation but leaves
   reusable compilation helpers as future work.
-- Add a dogfood acceptance test for `CollectSamplesUntil`: repeatedly collect,
-  store, resume, safety-preempt, and complete without stale one-shot goal
-  satisfaction.
+- Add a framework-level dogfood acceptance test mirroring the external consumer
+  scenario: repeatedly collect, store, resume, safety-preempt, and complete
+  without stale one-shot goal satisfaction.
 - Broaden user-facing examples once the API has more consumer mileage beyond the
   current deterministic `ObjectiveAuthor` and low-level `EvolutionOptions`
   examples.

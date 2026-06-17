@@ -61,6 +61,36 @@ data class AgendaEntry @JvmOverloads constructor(
 
     fun isExpired(now: Instant): Boolean =
         expiresAt?.let { !it.isAfter(now) } == true
+
+    fun withBindings(bindings: Map<String, Any>): AgendaEntry =
+        copy(bindings = bindings)
+
+    fun withSource(source: Any?): AgendaEntry =
+        copy(source = source)
+
+    fun withLane(lane: AgendaLane): AgendaEntry =
+        copy(lane = lane)
+
+    fun withCompletionMode(completionMode: AgendaCompletionMode): AgendaEntry =
+        copy(completionMode = completionMode)
+
+    fun withActivationKey(activationKey: String?): AgendaEntry =
+        copy(activationKey = activationKey)
+
+    fun withTtl(ttl: Duration?): AgendaEntry =
+        copy(ttl = ttl)
+
+    fun withCompletionPredicate(completionPredicate: AgendaCompletionPredicate?): AgendaEntry =
+        copy(completionPredicate = completionPredicate)
+
+    companion object {
+
+        @JvmStatic
+        fun of(
+            id: String,
+            goal: Goal,
+        ): AgendaEntry = AgendaEntry(id = id, goal = goal)
+    }
 }
 
 /**

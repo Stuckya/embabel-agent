@@ -30,8 +30,8 @@ import com.embabel.agent.test.integration.IntegrationTestUtils;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.Map;
 
+import static com.embabel.agent.core.support.Nirvana.NIRVANA;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class EvolvingInvocationJavaTest {
@@ -60,21 +60,16 @@ class EvolvingInvocationJavaTest {
         var agentPlatform = IntegrationTestUtils.dummyAgentPlatform();
         var objective = new JavaCollectSamplesUntil("zone-a", 1);
         ObjectiveAuthor objectiveAuthor = request -> {
-            var collectSamplesUntil = (JavaCollectSamplesUntil) request.getObjective();
+            var collectSamplesUntil = request.objectiveAs(JavaCollectSamplesUntil.class);
             Goal sampleStoredGoal = request.getScope().getGoals().stream()
                 .filter(goal -> JavaSampleStored.class.getName().equals(goal.getOutputType().getName()))
                 .findFirst()
                 .orElseThrow();
             return new ObjectivePlan(
                 "java-collect-zone-a",
-                List.of(new AgendaEntry(
-                    "java-collect-sample",
-                    sampleStoredGoal,
-                    Map.of(),
-                    null,
-                    AgendaLane.ECONOMIC,
-                    AgendaCompletionMode.TERMINAL
-                )),
+                List.of(AgendaEntry.of("java-collect-sample", sampleStoredGoal)
+                    .withLane(AgendaLane.ECONOMIC)
+                    .withCompletionMode(AgendaCompletionMode.TERMINAL)),
                 List.of(new JavaSampleAvailable(collectSamplesUntil.zone())),
                 null
             );
@@ -87,5 +82,6 @@ class EvolvingInvocationJavaTest {
 
         assertThat(result.getStatus()).isEqualTo(AgentProcessStatusCode.COMPLETED);
         assertThat(result.lastResult()).isEqualTo(new JavaSampleStored("zone-a"));
+        assertThat(NIRVANA.getName()).isEqualTo("Nirvana");
     }
 }

@@ -62,21 +62,29 @@ data class EvolvingInvocation @JvmOverloads constructor(
     override fun runAsync(
         obj: Any,
         vararg objs: Any,
-    ): CompletableFuture<AgentProcess> {
+    ): CompletableFuture<AgentProcess> =
+        agentPlatform.start(createProcess(obj, *objs))
+
+    fun createProcess(
+        obj: Any,
+        vararg objs: Any,
+    ): AgentProcess {
         val prepared = prepareRun(
             objective = obj,
             additionalInputs = objs.toList(),
         )
         val args = (listOf(obj) + objs.toList() + prepared.initialFacts).toTypedArray()
-        val agentProcess = agentPlatform.createAgentProcessFrom(
+        return agentPlatform.createAgentProcessFrom(
             agent = prepared.agent,
             processOptions = prepared.processOptions,
             objectsToAdd = args,
         )
-        return agentPlatform.start(agentProcess)
     }
 
-    override fun runAsync(map: Map<String, Any>): CompletableFuture<AgentProcess> {
+    override fun runAsync(map: Map<String, Any>): CompletableFuture<AgentProcess> =
+        agentPlatform.start(createProcess(map))
+
+    fun createProcess(map: Map<String, Any>): AgentProcess {
         val prepared = prepareRun(
             objective = map,
             additionalInputs = emptyList(),
@@ -87,7 +95,7 @@ data class EvolvingInvocation @JvmOverloads constructor(
             bindings = map,
         )
         prepared.initialFacts.forEach { agentProcess.addObject(it) }
-        return agentPlatform.start(agentProcess)
+        return agentProcess
     }
 
     fun createEvolvingAgent(): Agent {

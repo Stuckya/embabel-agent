@@ -34,6 +34,9 @@ data class ObjectiveAuthorRequest(
 
     inline fun <reified T : Any> objectiveAs(): T =
         objective as T
+
+    fun <T : Any> objectiveAs(type: Class<T>): T =
+        type.cast(objective)
 }
 
 /**

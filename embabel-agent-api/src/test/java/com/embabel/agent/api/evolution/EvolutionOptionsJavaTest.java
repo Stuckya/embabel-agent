@@ -27,7 +27,6 @@ import com.embabel.agent.core.GoalAgenda;
 import com.embabel.agent.core.ProcessOptions;
 import org.junit.jupiter.api.Test;
 
-import java.time.Instant;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,17 +39,12 @@ class EvolutionOptionsJavaTest {
     @Test
     void javaCanConfigureEvolutionOptionsAndAgendaApproverLambda() {
         Goal goal = Goal.createInstance("Handle Java evolution result", JavaEvolutionResult.class, "java-evolution-goal");
-        AgendaEntry entry = new AgendaEntry(
-            "java-entry",
-            goal,
-            Map.of("tenant", "test"),
-            "java-test",
-            AgendaLane.ECONOMIC,
-            AgendaCompletionMode.TERMINAL,
-            "java-activation",
-            null,
-            Instant.now()
-        );
+        AgendaEntry entry = AgendaEntry.of("java-entry", goal)
+            .withBindings(Map.of("tenant", "test"))
+            .withSource("java-test")
+            .withLane(AgendaLane.ECONOMIC)
+            .withCompletionMode(AgendaCompletionMode.TERMINAL)
+            .withActivationKey("java-activation");
         AgendaEntryApprover approver = request -> new AgendaEntryApproved(request);
         EvolutionOptions evolution = new EvolutionOptions(
             GoalAgenda.EMPTY.withEntry(entry),

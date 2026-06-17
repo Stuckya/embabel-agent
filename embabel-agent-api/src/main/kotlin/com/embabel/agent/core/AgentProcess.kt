@@ -189,7 +189,7 @@ interface AgentProcess : Blackboard, Timestamped, Timed, OperationStatus<AgentPr
      * When called outside action execution while actions are active, this targets
      * the actions active at the time of the call. Targeted actions terminate at
      * their next natural checkpoint, and the agent continues with the next
-     * planned action.
+     * planned action. When no actions are active, the request is ignored.
      *
      * @param reason Human-readable explanation for termination
      * @see com.embabel.agent.api.tool.TerminateActionException for immediate termination

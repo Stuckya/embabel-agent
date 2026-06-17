@@ -393,19 +393,6 @@ You can also configure logging via a `logback-spring.xml` file if you have more 
 
 See the https://docs.spring.io/spring-boot/reference/features/logging.html[Spring Boot Logging] reference.
 
-Embabel ships default logging configurations for both supported logging systems — `logback-embabel.xml`
-for Logback and `log4j2-embabel.xml` for Log4j2 — and applies the one matching your active logging system.
-The two defaults are at parity: the same console pattern and the same level suppressions, so a Log4j2
-application gets the same out-of-the-box experience as a Logback application.
-
-Embabel steps aside and applies nothing when you supply your own configuration via any of:
-
-* a `logging.config` property,
-* a `logback-spring.xml` file, or
-* a `log4j2-spring.xml` or `log4j2.xml` file.
-
-To opt out without supplying a config file, point `logging.config` at your own configuration.
-
 By default, many Embabel examples use personality-based logging experiences such as Star Wars.
 You can disable this by updating application.properties accordingly.
 
