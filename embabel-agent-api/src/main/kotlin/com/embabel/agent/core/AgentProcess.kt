@@ -183,9 +183,13 @@ interface AgentProcess : Blackboard, Timestamped, Timed, OperationStatus<AgentPr
     fun terminateAgent(reason: String)
 
     /**
-     * Request graceful termination of the current action only.
-     * The action will terminate at the next natural checkpoint (between tool calls),
-     * and the agent will continue with the next planned action.
+     * Request graceful action termination.
+     *
+     * When called inside action execution, this targets the current action.
+     * When called outside action execution while actions are active, this targets
+     * the actions active at the time of the call. Targeted actions terminate at
+     * their next natural checkpoint, and the agent continues with the next
+     * planned action.
      *
      * @param reason Human-readable explanation for termination
      * @see com.embabel.agent.api.tool.TerminateActionException for immediate termination

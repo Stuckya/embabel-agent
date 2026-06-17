@@ -121,16 +121,12 @@ data class AgendaEntryApprovalRequest @JvmOverloads constructor(
 sealed interface AgendaEntryApprovalResponse {
     val request: AgendaEntryApprovalRequest
     val approved: Boolean
-
-    fun isApproved(): Boolean
 }
 
 data class AgendaEntryApproved(
     override val request: AgendaEntryApprovalRequest,
 ) : AgendaEntryApprovalResponse {
     override val approved: Boolean = true
-
-    override fun isApproved(): Boolean = approved
 }
 
 data class AgendaEntryNotApproved(
@@ -138,8 +134,6 @@ data class AgendaEntryNotApproved(
     val reason: String,
 ) : AgendaEntryApprovalResponse {
     override val approved: Boolean = false
-
-    override fun isApproved(): Boolean = approved
 }
 
 /**

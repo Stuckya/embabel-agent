@@ -108,6 +108,11 @@ public class EmbabelMetricsEventListener implements AgenticEventListener {
                 recordTokensAndCost(e.getAgentProcess());
                 recordAgentDuration(e.getAgentProcess(), "failed");
             }
+            case AgentProcessTerminatedEvent e -> {
+                activeAgents.decrementAndGet();
+                recordTokensAndCost(e.getAgentProcess());
+                recordAgentDuration(e.getAgentProcess(), "terminated");
+            }
             case ProcessKilledEvent e -> {
                 activeAgents.decrementAndGet();
                 creationTimestamps.remove(e.getAgentProcess().getId());

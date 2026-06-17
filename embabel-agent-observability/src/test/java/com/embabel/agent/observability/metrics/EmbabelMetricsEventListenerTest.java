@@ -359,6 +359,27 @@ class EmbabelMetricsEventListenerTest {
             assertThat(timer).isNotNull();
             assertThat(timer.count()).isEqualTo(1);
         }
+
+        @Test
+        @DisplayName("Terminated agent should record duration and usage without error counter")
+        void terminated_shouldRecordDurationAndUsageWithoutErrorCounter() {
+            var registry = new SimpleMeterRegistry();
+            var listener = new EmbabelMetricsEventListener(registry, new ObservabilityProperties());
+            var process = createMockAgentProcess("run-1", "TerminatedAgent");
+            mockUsageAndCost(process, new Usage(100, 50, null), 0.0042);
+
+            listener.onProcessEvent(new AgentProcessCreationEvent(process));
+            listener.onProcessEvent(new AgentProcessTerminatedEvent(process));
+
+            assertThat(registry.find("embabel.agent.active").gauge().value()).isEqualTo(0.0);
+            assertThat(registry.find("embabel.agent.duration")
+                    .tag("agent", "TerminatedAgent").tag("status", "terminated").timer()).isNotNull();
+            assertThat(registry.find("embabel.llm.tokens.total")
+                    .tag("agent", "TerminatedAgent").tag("direction", "input").counter().count()).isEqualTo(100.0);
+            assertThat(registry.find("embabel.llm.cost.total")
+                    .tag("agent", "TerminatedAgent").counter().count()).isEqualTo(0.0042);
+            assertThat(registry.find("embabel.agent.errors.total").counter()).isNull();
+        }
     }
 
     // ================================================================================

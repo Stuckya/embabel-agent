@@ -80,6 +80,7 @@ public class EmbabelFullObservationEventListener implements AgenticEventListener
             case AgentProcessCreationEvent e -> onAgentProcessCreation(e);
             case AgentProcessCompletedEvent e -> onAgentProcessCompleted(e);
             case AgentProcessFailedEvent e -> onAgentProcessFailed(e);
+            case AgentProcessTerminatedEvent e -> onAgentProcessTerminated(e);
             case ActionExecutionStartEvent e -> onActionStart(e);
             case ActionExecutionResultEvent e -> onActionResult(e);
             case GoalAchievedEvent e -> onGoalAchieved(e);
@@ -265,6 +266,31 @@ public class EmbabelFullObservationEventListener implements AgenticEventListener
             ctx.observation.stop();
 
             log.debug("Failed observation for agent runId: {}", runId);
+        }
+    }
+
+    /** Closes the observation span when agent terminates without treating it as an error. */
+    private void onAgentProcessTerminated(AgentProcessTerminatedEvent event) {
+        AgentProcess process = event.getAgentProcess();
+        String runId = process.getId();
+        var key = ObservationKeys.agentKey(runId);
+
+        ObservationContext ctx = activeObservations.remove(key);
+        inputSnapshots.remove(key);
+        planIterations.remove(runId);
+
+        if (ctx != null) {
+            ctx.observation.lowCardinalityKeyValue("embabel.agent.status", "terminated");
+
+            Object failureInfo = process.getFailureInfo();
+            if (failureInfo != null) {
+                ctx.observation.highCardinalityKeyValue("embabel.agent.termination", truncate(failureInfo.toString()));
+            }
+
+            ctx.scope.close();
+            ctx.observation.stop();
+
+            log.debug("Terminated observation for agent runId: {}", runId);
         }
     }
 

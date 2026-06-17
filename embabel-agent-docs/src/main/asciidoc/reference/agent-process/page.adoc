@@ -145,6 +145,32 @@ See <<reference.tools__tool-call-context>> for how tools receive this context.
 evolving a process agenda at process seams.
 The agenda is projected into the effective planning system for the process; it
 does not mutate the agent's declared goals.
+The current POC evolves agenda entries over the `AgentScope` created for the
+process.
+It does not add new agents, actions, or capability modules to an already-running
+process.
+
+`EvolutionOptions` is the current low-level POC surface.
+The POC public interface is `EvolvingInvocation`, parallel to
+`UtilityInvocation` and `SupervisorInvocation`.
+It implements the existing `ScopedInvocation` and `BaseInvocation` contracts,
+inheriting `withScope`, `withProcessOptions`, `withAgentName`, `run`, and
+`runAsync` rather than introducing a separate invocation shape.
+The objective-authoring seam is `ObjectiveAuthor`, avoiding collision with
+Embabel's existing planner abstraction.
+An `ObjectiveAuthor` receives an `ObjectiveAuthorRequest` containing the
+objective, additional inputs, active `AgentScope`, and `ProcessOptions`, then
+returns an `ObjectivePlan`.
+The POC validates authored agenda goals against the active `AgentScope` and
+applies the plan's initial facts and agenda entries before process launch.
+An LLM-backed `ObjectiveAuthor` should reuse Autonomy, `Ranker`,
+`GoalSelectionOptions`, and `GoalChoiceApprover` for ranking and approval where
+applicable.
+Current Autonomy ranks existing goals; it does not author `ObjectivePlan`s.
+The current POC creates the configured `AgentScope` before calling
+`ObjectiveAuthor`.
+Objective-dependent scope assembly before launch is future work; runtime action
+or agent-scope expansion is out of scope.
 
 `GoalAgenda` is immutable.
 Use `withEntry`, `withoutEntry`, or `expire` to produce a new agenda.
@@ -156,6 +182,11 @@ direct additions are the repeatable path for entries created while the process
 is already running.
 An `AgendaEntryApprover` can approve or veto catalog activation or direct
 runtime proposals.
+It has a different request payload from `GoalChoiceApprover`, so the two should
+not be collapsed directly.
+Before promoting the agenda approver as a stable public API, prefer extracting
+or sharing the approval response protocol shape, or document why the agenda
+approver remains a parallel seam.
 Once activated, an entry is projected into the process planning system without
 adding a new planner type.
 The selected process goal is an `AgendaPlanningGoal`, whose `entry` exposes the
@@ -166,6 +197,8 @@ This lets an agenda-wrapped `NIRVANA` goal keep using Hybrid utility planning
 for standing utility work.
 If any active entry is in the `SAFETY` lane, safety entries are planned before
 economic entries.
+Safety uses a hard lane rather than high goal value because utility and
+net-value ranking are soft preferences and cannot guarantee preemption.
 
 `BlackboardIngress` is available from `AgentProcess` and `ProcessContext`.
 `IngressOptions` can append facts, keep only the latest visible fact for a key,
@@ -174,6 +207,12 @@ wake blocked processes, safety-preempt cooperative actions, and hide drained
 facts after a TTL.
 Ingress publish is safe for external callers; blackboard writes happen when the
 process drains ingress at a process seam.
+`BlackboardIngress` is distinct from `ReplanRequestedException`:
+`ReplanRequestedException` is initiated by an action or tool loop that is already
+running inside the process, while ingress is external async fact publication into
+a running process.
+Ingress is not a replacement for replanning; it covers the opposite direction of
+state change.
 
 Agenda completion is controlled by `AgendaCompletionMode`.
 `TERMINAL` completes the process when the entry's goal is satisfied.
@@ -182,16 +221,29 @@ satisfied. If the underlying goal is satisfied before the predicate is true, the
 process waits instead of repeatedly replanning the same already-satisfied goal.
 `RESUMABLE` removes the satisfied entry and lets the process re-arbitrate.
 `KEEP_ALIVE` and `RECURRING` are intentionally not part of this POC surface.
+`AgendaCompletionPredicate` overlaps with Embabel's existing `Condition`
+composition model.
+Future composite completion should decide whether it can be represented as a
+`Condition`, as an adapter over `Condition`, or must remain an internal predicate
+because it needs `AgentProcess`, `AgendaEntry`, and `GoalAgenda` context.
 
 `IngressWake.WAKE` makes a `WAITING`, `STUCK`, or `PAUSED` process runnable
 again. `IngressWake.SAFETY_PREEMPT` also trips the process cancellation token so
 cooperative blocking actions can exit at a checkpoint and the next process seam
 can re-arbitrate to any activated safety agenda entry.
+`SAFETY_PREEMPT` reuses existing termination machinery via
+`AgentProcess.terminateAction`, backed by
+`TerminationSignal(TerminationScope.ACTION)`.
 
 `CompletionPolicy` is separate from `EarlyTerminationPolicy`.
 It returns a `ProcessOutcome`, available from `AgentProcess.outcome`.
-`COMPLETED` maps to a completed process.
-`EXHAUSTED` and `CANCELLED` map to a terminated process.
+`CONTINUE` means no terminal status transition.
+`COMPLETED` maps to `AgentProcessStatusCode.COMPLETED`.
+`EXHAUSTED` and `CANCELLED` map to `AgentProcessStatusCode.TERMINATED`, with the
+outcome recorded as failure information.
+`failureInfo` on a terminated process may therefore contain a non-error
+`ProcessOutcome`; inspect `AgentProcess.outcome.code` when distinguishing
+exhausted, cancelled, and failed-style terminations.
 A drained resumable agenda with no remaining plan is exhausted rather than stuck.
 
 The following Java snippet is from `EvolutionOptionsJavaTest`:

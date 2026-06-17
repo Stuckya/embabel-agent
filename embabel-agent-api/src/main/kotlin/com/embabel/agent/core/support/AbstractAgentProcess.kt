@@ -43,7 +43,9 @@ import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -70,6 +72,8 @@ abstract class AbstractAgentProcess(
 
     private val _status = AtomicReference(AgentProcessStatusCode.NOT_STARTED)
 
+    private val finishedEventEmitted = AtomicBoolean(false)
+
     private var _failureInfo: Any? = null
 
     override val failureInfo: Any?
@@ -80,13 +84,37 @@ abstract class AbstractAgentProcess(
     override val outcome: ProcessOutcome
         get() = _outcome
 
-    private val _terminationRequest = AtomicReference<TerminationSignal?>(null)
+    private data class ScopedTerminationSignal(
+        val signal: TerminationSignal,
+        val actionTokens: Set<String> = emptySet(),
+    )
+
+    private val _terminationRequest = AtomicReference<ScopedTerminationSignal?>(null)
+
+    private val currentActionToken = ThreadLocal<String?>()
+
+    private val activeActionTokens = ConcurrentHashMap.newKeySet<String>()
 
     internal val terminationRequest: TerminationSignal?
-        get() = _terminationRequest.get()
+        get() = _terminationRequest.get()?.signal
 
-    private fun setTerminationRequest(signal: TerminationSignal) {
-        _terminationRequest.set(signal)
+    private fun setTerminationRequest(
+        signal: TerminationSignal,
+        actionTokens: Set<String> = emptySet(),
+    ): Boolean {
+        while (true) {
+            val current = _terminationRequest.get()
+            if (current?.signal?.scope == TerminationScope.AGENT && signal.scope == TerminationScope.ACTION) {
+                return false
+            }
+            val next = ScopedTerminationSignal(
+                signal = signal,
+                actionTokens = if (signal.scope == TerminationScope.ACTION) actionTokens else emptySet(),
+            )
+            if (_terminationRequest.compareAndSet(current, next)) {
+                return true
+            }
+        }
     }
 
     /**
@@ -95,8 +123,30 @@ abstract class AbstractAgentProcess(
      * Returns false if the slot was mutated concurrently — the newer value
      * is preserved and will be visible to the next consumer.
      */
-    internal fun compareAndResetTerminationRequest(expected: TerminationSignal): Boolean =
-        _terminationRequest.compareAndSet(expected, null)
+    internal fun compareAndResetTerminationRequest(expected: TerminationSignal): Boolean {
+        while (true) {
+            val current = _terminationRequest.get() ?: return false
+            if (current.signal !== expected) {
+                return false
+            }
+            if (current.signal.scope != TerminationScope.ACTION || current.actionTokens.isEmpty()) {
+                return _terminationRequest.compareAndSet(current, null)
+            }
+            val actionToken = currentActionToken.get() ?: return false
+            if (actionToken !in current.actionTokens) {
+                return false
+            }
+            val remainingTokens = current.actionTokens - actionToken
+            val next = if (remainingTokens.isEmpty()) {
+                null
+            } else {
+                current.copy(actionTokens = remainingTokens)
+            }
+            if (_terminationRequest.compareAndSet(current, next)) {
+                return true
+            }
+        }
+    }
 
     // Agenda and outcome state is process-thread confined. External publish() calls
     // only touch pending ingress under lock plus atomic status/termination signals.
@@ -109,14 +159,31 @@ abstract class AbstractAgentProcess(
     override val goalAgenda: GoalAgenda
         get() = _goalAgenda
 
-    override val cancellationToken: ProcessCancellationToken = object : ProcessCancellationToken {
-        override val isCancellationRequested: Boolean
-            get() = terminationRequest != null ||
-                    status == AgentProcessStatusCode.TERMINATED ||
-                    status == AgentProcessStatusCode.KILLED
+    override val cancellationToken: ProcessCancellationToken
+        get() {
+            val capturedActionToken = currentActionToken.get()
+            return object : ProcessCancellationToken {
+                override val isCancellationRequested: Boolean
+                    get() = currentTerminationSignalApplies(capturedActionToken) ||
+                            status == AgentProcessStatusCode.TERMINATED ||
+                            status == AgentProcessStatusCode.KILLED
 
-        override val reason: String?
-            get() = terminationRequest?.reason
+                override val reason: String?
+                    get() = if (currentTerminationSignalApplies(capturedActionToken)) {
+                        terminationRequest?.reason
+                    } else {
+                        null
+                    }
+            }
+        }
+
+    private fun currentTerminationSignalApplies(actionToken: String? = currentActionToken.get()): Boolean {
+        val request = _terminationRequest.get() ?: return false
+        return when (request.signal.scope) {
+            TerminationScope.AGENT -> true
+            TerminationScope.ACTION -> request.actionTokens.isEmpty() ||
+                    (actionToken?.let { it in request.actionTokens } ?: false)
+        }
     }
 
     private data class PendingBlackboardIngress(
@@ -312,9 +379,9 @@ abstract class AbstractAgentProcess(
         val evolution = processOptions.evolution
         return _goalAgenda.entries.isNotEmpty() ||
                 activeIngress.isNotEmpty() ||
-                hasPendingIngress() ||
                 evolution.agendaCatalog.entries.isNotEmpty() ||
-                evolution.completionPolicy !== CompletionPolicy.CONTINUE
+                evolution.completionPolicy !== CompletionPolicy.CONTINUE ||
+                hasPendingIngress()
     }
 
     private fun hasPendingIngress(): Boolean =
@@ -518,23 +585,30 @@ abstract class AbstractAgentProcess(
             }
             AgentProcessStatusCode.KILLED,
             AgentProcessStatusCode.FAILED,
-            AgentProcessStatusCode.TERMINATED -> {
+            AgentProcessStatusCode.TERMINATED,
+            AgentProcessStatusCode.COMPLETED -> {
                 // Already in terminal state - ignore
                 logger.info("Process {} already {}, ignoring terminate request", id, status)
             }
-            AgentProcessStatusCode.COMPLETED,
             AgentProcessStatusCode.STUCK,
             AgentProcessStatusCode.WAITING,
             AgentProcessStatusCode.PAUSED -> {
                 // No guaranteed next tick - set status immediately
                 logger.info("Terminating process {} (was {}): {}", id, status, reason)
+                _failureInfo = TerminationSignal(TerminationScope.AGENT, reason)
                 setStatus(AgentProcessStatusCode.TERMINATED)
+                emitFinishedEventIfNeeded()
             }
         }
     }
 
     override fun terminateAction(reason: String) {
-        setTerminationRequest(TerminationSignal(TerminationScope.ACTION, reason))
+        val actionTokens = currentActionToken.get()?.let { setOf(it) }
+            ?: activeActionTokens.toSet()
+        setTerminationRequest(
+            signal = TerminationSignal(TerminationScope.ACTION, reason),
+            actionTokens = actionTokens,
+        )
     }
 
     override val lastWorldState: WorldState?
@@ -746,6 +820,12 @@ abstract class AbstractAgentProcess(
             error("Agent ${agent.name} has no goals: ${agent.infoString(verbose = true)}")
         }
 
+        val initialEarlyTermination = identifyEarlyTermination()
+        if (initialEarlyTermination != null) {
+            emitFinishedEventIfNeeded()
+            return this
+        }
+
         var replanAfterStuckHandling: Boolean
         do {
             replanAfterStuckHandling = false
@@ -753,6 +833,7 @@ abstract class AbstractAgentProcess(
             while (status == AgentProcessStatusCode.RUNNING) {
                 val earlyTermination = identifyEarlyTermination()
                 if (earlyTermination != null) {
+                    emitFinishedEventIfNeeded()
                     return this
                 }
                 tick()
@@ -767,15 +848,15 @@ abstract class AbstractAgentProcess(
                 }
 
                 AgentProcessStatusCode.COMPLETED -> {
-                    platformServices.eventListener.onProcessEvent(AgentProcessCompletedEvent(this))
+                    emitFinishedEventIfNeeded()
                 }
 
                 AgentProcessStatusCode.FAILED -> {
-                    platformServices.eventListener.onProcessEvent(AgentProcessFailedEvent(this))
+                    emitFinishedEventIfNeeded()
                 }
 
                 AgentProcessStatusCode.TERMINATED -> {
-                    platformServices.eventListener.onProcessEvent(AgentProcessTerminatedEvent(this))
+                    emitFinishedEventIfNeeded()
                 }
 
                 AgentProcessStatusCode.KILLED -> {
@@ -799,12 +880,25 @@ abstract class AbstractAgentProcess(
             if (replanAfterStuckHandling) {
                 val earlyTermination = identifyEarlyTermination()
                 if (earlyTermination != null) {
+                    emitFinishedEventIfNeeded()
                     return this
                 }
                 setStatus(AgentProcessStatusCode.RUNNING)
             }
         } while (replanAfterStuckHandling)
         return this
+    }
+
+    private fun emitFinishedEventIfNeeded() {
+        val event = when (status) {
+            AgentProcessStatusCode.COMPLETED -> AgentProcessCompletedEvent(this)
+            AgentProcessStatusCode.FAILED -> AgentProcessFailedEvent(this)
+            AgentProcessStatusCode.TERMINATED -> AgentProcessTerminatedEvent(this)
+            else -> null
+        }
+        if (event != null && finishedEventEmitted.compareAndSet(false, true)) {
+            platformServices.eventListener.onProcessEvent(event)
+        }
     }
 
     /**
@@ -828,14 +922,7 @@ abstract class AbstractAgentProcess(
             return signalTermination
         }
 
-        // Clear any stale ACTION signal that wasn't consumed by tool loop
-        // (e.g., set by a simple action without tool loop)
-        val staleSignal = terminationRequest
-        if (staleSignal != null && staleSignal.scope == TerminationScope.ACTION) {
-            if (compareAndResetTerminationRequest(staleSignal)) {
-                logger.debug("Clearing stale ACTION termination signal: {}", staleSignal.reason)
-            }
-        }
+        clearActionTerminationSignalAtProcessSeam()
 
         // Check configured early termination policies
         val earlyTermination = processOptions.processControl.earlyTerminationPolicy.shouldTerminate(this)
@@ -852,6 +939,31 @@ abstract class AbstractAgentProcess(
             return earlyTermination
         }
         return null
+    }
+
+    private fun clearActionTerminationSignalAtProcessSeam() {
+        while (true) {
+            val current = _terminationRequest.get() ?: return
+            val signal = current.signal
+            if (signal.scope != TerminationScope.ACTION) {
+                return
+            }
+            val activeTargetTokens = current.actionTokens
+                .filter { it in activeActionTokens }
+                .toSet()
+            if (activeTargetTokens == current.actionTokens && activeTargetTokens.isNotEmpty()) {
+                return
+            }
+            val next = if (activeTargetTokens.isEmpty()) {
+                null
+            } else {
+                current.copy(actionTokens = activeTargetTokens)
+            }
+            if (_terminationRequest.compareAndSet(current, next)) {
+                logger.debug("Clearing stale ACTION termination signal: {}", signal.reason)
+                return
+            }
+        }
     }
 
     /**
@@ -955,123 +1067,161 @@ abstract class AbstractAgentProcess(
             outputTypes,
         )
 
-        val actionExecutionStartEvent = ActionExecutionStartEvent(
-            agentProcess = this,
-            action = action,
-        )
-        platformServices.eventListener.onProcessEvent(actionExecutionStartEvent)
-        val actionExecutionSchedule = platformServices.operationScheduler.scheduleAction(actionExecutionStartEvent)
-        when (actionExecutionSchedule) {
-            is ProntoActionExecutionSchedule -> {
-                // Do nothing
-            }
-
-            is DelayedActionExecutionSchedule -> {
-                // Delay and move on
-                logger.debug("Process {} delayed action {}: {}", id, action.name, actionExecutionSchedule)
-                try {
-                    Thread.sleep(actionExecutionSchedule.delay.toMillis())
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    _status.set(AgentProcessStatusCode.TERMINATED)
-                    return ActionStatus(
-                        runningTime = Duration.between(actionExecutionStartEvent.timestamp, Instant.now()),
-                        status = ActionStatusCode.FAILED,
-                    )
+        val actionToken = UUID.randomUUID().toString()
+        activeActionTokens += actionToken
+        currentActionToken.set(actionToken)
+        try {
+            val actionExecutionStartEvent = ActionExecutionStartEvent(
+                agentProcess = this,
+                action = action,
+            )
+            platformServices.eventListener.onProcessEvent(actionExecutionStartEvent)
+            val actionExecutionSchedule = platformServices.operationScheduler.scheduleAction(actionExecutionStartEvent)
+            when (actionExecutionSchedule) {
+                is ProntoActionExecutionSchedule -> {
+                    // Do nothing
                 }
-                logger.debug("Process {} delayed action {}: done", id, action.name)
-            }
 
-            is ScheduledActionExecutionSchedule -> {
-                return ActionStatus(
-                    Duration.between(actionExecutionStartEvent.timestamp, Instant.now()),
-                    ActionStatusCode.PAUSED
-                )
-            }
-        }
-
-        // Capture blackboard state before execution to detect if it was cleared
-        val blackboardObjectsBefore = blackboard.objects.toList()
-
-        val timestamp = Instant.now()
-        val actionStatus = try {
-            withCurrent {
-                val effectiveAction = action.withEffectiveQos(platformServices.actionQosProperties())
-                effectiveAction.qos
-                    .retryTemplate("Action-${action.name}")
-                    .execute<ActionStatus, Throwable> { context ->
-                        // Clear effect conditions on retry (not first attempt)
-                        if (context.retryCount > 0) {
-                            logger.debug(
-                                "Retry attempt {} for action {}, clearing effect conditions",
-                                context.retryCount,
-                                action.name
-                            )
-                            action.effects.forEach { (condition, _) ->
-                                blackboard.setCondition(condition, false)
-                            }
-                        }
-
-                        effectiveAction.execute(
-                            processContext = processContext,
+                is DelayedActionExecutionSchedule -> {
+                    // Delay and move on
+                    logger.debug("Process {} delayed action {}: {}", id, action.name, actionExecutionSchedule)
+                    try {
+                        Thread.sleep(actionExecutionSchedule.delay.toMillis())
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        _status.set(AgentProcessStatusCode.TERMINATED)
+                        return ActionStatus(
+                            runningTime = Duration.between(actionExecutionStartEvent.timestamp, Instant.now()),
+                            status = ActionStatusCode.FAILED,
                         )
                     }
+                    logger.debug("Process {} delayed action {}: done", id, action.name)
+                }
+
+                is ScheduledActionExecutionSchedule -> {
+                    return ActionStatus(
+                        Duration.between(actionExecutionStartEvent.timestamp, Instant.now()),
+                        ActionStatusCode.PAUSED
+                    )
+                }
             }
-        } catch (e: TerminateActionException) {
-            logger.info("Action {} terminated early: {}", action.name, e.reason)
-            ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.TERMINATED)
-        } catch (e: TerminateAgentException) {
-            logger.info("Action {} requested agent termination: {}", action.name, e.reason)
-            ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.AGENT_TERMINATED)
-        }
-        val actionStatusAfterCancellation = actionStatusAfterCooperativeActionTermination(actionStatus, timestamp)
-        val runningTime = Duration.between(timestamp, Instant.now())
-        _history += ActionInvocation(
-            actionName = action.name,
-            timestamp = timestamp,
-            runningTime = runningTime,
-        )
 
-        // Set hasRun condition on blackboard after action execution.
-        // This must be set for ALL actions (not just canRerun=false) because other
-        // actions may depend on hasRun as a precondition (e.g., aggregate actions).
-        // The canRerun flag controls whether hasRun=FALSE is a precondition, not
-        // whether to track that the action ran.
-        // Only set if the blackboard wasn't cleared during execution.
-        // For state-clearing actions, the blackboard reset naturally prevents re-runs
-        // since inputs are gone. Setting hasRun on the NEW state's blackboard would
-        // incorrectly block actions that haven't run in the new state.
-        val blackboardWasCleared = blackboard.objects.none { it in blackboardObjectsBefore }
-        if (!blackboardWasCleared) {
-            blackboard.setCondition(Rerun.hasRunCondition(action), true)
-        }
+            // Capture blackboard state before execution to detect if it was cleared
+            val blackboardObjectsBefore = blackboard.objects.toList()
 
-        platformServices.eventListener.onProcessEvent(
-            actionExecutionStartEvent.resultEvent(
-                actionStatus = actionStatusAfterCancellation,
+            val timestamp = Instant.now()
+            val actionStatus = try {
+                withCurrent {
+                    val effectiveAction = action.withEffectiveQos(platformServices.actionQosProperties())
+                    effectiveAction.qos
+                        .retryTemplate("Action-${action.name}")
+                        .execute<ActionStatus, Throwable> { context ->
+                            // Clear effect conditions on retry (not first attempt)
+                            if (context.retryCount > 0) {
+                                logger.debug(
+                                    "Retry attempt {} for action {}, clearing effect conditions",
+                                    context.retryCount,
+                                    action.name
+                                )
+                                action.effects.forEach { (condition, _) ->
+                                    blackboard.setCondition(condition, false)
+                                }
+                            }
+
+                            effectiveAction.execute(
+                                processContext = processContext,
+                            )
+                        }
+                }
+            } catch (e: TerminateActionException) {
+                logger.info("Action {} terminated early: {}", action.name, e.reason)
+                ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.TERMINATED)
+            } catch (e: TerminateAgentException) {
+                logger.info("Action {} requested agent termination: {}", action.name, e.reason)
+                ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.AGENT_TERMINATED)
+            }
+            val actionStatusAfterCancellation =
+                actionStatusAfterCooperativeActionTermination(actionStatus, timestamp, actionToken)
+            val runningTime = Duration.between(timestamp, Instant.now())
+            _history += ActionInvocation(
+                actionName = action.name,
+                timestamp = timestamp,
+                runningTime = runningTime,
             )
-        )
 
-        logger.debug("New world state: {}", worldStateDeterminer.determineWorldState())
-        return actionStatusAfterCancellation
+            // Set hasRun condition on blackboard after action execution.
+            // This must be set for ALL actions (not just canRerun=false) because other
+            // actions may depend on hasRun as a precondition (e.g., aggregate actions).
+            // The canRerun flag controls whether hasRun=FALSE is a precondition, not
+            // whether to track that the action ran.
+            // Only set if the blackboard wasn't cleared during execution.
+            // For state-clearing actions, the blackboard reset naturally prevents re-runs
+            // since inputs are gone. Setting hasRun on the NEW state's blackboard would
+            // incorrectly block actions that haven't run in the new state.
+            val blackboardWasCleared = blackboard.objects.none { it in blackboardObjectsBefore }
+            if (!blackboardWasCleared) {
+                blackboard.setCondition(Rerun.hasRunCondition(action), true)
+            }
+
+            platformServices.eventListener.onProcessEvent(
+                actionExecutionStartEvent.resultEvent(
+                    actionStatus = actionStatusAfterCancellation,
+                )
+            )
+
+            logger.debug("New world state: {}", worldStateDeterminer.determineWorldState())
+            return actionStatusAfterCancellation
+        } finally {
+            currentActionToken.remove()
+            activeActionTokens -= actionToken
+            clearActionTerminationSignalAtProcessSeam()
+        }
     }
 
     private fun actionStatusAfterCooperativeActionTermination(
         actionStatus: ActionStatus,
         timestamp: Instant,
+        actionToken: String,
     ): ActionStatus {
         if (actionStatus.status != ActionStatusCode.SUCCEEDED) {
             return actionStatus
         }
-        val signal = terminationRequest
+        val request = _terminationRequest.get()
+        val signal = request?.signal
         return if (signal != null &&
+            actionToken in request.actionTokens &&
             signal.scope == TerminationScope.ACTION &&
-            compareAndResetTerminationRequest(signal)
+            consumeActionTerminationSignal(signal, actionToken)
         ) {
             logger.info("Action cooperatively observed termination signal: {}", signal.reason)
             ActionStatus(Duration.between(timestamp, Instant.now()), ActionStatusCode.TERMINATED)
         } else {
             actionStatus
+        }
+    }
+
+    private fun consumeActionTerminationSignal(
+        signal: TerminationSignal,
+        actionToken: String,
+    ): Boolean {
+        while (true) {
+            val current = _terminationRequest.get() ?: return false
+            if (
+                current.signal !== signal ||
+                current.signal.scope != TerminationScope.ACTION ||
+                actionToken !in current.actionTokens
+            ) {
+                return false
+            }
+            val remainingTokens = current.actionTokens - actionToken
+            val next = if (remainingTokens.isEmpty()) {
+                null
+            } else {
+                current.copy(actionTokens = remainingTokens)
+            }
+            if (_terminationRequest.compareAndSet(current, next)) {
+                return true
+            }
         }
     }
 

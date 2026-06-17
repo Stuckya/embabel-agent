@@ -21,9 +21,12 @@ import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.StuckHandler
 import com.embabel.agent.api.common.StuckHandlerResult
 import com.embabel.agent.api.common.StuckHandlingResultCode
+import com.embabel.agent.api.common.TerminationScope
 import com.embabel.agent.api.dsl.Frog
 import com.embabel.agent.api.dsl.agent
 import com.embabel.agent.api.dsl.evenMoreEvilWizard
+import com.embabel.agent.api.event.ActionExecutionResultEvent
+import com.embabel.agent.api.event.AgentProcessTerminatedEvent
 import com.embabel.agent.api.event.AgentProcessReadyToPlanEvent
 import com.embabel.agent.api.event.BlackboardIngressDrainedEvent
 import com.embabel.agent.api.event.BlackboardIngressHiddenEvent
@@ -34,6 +37,7 @@ import com.embabel.agent.api.event.ObjectBoundEvent
 import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.ActionStatusCode
 import com.embabel.agent.core.EarlyTermination
 import com.embabel.agent.core.EarlyTerminationPolicy
 import com.embabel.agent.core.IoBinding
@@ -354,6 +358,10 @@ class SimpleAgentProcessTest {
             assertEquals(
                 4,
                 listener.processEvents.filterIsInstance<AgentProcessReadyToPlanEvent>().size,
+            )
+            assertEquals(
+                1,
+                listener.processEvents.filterIsInstance<AgentProcessTerminatedEvent>().size,
             )
         }
 
@@ -719,8 +727,9 @@ class SimpleAgentProcessTest {
 
         private fun createProcess(
             status: AgentProcessStatusCode = AgentProcessStatusCode.NOT_STARTED,
+            listener: EventSavingAgenticEventListener = EventSavingAgenticEventListener(),
         ): TestableAgentProcess {
-            val dummyPlatformServices = dummyPlatformServices()
+            val dummyPlatformServices = dummyPlatformServices(listener)
             val process = TestableAgentProcess(dummyPlatformServices)
             if (status != AgentProcessStatusCode.NOT_STARTED) {
                 process.setStatusForTest(status)
@@ -750,11 +759,77 @@ class SimpleAgentProcessTest {
         }
 
         @Test
-        fun `COMPLETED status sets TERMINATED immediately`() {
+        fun `NOT_STARTED terminateAgent stops before first tick and emits terminated event once`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            blackboard += UserInput("TestUser")
+            val process = SimpleAgentProcess(
+                id = "test-pre-start-terminate",
+                agent = SimpleTestAgent,
+                processOptions = ProcessOptions(),
+                blackboard = blackboard,
+                platformServices = dummyPlatformServices(listener),
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+            )
+
+            process.terminateAgent("test reason")
+            val result = process.run()
+
+            assertEquals(AgentProcessStatusCode.TERMINATED, result.status)
+            assertEquals(
+                0,
+                listener.processEvents.filterIsInstance<ActionExecutionResultEvent>().size,
+                "Pre-start termination must not allow a first action side effect",
+            )
+            assertEquals(
+                1,
+                listener.processEvents.filterIsInstance<AgentProcessTerminatedEvent>().size,
+            )
+        }
+
+        @Test
+        fun `AGENT termination signal is not overwritten by later ACTION signal`() {
+            val process = createProcess(AgentProcessStatusCode.RUNNING)
+            process.terminateAgent("agent reason")
+
+            process.terminateAction("action reason")
+
+            assertEquals(TerminationScope.AGENT, process.terminationRequest?.scope)
+            assertEquals("agent reason", process.terminationRequest?.reason)
+        }
+
+        @Test
+        fun `ACTION signal posted before action starts does not terminate unrelated action`() {
+            val listener = EventSavingAgenticEventListener()
+            val blackboard = InMemoryBlackboard()
+            blackboard += UserInput("TestUser")
+            val process = SimpleAgentProcess(
+                id = "test-stale-action-signal",
+                agent = SimpleTestAgent,
+                processOptions = ProcessOptions(),
+                blackboard = blackboard,
+                platformServices = dummyPlatformServices(listener),
+                plannerFactory = DefaultPlannerFactory,
+                parentId = null,
+            )
+
+            process.terminateAction("stale action signal")
+            val result = process.run()
+
+            val actionResult = listener.processEvents
+                .filterIsInstance<ActionExecutionResultEvent>()
+                .single { it.action.name == "thing" }
+            assertEquals(ActionStatusCode.SUCCEEDED, actionResult.actionStatus.status)
+            assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        }
+
+        @Test
+        fun `COMPLETED status ignores terminate request`() {
             val process = createProcess(AgentProcessStatusCode.COMPLETED)
             process.terminateAgent("test reason")
 
-            assertEquals(AgentProcessStatusCode.TERMINATED, process.status)
+            assertEquals(AgentProcessStatusCode.COMPLETED, process.status)
         }
 
         @Test
@@ -763,6 +838,27 @@ class SimpleAgentProcessTest {
             process.terminateAgent("test reason")
 
             assertEquals(AgentProcessStatusCode.TERMINATED, process.status)
+        }
+
+        @Test
+        fun `parked statuses emit terminated event immediately`() {
+            listOf(
+                AgentProcessStatusCode.STUCK,
+                AgentProcessStatusCode.WAITING,
+                AgentProcessStatusCode.PAUSED,
+            ).forEach { parkedStatus ->
+                val listener = EventSavingAgenticEventListener()
+                val process = createProcess(parkedStatus, listener)
+
+                process.terminateAgent("test reason")
+
+                assertEquals(AgentProcessStatusCode.TERMINATED, process.status)
+                assertEquals(
+                    1,
+                    listener.processEvents.filterIsInstance<AgentProcessTerminatedEvent>().size,
+                    "Expected immediate terminated event for $parkedStatus"
+                )
+            }
         }
 
         @Test

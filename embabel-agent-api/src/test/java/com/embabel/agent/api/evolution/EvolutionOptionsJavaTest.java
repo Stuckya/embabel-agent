@@ -70,6 +70,6 @@ class EvolutionOptionsJavaTest {
 
         assertThat(options.getEvolution()).isSameAs(evolution);
         assertThat(options.getEvolution().getAgendaCatalog().getEntries()).containsExactly(entry);
-        assertThat(options.getEvolution().getAgendaEntryApprover().approve(request).isApproved()).isTrue();
+        assertThat(options.getEvolution().getAgendaEntryApprover().approve(request).getApproved()).isTrue();
     }
 }
