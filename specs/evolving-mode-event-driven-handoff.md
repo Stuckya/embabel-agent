@@ -15,8 +15,8 @@ The public model should be:
 ```text
 external event/state
   -> process fact ingress
-  -> fact derivation pass
-  -> derived domain facts
+  -> optional fact derivation pass
+  -> published or derived domain facts
   -> evolution policy maps selected facts to runtime goals
   -> existing GOAP / Utility / Hybrid planner selects real actions
 ```
@@ -58,7 +58,12 @@ That is useful, but too positional for long-lived event-driven processes:
 Recommendation: keep `trigger` as a low-level reactive action feature, but do
 not make it the main Evolving Mode event-driven API.
 
-## Public Shape
+## Core Public Shape
+
+The core Evolving Mode proposal can land as fact ingress, evolution policy, and
+process-local runtime goals. The fact derivation layer below is a useful next
+layer for better developer experience, but it should not be a prerequisite for
+the core runtime-goal mechanism.
 
 ```java
 EvolvingInvocation.on(agentPlatform)
@@ -69,7 +74,7 @@ EvolvingInvocation.on(agentPlatform)
         collectionCapabilities,
         hazardResponseCapabilities
     ))
-    .withEventSource(domainEvents)
+    .withEventSource(domainEvents)  // Optional adapter over fact ingress
     .withEvolution(evolution -> evolution
         .onFact(StorageNeeded.class)
             .addRuntimeGoal(StorageCompleted.class)
@@ -83,6 +88,10 @@ EvolvingInvocation.on(agentPlatform)
     )
     .run(objective);
 ```
+
+`.addRuntimeGoal(StorageCompleted.class)` compiles to a process-local agenda
+entry wrapping a canonical goal from the active scope. Ambiguous output-type
+matches should fail unless the rule names the declared goal explicitly.
 
 Ingress should feel like normal fact publication:
 
@@ -98,7 +107,15 @@ Suggested semantics:
 - facts become visible at the next planning tick
 - consumers should not manage activation keys or clear latches manually
 
-## Missing Module: Fact Derivation
+Event identity must be explicit enough for repeat behavior to be deterministic:
+use framework-generated occurrence identity, caller-supplied ids, or an explicit
+"always fire" mode.
+
+## Next Layer: Fact Derivation
+
+Fact derivation is a separate layer on top of the core Evolving Mode proposal.
+It is not required to add runtime goals from already-published facts, but it
+removes a major source of consumer friction in event-driven systems.
 
 Pure fact derivation should not be modeled as ordinary planner work.
 
@@ -169,6 +186,8 @@ reactive dataflow graph. The implementation needs explicit rules for:
 - provenance: track which derivation produced which fact
 - retraction: retract only facts produced by the same derivation/input key
 - conflicts: define precedence when a fact is both ingested and derivable
+- multiplicity: define whether inputs are latest-only, keyed-by, explicit joins,
+  or Cartesian products
 
 Without this, multi-step derivations will have nondeterministic ordering and
 unclear retraction semantics.
@@ -300,12 +319,12 @@ The lifecycle of runtime goals should be framework-owned.
 When an evolution rule says `StorageNeeded -> StorageCompleted runtime goal`,
 the framework should define what happens when `StorageNeeded` disappears.
 
-Open decision:
+Recommended default:
 
-- remove the runtime goal immediately
-- mark the runtime goal inactive
-- allow the active action to finish but prevent new planning toward it
-- interrupt the active action if the goal is preempted or retracted
+- when the source fact retracts, stop planning new work toward the runtime goal
+- do not interrupt an active action by default
+- interrupt only when the rule is safety/preemptive or explicitly configured to
+  cancel on retraction
 
 This cannot be left to consumer-side `none()` facts or manual clear calls.
 
@@ -458,8 +477,8 @@ EvolvingInvocation
 Fact ingress
   brings external state/events into the process
 
-Fact derivations
-  maintain current domain facts before planning
+Optional fact derivations
+  maintain current domain facts before planning as a next layer
 
 Evolution policy
   maps selected facts to process-local runtime goals
