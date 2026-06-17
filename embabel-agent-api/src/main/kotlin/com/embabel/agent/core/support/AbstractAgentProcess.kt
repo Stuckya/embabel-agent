@@ -47,6 +47,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.function.Supplier
 
 /**
  * Abstract implementation of AgentProcess that provides common functionality
@@ -201,9 +202,13 @@ abstract class AbstractAgentProcess(
 
     private val pendingIngress = mutableListOf<PendingBlackboardIngress>()
 
+    private val pendingLevelClears = mutableListOf<ActivationTrigger<*>>()
+
     private val activeIngress = CopyOnWriteArrayList<ActiveBlackboardIngress>()
 
     private val activeActivationKeys = ConcurrentHashMap.newKeySet<String>()
+
+    private val seenActivationOccurrences = ConcurrentHashMap.newKeySet<String>()
 
     override val ingress: BlackboardIngress = object : BlackboardIngress {
 
@@ -211,6 +216,41 @@ abstract class AbstractAgentProcess(
             fact: Any,
             options: IngressOptions,
         ): IngressReceipt = publishIngress(fact, options)
+
+        override fun <T : Any> update(
+            trigger: ActivationTrigger<T>,
+            active: Boolean,
+            factSupplier: Supplier<T>,
+        ): IngressReceipt? {
+            require(trigger.kind == ActivationTriggerKind.LEVEL) {
+                "update is only supported for level activation triggers"
+            }
+            if (!active) {
+                activeActivationKeys.remove(trigger.key)
+                if (trigger.hideOnInactive) {
+                    synchronized(pendingIngressLock) {
+                        pendingLevelClears += trigger
+                    }
+                }
+                return null
+            }
+            return publishIngress(factSupplier.get(), trigger.toIngressOptions())
+        }
+
+        override fun <T : Any> occurred(
+            trigger: ActivationTrigger<T>,
+            fact: T,
+        ): IngressReceipt? {
+            require(trigger.kind == ActivationTriggerKind.OCCURRENCE) {
+                "occurred is only supported for occurrence activation triggers"
+            }
+            val occurrenceKey = "${trigger.key}:${trigger.occurrenceId(fact)}"
+            if (!seenActivationOccurrences.add(occurrenceKey)) {
+                return null
+            }
+            activeActivationKeys.remove(trigger.key)
+            return publishIngress(fact, trigger.toIngressOptions())
+        }
 
         override fun clearActivationKey(activationKey: String) {
             activeActivationKeys.remove(activationKey)
@@ -271,13 +311,28 @@ abstract class AbstractAgentProcess(
     private fun drainIngress() {
         val now = Instant.now()
         expireIngress(now)
-        val toDrain = synchronized(pendingIngressLock) {
-            pendingIngress.toList().also {
+        val (levelClearsToDrain, toDrain) = synchronized(pendingIngressLock) {
+            val clears = pendingLevelClears.toList().also {
+                pendingLevelClears.clear()
+            }
+            val ingress = pendingIngress.toList().also {
                 pendingIngress.clear()
             }
+            clears to ingress
         }
+        levelClearsToDrain.forEach { drainLevelClear(it) }
         toDrain.forEach { drainIngress(it, now) }
         expireIngress(now)
+    }
+
+    private fun drainLevelClear(trigger: ActivationTrigger<*>) {
+        if (trigger.hideOnInactive) {
+            hideVisibleIngress(
+                key = activationTriggerIngressKey(trigger),
+                reason = BlackboardIngressHideReason.LEVEL_INACTIVE,
+                replacementReceipt = null,
+            )
+        }
     }
 
     private fun drainIngress(pending: PendingBlackboardIngress, now: Instant) {
@@ -440,6 +495,9 @@ abstract class AbstractAgentProcess(
         options: IngressOptions,
     ): String = options.coalesceKey ?: fact.javaClass.name
 
+    private fun activationTriggerIngressKey(trigger: ActivationTrigger<*>): String =
+        trigger.coalesceKey ?: trigger.factType.name
+
     private fun expireIngress(now: Instant) {
         activeIngress
             .filter { it.expiresAt != null && !it.expiresAt.isAfter(now) }
@@ -564,6 +622,7 @@ abstract class AbstractAgentProcess(
             }
 
             AgendaCompletionMode.RESUMABLE -> {
+                consumeGoalOutputs(agendaEntry.goal)
                 _goalAgenda = _goalAgenda.withoutEntry(agendaEntry.id)
                 completedAgendaGoals += agendaEntry.goal
                 _outcome = ProcessOutcome(
@@ -574,6 +633,13 @@ abstract class AbstractAgentProcess(
                 AgentProcessStatusCode.RUNNING
             }
         }
+    }
+
+    private fun consumeGoalOutputs(goal: Goal) {
+        val outputType = goal.outputType?.name ?: return
+        blackboard.objects
+            .filter { satisfiesType(it, outputType) }
+            .forEach { blackboard.hide(it) }
     }
 
     override fun terminateAgent(reason: String) {

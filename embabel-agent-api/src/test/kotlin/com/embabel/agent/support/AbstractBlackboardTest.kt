@@ -22,6 +22,7 @@ import com.embabel.agent.core.IoBinding
 import com.embabel.agent.domain.io.UserInput
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.awt.Point
@@ -282,6 +283,24 @@ abstract class AbstractBlackboardTest {
             )
             assertNotNull(retrieved)
             assertEquals(jane, retrieved)
+        }
+
+        @Test
+        fun `hide specific object leaves later equal object visible`() {
+            val bb = createBlackboard()
+            val first = PersonWithReverseTool("John")
+            val second = PersonWithReverseTool("John")
+            bb += first
+            bb.hide(first)
+            bb += second
+
+            val retrieved = bb.getValue(
+                IoBinding.DEFAULT_BINDING,
+                PersonWithReverseTool::class.java.simpleName,
+                DataDictionary.fromClasses("test", PersonWithReverseTool::class.java)
+            )
+
+            assertSame(second, retrieved)
         }
 
         @Test

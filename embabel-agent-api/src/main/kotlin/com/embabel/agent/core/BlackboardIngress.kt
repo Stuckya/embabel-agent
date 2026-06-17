@@ -18,6 +18,7 @@ package com.embabel.agent.core
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.function.Supplier
 
 interface BlackboardIngress {
 
@@ -27,6 +28,24 @@ interface BlackboardIngress {
     ): IngressReceipt
 
     fun publish(fact: Any): IngressReceipt = publish(fact, IngressOptions())
+
+    fun <T : Any> update(
+        trigger: ActivationTrigger<T>,
+        active: Boolean,
+        factSupplier: Supplier<T>,
+    ): IngressReceipt? =
+        if (active) {
+            publish(factSupplier.get(), trigger.toIngressOptions())
+        } else {
+            clearActivationKey(trigger.key)
+            null
+        }
+
+    fun <T : Any> occurred(
+        trigger: ActivationTrigger<T>,
+        fact: T,
+    ): IngressReceipt? =
+        publish(fact, trigger.toIngressOptions())
 
     fun clearActivationKey(activationKey: String) {}
 

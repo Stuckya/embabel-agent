@@ -30,6 +30,7 @@ import com.embabel.agent.core.AgendaPlanningGoal
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.ActionStatusCode
+import com.embabel.agent.core.ActivationTrigger
 import com.embabel.agent.core.CompletionPolicy
 import com.embabel.agent.core.EvolutionOptions
 import com.embabel.agent.core.GoalAgenda
@@ -112,6 +113,21 @@ val EvolvingAgendaAgent = agent("EvolvingAgendaAgent", description = "Tests evol
         satisfiedBy = EconomicOutcome::class,
         value = { 1.0 },
     )
+    goal(
+        name = "safety-goal",
+        description = "Complete safety work",
+        satisfiedBy = SafetyOutcome::class,
+        value = { 0.1 },
+    )
+}
+
+val RerunnableEvolvingAgendaAgent = agent(
+    "RerunnableEvolvingAgendaAgent",
+    description = "Tests recurring agenda projection",
+) {
+    transformation<SafetySignal, SafetyOutcome>(name = "rerunnable-safety-work", canRerun = true) {
+        SafetyOutcome(it.input.name)
+    }
     goal(
         name = "safety-goal",
         description = "Complete safety work",
@@ -454,7 +470,7 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
         agentProcess.tick()
 
-        assertTrue(agentProcess.lastResult() is DuplicateSecondOutcome)
+        assertEquals("second-duplicate-work", agentProcess.history.last().actionName)
         assertEquals(listOf("first-entry"), agentProcess.goalAgenda.entries.map { it.id })
     }
 
@@ -565,7 +581,7 @@ class EvolvingProcessModeTest {
     fun `composite terminal agenda entry completes only when predicate is satisfied`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
-        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyGoal = RerunnableEvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
         val compositeEntry = AgendaEntry(
             id = "composite-entry",
             goal = safetyGoal,
@@ -802,6 +818,199 @@ class EvolvingProcessModeTest {
     }
 
     @Test
+    fun `typed level trigger ignores duplicate true update while active`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val dangerTrigger = ActivationTrigger.level("danger", SafetySignal::class.java)
+            .wake(IngressWake.WAKE)
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry.of("typed-safety-entry", safetyGoal)
+            .withLane(AgendaLane.SAFETY)
+            .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+            .activatedBy(dangerTrigger)
+        val agentProcess = SimpleAgentProcess(
+            id = "test-typed-level-trigger",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.update(dangerTrigger, true) { SafetySignal("first") }
+        agentProcess.tick()
+        agentProcess.tick()
+        agentProcess.ingress.update(dangerTrigger, true) { SafetySignal("duplicate") }
+        agentProcess.tick()
+
+        assertEquals(1, approvalCalls.get())
+        assertEquals(emptyList<AgendaEntry>(), agentProcess.goalAgenda.entries)
+    }
+
+    @Test
+    fun `typed level trigger owns falling edge rearm`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val dangerTrigger = ActivationTrigger.level("danger", SafetySignal::class.java)
+            .wake(IngressWake.WAKE)
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry.of("typed-safety-entry", safetyGoal)
+            .withLane(AgendaLane.SAFETY)
+            .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+            .activatedBy(dangerTrigger)
+        val agentProcess = SimpleAgentProcess(
+            id = "test-typed-level-trigger-rearm",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.update(dangerTrigger, true) { SafetySignal("first") }
+        agentProcess.tick()
+        agentProcess.tick()
+        agentProcess.objects.filterIsInstance<SafetyOutcome>().forEach { agentProcess.hide(it) }
+        agentProcess.ingress.update(dangerTrigger, false) { SafetySignal("cleared") }
+        agentProcess.ingress.update(dangerTrigger, true) { SafetySignal("second") }
+        agentProcess.tick()
+
+        assertEquals(2, approvalCalls.get())
+        assertEquals(listOf("typed-safety-entry"), agentProcess.goalAgenda.entries.map { it.id })
+    }
+
+    @Test
+    fun `typed level trigger can hide visible level fact on falling edge`() {
+        val dangerTrigger = ActivationTrigger.level("danger", SafetySignal::class.java)
+            .latest("safety-state")
+            .hideOnInactive()
+        val agentProcess = SimpleAgentProcess(
+            id = "test-typed-level-trigger-hide-on-inactive",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(EvolutionOptions()),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.update(dangerTrigger, true) { SafetySignal("first") }
+        agentProcess.tick()
+
+        assertEquals(listOf(SafetySignal("first")), agentProcess.objects.filterIsInstance<SafetySignal>())
+
+        agentProcess.ingress.update(dangerTrigger, false) { SafetySignal("unused") }
+        agentProcess.tick()
+
+        assertEquals(emptyList<SafetySignal>(), agentProcess.objects.filterIsInstance<SafetySignal>())
+    }
+
+    @Test
+    fun `typed occurrence trigger ignores duplicate occurrence id`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val dangerTrigger = ActivationTrigger.occurrence("danger", SafetySignal::class.java)
+            .occurrenceId { it.name }
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry.of("typed-occurrence-safety-entry", safetyGoal)
+            .withLane(AgendaLane.SAFETY)
+            .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+            .activatedBy(dangerTrigger)
+        val agentProcess = SimpleAgentProcess(
+            id = "test-typed-occurrence-trigger-dedupe",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.occurred(dangerTrigger, SafetySignal("same"))
+        agentProcess.tick()
+        agentProcess.tick()
+        agentProcess.ingress.occurred(dangerTrigger, SafetySignal("same"))
+        agentProcess.tick()
+
+        assertEquals(1, approvalCalls.get())
+        assertEquals(emptyList<AgendaEntry>(), agentProcess.goalAgenda.entries)
+    }
+
+    @Test
+    fun `typed occurrence trigger activates again for different occurrence id`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val dangerTrigger = ActivationTrigger.occurrence("danger", SafetySignal::class.java)
+            .occurrenceId { it.name }
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry.of("typed-occurrence-safety-entry", safetyGoal)
+            .withLane(AgendaLane.SAFETY)
+            .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+            .activatedBy(dangerTrigger)
+        val agentProcess = SimpleAgentProcess(
+            id = "test-typed-occurrence-trigger-new-id",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.occurred(dangerTrigger, SafetySignal("first"))
+        agentProcess.tick()
+        agentProcess.tick()
+        agentProcess.objects.filterIsInstance<SafetyOutcome>().forEach { agentProcess.hide(it) }
+        agentProcess.ingress.occurred(dangerTrigger, SafetySignal("second"))
+        agentProcess.tick()
+
+        assertEquals(2, approvalCalls.get())
+        assertEquals(listOf("typed-occurrence-safety-entry"), agentProcess.goalAgenda.entries.map { it.id })
+    }
+
+    @Test
     fun `completed keyed resumable entry ignores duplicate activation while key remains true`() {
         val approvalCalls = AtomicInteger()
         val approver = object : AgendaEntryApprover {
@@ -922,7 +1131,7 @@ class EvolvingProcessModeTest {
     }
 
     @Test
-    fun `reactivating resumable agenda entry does not hide prior goal output`() {
+    fun `resumable agenda completion consumes stale goal output without poisoning equal future output`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
@@ -934,7 +1143,7 @@ class EvolvingProcessModeTest {
         )
         val agentProcess = SimpleAgentProcess(
             id = "test-resumable-reactivation-does-not-hide-output",
-            agent = EvolvingAgendaAgent,
+            agent = RerunnableEvolvingAgendaAgent,
             processOptions = ProcessOptions().withEvolution(EvolutionOptions()),
             blackboard = blackboard,
             platformServices = dummyPlatformServices(),
@@ -944,11 +1153,12 @@ class EvolvingProcessModeTest {
         agentProcess.addAgendaEntry(safetyEntry)
         agentProcess.tick()
         agentProcess.tick()
-        val safetyOutcome = agentProcess.objects.filterIsInstance<SafetyOutcome>().single()
 
+        assertEquals(emptyList<SafetyOutcome>(), agentProcess.objects.filterIsInstance<SafetyOutcome>())
         agentProcess.addAgendaEntry(safetyEntry)
+        agentProcess.tick()
 
-        assertTrue(safetyOutcome in agentProcess.objects)
+        assertEquals(listOf(SafetyOutcome("danger")), agentProcess.objects.filterIsInstance<SafetyOutcome>())
     }
 
     @Test

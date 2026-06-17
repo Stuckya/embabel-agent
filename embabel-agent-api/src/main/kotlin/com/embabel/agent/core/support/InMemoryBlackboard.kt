@@ -32,7 +32,7 @@ class InMemoryBlackboard(
 
     private val _map: MutableMap<String, Any> = ConcurrentHashMap()
     private val _entries: MutableList<Any> = Collections.synchronizedList(mutableListOf())
-    private val hiddens: MutableSet<Any> = Collections.synchronizedSet(mutableSetOf())
+    private val hiddens: MutableSet<Any> = Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap()))
     private val protectedKeys: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     override fun spawn(): Blackboard {
@@ -47,7 +47,7 @@ class InMemoryBlackboard(
 
     override fun clear() {
         // Preserve protected bindings and their values
-        val protectedValues = protectedKeys.mapNotNull { _map[it] }.toSet()
+        val protectedValues = protectedKeys.mapNotNull { _map[it] }
 
         // Clear non-protected map entries
         val keysToRemove = _map.keys - protectedKeys
@@ -55,11 +55,11 @@ class InMemoryBlackboard(
 
         // Clear non-protected entries from the list
         synchronized(_entries) {
-            _entries.removeIf { it !in protectedValues }
+            _entries.removeIf { entry -> protectedValues.none { it === entry } }
         }
 
         // Clear hiddens that aren't protected values
-        hiddens.removeIf { it !in protectedValues }
+        hiddens.removeIf { hidden -> protectedValues.none { it === hidden } }
     }
 
     override fun hide(what: Any) {
@@ -70,7 +70,7 @@ class InMemoryBlackboard(
 
     override val objects: List<Any>
         get() = synchronized(_entries) {
-            (_entries - hiddens).toList() // Return a snapshot to avoid concurrent modification
+            _entries.filterNot { isHidden(it) }.toList() // Return a snapshot to avoid concurrent modification
         }
 
     override fun get(name: String): Any? {

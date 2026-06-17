@@ -79,6 +79,10 @@ session state.
 - Goal: Embabel planner goal.
 - AgendaEntry: runtime wrapper that projects a `Goal` into the active process
   with bindings, lane, completion mode, activation key, and source context.
+- ActivationTrigger: typed ingress-to-agenda trigger used by normal consumers.
+  Level triggers model external state that can become true or false.
+  Occurrence triggers model identifiable events that should dedupe repeated
+  reports of the same occurrence.
 
 ## Public Interface: EvolvingInvocation
 
@@ -284,13 +288,26 @@ into the blackboard.
 - `activationKey`: activates matching catalog entries at drain time
 - `ttl`: hides the drained fact after the duration expires
 
+The happy-path API for agenda activation is `ActivationTrigger`, not raw string
+keys. `ActivationTrigger.level(K, Fact.class)` can be used with
+`BlackboardIngress.update(trigger, active, supplier)`: `false -> true` publishes
+a fact and activates matching entries, `true -> true` remains idempotent,
+`true -> false` rearms the process-private latch, and `false -> false` is a
+no-op. Level triggers may opt into `hideOnInactive()`, which hides the visible
+level fact at the next process seam when the trigger falls false.
+`ActivationTrigger.occurrence(K, Fact.class).occurrenceId(...)` can be used with
+`BlackboardIngress.occurred(trigger, fact)`: repeated occurrence ids are
+suppressed, while a different occurrence id can activate matching entries again.
+Both trigger styles project to the lower-level `activationKey` internally.
+
 `activationKey` bridges ingress to agenda activation: when a fact drains with
 activation key `K`, catalog entries with `activationKey == K` are proposed
 through the approver if process-private key `K` is not already active. This
 makes activation key ingress edge-triggered without using the planning condition
 namespace: duplicate publishes while `K` is active are idempotent, and a later
 occurrence can rearm through `BlackboardIngress.clearActivationKey(K)` before
-the next matching publish.
+the next matching publish. Raw keys and `clearActivationKey` remain low-level
+escape hatches for tests, explicit control, and migration.
 
 `BlackboardIngress.publish` is safe to call from non-process threads. It queues
 pending ingress under lock and does not mutate the blackboard directly. Normal
@@ -311,8 +328,8 @@ explicit. Prefer one of these patterns:
 
 - use `IngressMode.LATEST`, `coalesceKey`, and `ttl` for external facts whose
   visible state should replace or expire older facts
-- use `activationKey` when an external event should activate a runtime agenda
-  entry
+- use typed `ActivationTrigger`s when external state or events should activate
+  runtime agenda entries
 - avoid modeling toggled state as permanent append-only facts unless the
   corresponding hide/coalesce rule is part of the design
 
@@ -344,7 +361,8 @@ An `AgendaEntry` references a known goal and carries runtime context:
 Completion modes are intentionally small in the first POC:
 
 - `TERMINAL`: satisfying the entry completes the process
-- `RESUMABLE`: satisfying the entry removes it and re-arbitrates
+- `RESUMABLE`: satisfying the entry removes it, consumes visible outputs that
+  satisfy the entry goal, and re-arbitrates
 - `COMPOSITE_TERMINAL`: completes only when its completion predicate is true;
   if the child goal is satisfied before the predicate is true, the process
   waits instead of spinning on the already-satisfied goal
@@ -462,6 +480,16 @@ entry; call `BlackboardIngress.clearActivationKey` when the external trigger has
 cleared and should be allowed to fire again. An already active entry id is
 rejected.
 
+Typed `ActivationTrigger`s layer over this latch:
+
+- level triggers own the false-to-true edge and false rearm through
+  `BlackboardIngress.update`, with optional visible fact hiding via
+  `hideOnInactive()`
+- occurrence triggers dedupe by occurrence id and reactivate for new occurrence
+  ids
+- raw `activationKey` remains available for low-level/manual use, but examples
+  should prefer typed triggers
+
 Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
 Direct runtime additions are not remembered as one-shot catalog activations, so a
 host or action can propose a fresh entry again after the previous entry is no
@@ -495,8 +523,10 @@ Agenda goals use their entry's `AgendaCompletionMode`:
 
 - `TERMINAL` sets a completed outcome and completes the process.
 - `RESUMABLE` removes the selected agenda entry, records the underlying goal as
-  completed for base-goal suppression, sets a continue outcome, and re-runs
-  arbitration.
+  completed for base-goal suppression, consumes visible blackboard outputs that
+  satisfy the entry goal, sets a continue outcome, and re-runs arbitration. This
+  prevents a reactivated entry from being immediately satisfied by stale output
+  from its previous activation.
 - `COMPOSITE_TERMINAL` completes only when `completionPredicate` returns true.
   If the wrapped child goal is achieved before the composite predicate is true,
   the process moves to `WAITING`.
@@ -529,6 +559,10 @@ The POC has focused tests for:
 - activation keys and one-shot unkeyed catalog activation
 - activation-key idempotence for completed keyed `RESUMABLE` entries, with
   explicit false-then-true rearm behavior
+- typed level triggers for false-to-true activation, duplicate suppression, and
+  false-then-true rearm, including configured hide-on-inactive behavior
+- typed occurrence triggers for duplicate occurrence-id suppression and new-id
+  reactivation
 - direct runtime agenda addition and approval rejection
 - duplicate goal names distinguished by agenda entry identity and bindings
 - safety-lane hard priority over economic entries
@@ -543,6 +577,8 @@ The POC has focused tests for:
   `AgendaEntryApprover`
 - Java use of `ObjectiveAuthorRequest.objectiveAs(Class<T>)`,
   `AgendaEntry.of(...).with...`, and `Nirvana.NIRVANA`
+- Java use of typed `ActivationTrigger` with
+  `AgendaEntry.of(...).activatedBy(trigger)` and `BlackboardIngress.update`
 
 ## POC Boundary and Cleanup Direction
 
@@ -577,7 +613,8 @@ mutation.
 
 Revisit after more consumer dogfood and framework-level acceptance coverage:
 
-- `activationKey`: currently a stringly ingress-to-agenda bridge. It may stay
+- `ActivationTrigger` and `activationKey`: typed triggers are now the normal
+  consumer-facing ingress-to-agenda path. Raw `activationKey` may stay
   low-level, but objective handlers or `ObjectiveAuthor` should own higher
   level fact-to-objective mapping.
 - `AgendaEntryApprover`: duplicates `GoalChoiceApprover`'s approval protocol

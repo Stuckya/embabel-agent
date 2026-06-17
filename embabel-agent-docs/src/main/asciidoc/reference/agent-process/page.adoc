@@ -185,6 +185,16 @@ process-private activation key transitions from inactive to active.
 Duplicate matching ingress while the key remains active is idempotent; call
 `BlackboardIngress.clearActivationKey` when the external trigger has cleared and
 should be allowed to fire again.
+The preferred consumer-facing API is `ActivationTrigger`, which owns these latch
+mechanics for common cases.
+Use `ActivationTrigger.level(... )` with `BlackboardIngress.update` for external
+state that becomes true or false. Level triggers can opt into
+`hideOnInactive()` to hide the visible level fact at the next process seam when
+the trigger falls false.
+Use `ActivationTrigger.occurrence(...).occurrenceId(...)` with
+`BlackboardIngress.occurred` for identifiable events where repeated reports of
+the same occurrence should be suppressed.
+Raw `activationKey` and `clearActivationKey` remain low-level escape hatches.
 Runtime code can also propose entries directly with `AgentProcess.addAgendaEntry`;
 direct additions are the repeatable path for entries created while the process
 is already running.
@@ -225,7 +235,8 @@ For external world state, prefer explicit ingress semantics over permanent
 append-only boolean facts.
 Use `IngressMode.LATEST`, `coalesceKey`, and `ttl` when a visible fact should
 replace or expire older facts.
-Use `activationKey` when an event should activate a runtime agenda entry.
+Use typed `ActivationTrigger`s when external state or events should activate a
+runtime agenda entry.
 Activation keys are edge-triggered: a matching publish while the key is already
 active will not propose the catalog entry again. Activation keys are not written
 as blackboard planning conditions.
@@ -237,7 +248,10 @@ Agenda completion is controlled by `AgendaCompletionMode`.
 `COMPOSITE_TERMINAL` completes the process only when its completion predicate is
 satisfied. If the underlying goal is satisfied before the predicate is true, the
 process waits instead of repeatedly replanning the same already-satisfied goal.
-`RESUMABLE` removes the satisfied entry and lets the process re-arbitrate.
+`RESUMABLE` removes the satisfied entry, consumes visible blackboard outputs
+that satisfy the entry goal, and lets the process re-arbitrate. This prevents a
+later reactivation from being instantly satisfied by stale output from the
+previous activation.
 `KEEP_ALIVE` and `RECURRING` are intentionally not part of this POC surface.
 `AgendaCompletionPredicate` overlaps with Embabel's existing `Condition`
 composition model.
@@ -283,6 +297,28 @@ EvolutionOptions evolution = new EvolutionOptions(
 );
 
 ProcessOptions options = ProcessOptions.DEFAULT.withEvolution(evolution);
+----
+
+The following typed-trigger Java snippet is from `BlackboardIngressJavaTest`:
+
+[source,java]
+----
+var trigger = ActivationTrigger.level("java-activation", JavaIngressFact.class)
+    .latest("java-fact")
+    .wake(IngressWake.WAKE);
+var goal = agent.getGoals().iterator().next();
+var entry = AgendaEntry.of("java-entry", goal)
+    .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+    .activatedBy(trigger);
+var processOptions = ProcessOptions.DEFAULT.withEvolution(
+    new EvolutionOptions(GoalAgenda.EMPTY.withEntry(entry))
+);
+
+var receipt = agentProcess.getIngress().update(
+    trigger,
+    true,
+    () -> new JavaIngressFact("typed")
+);
 ----
 
 The following Kotlin snippet is from `EvolvingProcessModeTest`:

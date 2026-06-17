@@ -90,6 +90,7 @@ class BlackboardIngressDrainedEvent(
 enum class BlackboardIngressHideReason {
     LATEST_REPLACED,
     TTL_EXPIRED,
+    LEVEL_INACTIVE,
 }
 
 class BlackboardIngressHiddenEvent(

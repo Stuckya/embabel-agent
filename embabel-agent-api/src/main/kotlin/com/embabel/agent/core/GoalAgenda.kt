@@ -77,6 +77,9 @@ data class AgendaEntry @JvmOverloads constructor(
     fun withActivationKey(activationKey: String?): AgendaEntry =
         copy(activationKey = activationKey)
 
+    fun <T : Any> activatedBy(trigger: ActivationTrigger<T>): AgendaEntry =
+        withActivationKey(trigger.key)
+
     fun withTtl(ttl: Duration?): AgendaEntry =
         copy(ttl = ttl)
 

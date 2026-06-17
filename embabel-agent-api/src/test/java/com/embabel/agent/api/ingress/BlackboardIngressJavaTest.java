@@ -20,8 +20,13 @@ import com.embabel.agent.api.annotation.Action;
 import com.embabel.agent.api.annotation.Agent;
 import com.embabel.agent.api.annotation.support.AgentMetadataReader;
 import com.embabel.agent.api.event.BlackboardIngressDrainedEvent;
+import com.embabel.agent.core.ActivationTrigger;
+import com.embabel.agent.core.AgendaCompletionMode;
+import com.embabel.agent.core.AgendaEntry;
 import com.embabel.agent.core.AgentProcess;
 import com.embabel.agent.core.AgentProcessStatusCode;
+import com.embabel.agent.core.EvolutionOptions;
+import com.embabel.agent.core.GoalAgenda;
 import com.embabel.agent.core.IngressMode;
 import com.embabel.agent.core.IngressOptions;
 import com.embabel.agent.core.IngressWake;
@@ -101,5 +106,42 @@ class BlackboardIngressJavaTest {
         assertThat(drainedEvents).hasSize(1);
         assertThat(drainedEvents.getFirst().getReceipt()).isEqualTo(receipt);
         assertThat(drainedEvents.getFirst().getFact()).isEqualTo(fact);
+    }
+
+    @Test
+    void javaCanActivateAgendaEntryWithTypedLevelTrigger() {
+        var blackboard = new InMemoryBlackboard();
+        var reader = new AgentMetadataReader();
+        var agent = (com.embabel.agent.core.Agent) reader.createAgentMetadata(new JavaIngressAgent());
+        var trigger = ActivationTrigger.level("java-activation", JavaIngressFact.class)
+            .latest("java-fact")
+            .wake(IngressWake.WAKE);
+        var goal = agent.getGoals().iterator().next();
+        var entry = AgendaEntry.of("java-entry", goal)
+            .withCompletionMode(AgendaCompletionMode.RESUMABLE)
+            .activatedBy(trigger);
+        var processOptions = ProcessOptions.DEFAULT.withEvolution(
+            new EvolutionOptions(GoalAgenda.EMPTY.withEntry(entry))
+        );
+        var agentProcess = new SimpleAgentProcess(
+            "test-java-typed-trigger",
+            null,
+            agent,
+            processOptions,
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory.INSTANCE,
+            Instant.now()
+        );
+
+        var receipt = agentProcess.getIngress().update(
+            trigger,
+            true,
+            () -> new JavaIngressFact("typed")
+        );
+        agentProcess.tick();
+
+        assertThat(receipt).isNotNull();
+        assertThat((JavaIngressResult) blackboard.lastResult()).isEqualTo(new JavaIngressResult("typed"));
     }
 }
