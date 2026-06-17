@@ -28,6 +28,8 @@ interface BlackboardIngress {
 
     fun publish(fact: Any): IngressReceipt = publish(fact, IngressOptions())
 
+    fun clearActivationKey(activationKey: String) {}
+
     companion object {
 
         @JvmField

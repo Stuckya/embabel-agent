@@ -84,6 +84,10 @@ data class BlockingWorkOutcome(
     val name: String,
 )
 
+data class PlanningConditionCollisionOutcome(
+    val name: String,
+)
+
 object SafetyPreemptProbe {
 
     lateinit var actionStarted: CountDownLatch
@@ -196,6 +200,24 @@ val UtilityAgendaAgent = agent("UtilityAgendaAgent", description = "Tests agenda
     ) {
         EconomicOutcome(it.input.name)
     }
+}
+
+val ActivationConditionCollisionAgent = agent(
+    "ActivationConditionCollisionAgent",
+    description = "Tests activation key isolation from planning conditions",
+) {
+    transformation<EconomicSignal, PlanningConditionCollisionOutcome>(
+        name = "planning-condition-work",
+        pre = listOf("danger"),
+    ) {
+        PlanningConditionCollisionOutcome(it.input.name)
+    }
+    goal(
+        name = "planning-condition-goal",
+        description = "Complete work requiring a planning condition",
+        satisfiedBy = PlanningConditionCollisionOutcome::class,
+        value = { 1.0 },
+    )
 }
 
 class EvolvingProcessModeTest {
@@ -767,7 +789,7 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
         agentProcess.tick()
         agentProcess.objects.filterIsInstance<SafetyOutcome>().forEach { agentProcess.hide(it) }
-        agentProcess.setCondition("danger", false)
+        agentProcess.ingress.clearActivationKey("danger")
 
         agentProcess.ingress.publish(
             SafetySignal("second"),
@@ -829,6 +851,74 @@ class EvolvingProcessModeTest {
 
         assertEquals(1, approvalCalls.get())
         assertEquals(emptyList<AgendaEntry>(), agentProcess.goalAgenda.entries)
+    }
+
+    @Test
+    fun `planning condition with same name as activation key does not suppress agenda activation`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val blackboard = InMemoryBlackboard()
+        blackboard.setCondition("danger", true)
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry(
+            id = "collision-safety-entry",
+            goal = safetyGoal,
+            lane = AgendaLane.SAFETY,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+            activationKey = "danger",
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-planning-condition-does-not-suppress-activation",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.publish(
+            SafetySignal("danger"),
+            IngressOptions(activationKey = "danger"),
+        )
+        agentProcess.tick()
+
+        assertEquals(1, approvalCalls.get())
+        assertEquals(listOf("collision-safety-entry"), agentProcess.goalAgenda.entries.map { it.id })
+    }
+
+    @Test
+    fun `activation key publish does not satisfy unrelated planning condition`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += EconomicSignal("ready")
+        val agentProcess = SimpleAgentProcess(
+            id = "test-activation-key-does-not-set-planning-condition",
+            agent = ActivationConditionCollisionAgent,
+            processOptions = ProcessOptions().withEvolution(EvolutionOptions()),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.publish(
+            SafetySignal("danger"),
+            IngressOptions(activationKey = "danger"),
+        )
+        agentProcess.tick()
+
+        assertEquals(null, blackboard.getCondition("danger"))
+        assertTrue(agentProcess.objects.none { it is PlanningConditionCollisionOutcome })
     }
 
     @Test

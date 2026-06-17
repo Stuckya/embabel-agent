@@ -91,7 +91,7 @@ class BlackboardIngressJavaTest {
 
         assertThat(result.getStatus()).isEqualTo(AgentProcessStatusCode.COMPLETED);
         assertThat(blackboard.getObjects()).contains(fact);
-        assertThat(blackboard.getCondition("java-activation")).isEqualTo(true);
+        assertThat(blackboard.getCondition("java-activation")).isNull();
         assertThat((JavaIngressResult) blackboard.lastResult()).isEqualTo(new JavaIngressResult("Duke"));
 
         var drainedEvents = listener.getProcessEvents().stream()

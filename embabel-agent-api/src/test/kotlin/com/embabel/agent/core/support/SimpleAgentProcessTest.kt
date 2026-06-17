@@ -423,7 +423,7 @@ class SimpleAgentProcessTest {
 
             assertEquals(AgentProcessStatusCode.STUCK, result.status)
             assertTrue(blackboard.objects.contains(dog))
-            assertEquals(true, blackboard.getCondition("dog-arrived"))
+            assertEquals(null, blackboard.getCondition("dog-arrived"))
 
             val published = listener.processEvents.filterIsInstance<BlackboardIngressPublishedEvent>().single()
             val drained = listener.processEvents.filterIsInstance<BlackboardIngressDrainedEvent>().single()

@@ -203,12 +203,18 @@ abstract class AbstractAgentProcess(
 
     private val activeIngress = CopyOnWriteArrayList<ActiveBlackboardIngress>()
 
+    private val activeActivationKeys = ConcurrentHashMap.newKeySet<String>()
+
     override val ingress: BlackboardIngress = object : BlackboardIngress {
 
         override fun publish(
             fact: Any,
             options: IngressOptions,
         ): IngressReceipt = publishIngress(fact, options)
+
+        override fun clearActivationKey(activationKey: String) {
+            activeActivationKeys.remove(activationKey)
+        }
     }
 
     private fun publishIngress(
@@ -278,7 +284,7 @@ abstract class AbstractAgentProcess(
         val options = pending.receipt.options
         val key = ingressKey(pending.fact, options)
         val activationKeyWasAlreadyTrue = options.activationKey?.let {
-            blackboard.getCondition(it) == true
+            !activeActivationKeys.add(it)
         } == true
         if (options.mode == IngressMode.LATEST) {
             hideVisibleIngress(
@@ -289,7 +295,6 @@ abstract class AbstractAgentProcess(
         }
         addObject(pending.fact)
         options.activationKey?.let {
-            blackboard.setCondition(it, true)
             if (!activationKeyWasAlreadyTrue) {
                 activateAgendaEntries(
                     activationKey = it,

@@ -286,10 +286,11 @@ into the blackboard.
 
 `activationKey` bridges ingress to agenda activation: when a fact drains with
 activation key `K`, catalog entries with `activationKey == K` are proposed
-through the approver if key `K` was not already true on the blackboard. This
-makes activation key ingress edge-triggered: duplicate publishes while `K` is
-already true are idempotent, and a later occurrence can rearm by setting `K` to
-false before the next matching publish.
+through the approver if process-private key `K` is not already active. This
+makes activation key ingress edge-triggered without using the planning condition
+namespace: duplicate publishes while `K` is active are idempotent, and a later
+occurrence can rearm through `BlackboardIngress.clearActivationKey(K)` before
+the next matching publish.
 
 `BlackboardIngress.publish` is safe to call from non-process threads. It queues
 pending ingress under lock and does not mutate the blackboard directly. Normal
@@ -434,9 +435,9 @@ At drain time, the process:
 2. drains pending ingress
 3. hides prior visible ingress with the same key for `LATEST` mode
 4. adds the new fact to the blackboard
-5. sets the activation condition for `activationKey`, when present
-6. activates matching catalog entries through the approver
-7. records the drained fact as active ingress for TTL tracking
+5. activates matching catalog entries through the approver when `activationKey`
+   is present and not already active
+6. records the drained fact as active ingress for TTL tracking
 
 TTL expiry hides facts and emits a hidden-ingress event. It does not delete or
 mutate facts.
@@ -455,10 +456,11 @@ Safety preempt is narrow:
 
 Catalog entries without an `activationKey` activate at a process seam once per
 entry id. Keyed catalog entries activate when matching ingress is drained and
-the activation key transitions from not-true to true. Duplicate matching ingress
-while the key remains true does not re-propose the entry; reset the key to false
-when the external trigger has cleared and should be allowed to fire again. An
-already active entry id is rejected.
+the process-private activation key transitions from inactive to active.
+Duplicate matching ingress while the key remains active does not re-propose the
+entry; call `BlackboardIngress.clearActivationKey` when the external trigger has
+cleared and should be allowed to fire again. An already active entry id is
+rejected.
 
 Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
 Direct runtime additions are not remembered as one-shot catalog activations, so a
