@@ -767,6 +767,7 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
         agentProcess.tick()
         agentProcess.objects.filterIsInstance<SafetyOutcome>().forEach { agentProcess.hide(it) }
+        agentProcess.setCondition("danger", false)
 
         agentProcess.ingress.publish(
             SafetySignal("second"),
@@ -776,6 +777,58 @@ class EvolvingProcessModeTest {
 
         assertEquals(2, approvalCalls.get())
         assertEquals(listOf("rearmable-safety-entry"), agentProcess.goalAgenda.entries.map { it.id })
+    }
+
+    @Test
+    fun `completed keyed resumable entry ignores duplicate activation while key remains true`() {
+        val approvalCalls = AtomicInteger()
+        val approver = object : AgendaEntryApprover {
+            override fun approve(request: AgendaEntryApprovalRequest): AgendaEntryApprovalResponse {
+                approvalCalls.incrementAndGet()
+                return AgendaEntryApproved(request)
+            }
+        }
+        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
+        val safetyEntry = AgendaEntry(
+            id = "rearmable-safety-entry",
+            goal = safetyGoal,
+            lane = AgendaLane.SAFETY,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+            activationKey = "danger",
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-duplicate-keyed-resumable-activation",
+            agent = EvolvingAgendaAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
+                    agendaEntryApprover = approver,
+                )
+            ),
+            blackboard = InMemoryBlackboard(),
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.ingress.publish(
+            SafetySignal("first"),
+            IngressOptions(activationKey = "danger"),
+        )
+        agentProcess.tick()
+        agentProcess.tick()
+
+        assertEquals(1, approvalCalls.get())
+        assertEquals(emptyList<AgendaEntry>(), agentProcess.goalAgenda.entries)
+
+        agentProcess.ingress.publish(
+            SafetySignal("duplicate"),
+            IngressOptions(activationKey = "danger"),
+        )
+        agentProcess.tick()
+
+        assertEquals(1, approvalCalls.get())
+        assertEquals(emptyList<AgendaEntry>(), agentProcess.goalAgenda.entries)
     }
 
     @Test

@@ -286,7 +286,10 @@ into the blackboard.
 
 `activationKey` bridges ingress to agenda activation: when a fact drains with
 activation key `K`, catalog entries with `activationKey == K` are proposed
-through the approver.
+through the approver if key `K` was not already true on the blackboard. This
+makes activation key ingress edge-triggered: duplicate publishes while `K` is
+already true are idempotent, and a later occurrence can rearm by setting `K` to
+false before the next matching publish.
 
 `BlackboardIngress.publish` is safe to call from non-process threads. It queues
 pending ingress under lock and does not mutate the blackboard directly. Normal
@@ -451,7 +454,10 @@ Safety preempt is narrow:
 6. safety-lane planning preempts economic agenda entries
 
 Catalog entries without an `activationKey` activate at a process seam once per
-entry id. Keyed catalog entries activate when matching ingress is drained. An
+entry id. Keyed catalog entries activate when matching ingress is drained and
+the activation key transitions from not-true to true. Duplicate matching ingress
+while the key remains true does not re-propose the entry; reset the key to false
+when the external trigger has cleared and should be allowed to fire again. An
 already active entry id is rejected.
 
 Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
@@ -519,6 +525,8 @@ The POC has focused tests for:
   objective-authored evolution, initial facts, canonicalized goals, and manual
   ingress/tick control
 - activation keys and one-shot unkeyed catalog activation
+- activation-key idempotence for completed keyed `RESUMABLE` entries, with
+  explicit false-then-true rearm behavior
 - direct runtime agenda addition and approval rejection
 - duplicate goal names distinguished by agenda entry identity and bindings
 - safety-lane hard priority over economic entries

@@ -180,7 +180,11 @@ or agent-scope expansion is out of scope.
 Use `withEntry`, `withoutEntry`, or `expire` to produce a new agenda.
 `EvolutionOptions.agendaCatalog` is an activatable catalog: entries without an
 `activationKey` are activated once per entry id at a process seam, and keyed
-entries are activated when matching blackboard ingress is drained.
+entries are activated when matching blackboard ingress is drained and the
+activation key transitions from not-true to true.
+Duplicate matching ingress while the key remains true is idempotent; reset the
+key to false when the external trigger has cleared and should be allowed to fire
+again.
 Runtime code can also propose entries directly with `AgentProcess.addAgendaEntry`;
 direct additions are the repeatable path for entries created while the process
 is already running.
@@ -222,6 +226,8 @@ append-only boolean facts.
 Use `IngressMode.LATEST`, `coalesceKey`, and `ttl` when a visible fact should
 replace or expire older facts.
 Use `activationKey` when an event should activate a runtime agenda entry.
+Activation keys are edge-triggered: a matching publish while the key is already
+true will not propose the catalog entry again.
 Avoid relying on append-only facts as mutable booleans unless the hide or
 coalesce behavior is explicit.
 

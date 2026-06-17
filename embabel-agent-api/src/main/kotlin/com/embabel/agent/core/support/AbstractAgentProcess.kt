@@ -277,6 +277,9 @@ abstract class AbstractAgentProcess(
     private fun drainIngress(pending: PendingBlackboardIngress, now: Instant) {
         val options = pending.receipt.options
         val key = ingressKey(pending.fact, options)
+        val activationKeyWasAlreadyTrue = options.activationKey?.let {
+            blackboard.getCondition(it) == true
+        } == true
         if (options.mode == IngressMode.LATEST) {
             hideVisibleIngress(
                 key = key,
@@ -287,10 +290,12 @@ abstract class AbstractAgentProcess(
         addObject(pending.fact)
         options.activationKey?.let {
             blackboard.setCondition(it, true)
-            activateAgendaEntries(
-                activationKey = it,
-                sourceFact = pending.fact,
-            )
+            if (!activationKeyWasAlreadyTrue) {
+                activateAgendaEntries(
+                    activationKey = it,
+                    sourceFact = pending.fact,
+                )
+            }
         }
         activeIngress += ActiveBlackboardIngress(
             fact = pending.fact,
