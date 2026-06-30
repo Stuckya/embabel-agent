@@ -501,25 +501,6 @@ class SimpleAgentProcessTest {
             assertEquals(BlackboardIngressHideReason.TTL_EXPIRED, hidden.reason)
         }
 
-        @Test
-        fun `safety preempt ingress without active action does not create unscoped cancellation`() {
-            val blackboard = InMemoryBlackboard()
-            val agentProcess = createProcess(EventSavingAgenticEventListener(), blackboard)
-            val dog = Dog("Duke")
-
-            agentProcess.ingress.publish(
-                dog,
-                IngressOptions(wake = IngressWake.SAFETY_PREEMPT),
-            )
-
-            assertFalse(agentProcess.processContext.cancellationToken.isCancellationRequested)
-            assertFalse(blackboard.objects.contains(dog))
-
-            agentProcess.tick()
-
-            assertTrue(blackboard.objects.contains(dog))
-        }
-
         private fun createProcess(
             listener: EventSavingAgenticEventListener,
             blackboard: InMemoryBlackboard,

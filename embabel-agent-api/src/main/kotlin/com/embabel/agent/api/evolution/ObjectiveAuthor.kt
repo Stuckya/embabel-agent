@@ -19,6 +19,7 @@ import com.embabel.agent.core.AgendaEntry
 import com.embabel.agent.core.AgentScope
 import com.embabel.agent.core.CompletionPolicy
 import com.embabel.agent.core.EvolutionOptions
+import com.embabel.agent.core.EvolutionPolicy
 import com.embabel.agent.core.GoalAgenda
 import com.embabel.agent.core.ProcessOptions
 
@@ -56,6 +57,7 @@ data class ObjectivePlan @JvmOverloads constructor(
     val agendaEntries: List<AgendaEntry> = emptyList(),
     val initialFacts: List<Any> = emptyList(),
     val completionPolicy: CompletionPolicy? = null,
+    val evolutionPolicy: EvolutionPolicy = EvolutionPolicy.EMPTY,
 ) {
 
     fun applyTo(processOptions: ProcessOptions): ProcessOptions =
@@ -68,6 +70,9 @@ data class ObjectivePlan @JvmOverloads constructor(
         return base.copy(
             agendaCatalog = agendaCatalog,
             completionPolicy = completionPolicy ?: base.completionPolicy,
+            policy = evolutionPolicy.rules.fold(base.policy) { policy, rule ->
+                policy.withRule(rule)
+            },
         )
     }
 

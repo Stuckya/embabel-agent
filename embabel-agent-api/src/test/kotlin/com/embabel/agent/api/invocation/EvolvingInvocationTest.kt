@@ -21,11 +21,15 @@ import com.embabel.agent.api.evolution.ObjectivePlan
 import com.embabel.agent.core.AgendaCompletionMode
 import com.embabel.agent.core.AgendaEntry
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.CompletionPolicy
 import com.embabel.agent.core.EvolutionOptions
+import com.embabel.agent.core.EvolutionPolicy
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalAgenda
 import com.embabel.agent.core.IngressOptions
 import com.embabel.agent.core.IngressWake
+import com.embabel.agent.core.ProcessOutcome
+import com.embabel.agent.core.ProcessOutcomeCode
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyAgentPlatform
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -43,15 +47,39 @@ data class OutOfScopeResult(val name: String)
 
 data class CollectionActivated(val zone: String)
 
+data class PrioritySampleStored(val zone: String)
+
+data class HazardDetected(val zone: String)
+
+data class HazardHandled(val zone: String)
+
 val CollectionCapabilitiesAgent = agent("CollectionCapabilitiesAgent", description = "Tests evolving invocation") {
     transformation<SampleAvailable, SampleStored>(name = "collect-sample") {
         SampleStored(it.input.zone)
+    }
+    transformation<SampleAvailable, PrioritySampleStored>(name = "priority-collect-sample") {
+        PrioritySampleStored(it.input.zone)
+    }
+    transformation<HazardDetected, HazardHandled>(name = "handle-hazard") {
+        HazardHandled(it.input.zone)
     }
     goal(
         name = "sample-stored",
         description = "Store a sample",
         satisfiedBy = SampleStored::class,
-        value = { 1.0 },
+        value = { 0.5 },
+    )
+    goal(
+        name = "priority-sample-stored",
+        description = "Store a high value sample without safety semantics",
+        satisfiedBy = PrioritySampleStored::class,
+        value = { 0.95 },
+    )
+    goal(
+        name = "hazard-handled",
+        description = "Handle a hazard",
+        satisfiedBy = HazardHandled::class,
+        value = { 0.95 },
     )
 }
 
@@ -113,6 +141,42 @@ class EvolvingInvocationTest {
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         assertEquals(SampleStored("zone-a"), result.lastResult())
         assertTrue(result.objects.contains(objective))
+    }
+
+    @Test
+    fun `objective author can compile runtime fact policy before launch`() {
+        val agentPlatform = dummyAgentPlatform()
+        val objective = CollectSamplesUntil(zone = "zone-a", target = 1)
+        val objectiveAuthor = ObjectiveAuthor { request ->
+            val collectSamplesUntil = request.objectiveAs<CollectSamplesUntil>()
+            ObjectivePlan(
+                id = "policy-collect-zone-a",
+                evolutionPolicy = EvolutionPolicy.EMPTY.onEvent(
+                    eventType = SampleAvailable::class.java,
+                    runtimeAction = SampleStored::class.java,
+                ),
+                initialFacts = listOf(SampleAvailable(collectSamplesUntil.zone)),
+                completionPolicy = CompletionPolicy { process, _ ->
+                    if (process.objects.any { it is SampleStored }) {
+                        ProcessOutcome(
+                            code = ProcessOutcomeCode.COMPLETED,
+                            reason = "sample stored",
+                        )
+                    } else {
+                        ProcessOutcome()
+                    }
+                },
+            )
+        }
+
+        val result = EvolvingInvocation.on(agentPlatform)
+            .withScope(CollectionCapabilitiesAgent)
+            .withObjectiveAuthor(objectiveAuthor)
+            .run(objective)
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(SampleStored("zone-a"), result.lastResult())
+        assertEquals(1, result.processOptions.evolution.policy.rules.size)
     }
 
     @Test
@@ -324,5 +388,47 @@ class EvolvingInvocationTest {
 
         assertTrue(thrown.message!!.contains("EvolutionOptions"))
         assertTrue(thrown.message!!.contains("out-of-scope-goal"))
+    }
+
+    @Test
+    fun `direct evolution policy is rejected when runtime action is outside active scope`() {
+        val agentPlatform = dummyAgentPlatform()
+        val evolution = EvolutionOptions(
+            policy = EvolutionPolicy.EMPTY.onEvent(
+                eventType = SampleAvailable::class.java,
+                runtimeAction = OutOfScopeResult::class.java,
+            ),
+        )
+
+        val thrown = assertThrows(IllegalArgumentException::class.java) {
+            EvolvingInvocation.on(agentPlatform)
+                .withScope(CollectionCapabilitiesAgent)
+                .withEvolution(evolution)
+                .createProcess(CollectSamplesUntil(zone = "zone-a", target = 1))
+        }
+
+        assertTrue(thrown.message!!.contains("EvolutionOptions"))
+        assertTrue(thrown.message!!.contains(OutOfScopeResult::class.java.name))
+    }
+
+    @Test
+    fun `direct evolution policy allows high value runtime action without framework priority convention`() {
+        val agentPlatform = dummyAgentPlatform()
+        val evolution = EvolutionOptions(
+            policy = EvolutionPolicy.EMPTY.onEvent(
+                eventType = SampleAvailable::class.java,
+                runtimeAction = PrioritySampleStored::class.java,
+            ),
+        )
+
+        val process = EvolvingInvocation.on(agentPlatform)
+            .withScope(CollectionCapabilitiesAgent)
+            .withEvolution(evolution)
+            .createProcess(CollectSamplesUntil(zone = "zone-a", target = 1))
+
+        assertEquals(
+            PrioritySampleStored::class.java.name,
+            process.processOptions.evolution.policy.rules.single().goal?.outputType?.name,
+        )
     }
 }

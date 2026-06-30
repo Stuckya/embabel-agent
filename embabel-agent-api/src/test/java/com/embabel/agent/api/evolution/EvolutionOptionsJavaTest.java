@@ -20,7 +20,6 @@ import com.embabel.agent.core.AgendaEntry;
 import com.embabel.agent.core.AgendaEntryApprovalRequest;
 import com.embabel.agent.core.AgendaEntryApproved;
 import com.embabel.agent.core.AgendaEntryApprover;
-import com.embabel.agent.core.AgendaLane;
 import com.embabel.agent.core.EvolutionOptions;
 import com.embabel.agent.core.Goal;
 import com.embabel.agent.core.GoalAgenda;
@@ -42,7 +41,6 @@ class EvolutionOptionsJavaTest {
         AgendaEntry entry = AgendaEntry.of("java-entry", goal)
             .withBindings(Map.of("tenant", "test"))
             .withSource("java-test")
-            .withLane(AgendaLane.ECONOMIC)
             .withCompletionMode(AgendaCompletionMode.TERMINAL)
             .withActivationKey("java-activation");
         AgendaEntryApprover approver = request -> new AgendaEntryApproved(request);
@@ -56,7 +54,6 @@ class EvolutionOptionsJavaTest {
             entry,
             "source-fact",
             String.class.getName(),
-            AgendaLane.ECONOMIC,
             Map.of(),
             GoalAgenda.EMPTY,
             null

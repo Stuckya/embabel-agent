@@ -23,9 +23,12 @@ import com.embabel.agent.api.evolution.ObjectiveAuthor;
 import com.embabel.agent.api.evolution.ObjectivePlan;
 import com.embabel.agent.core.AgendaCompletionMode;
 import com.embabel.agent.core.AgendaEntry;
-import com.embabel.agent.core.AgendaLane;
 import com.embabel.agent.core.AgentProcessStatusCode;
+import com.embabel.agent.core.CompletionPolicy;
+import com.embabel.agent.core.EvolutionPolicy;
 import com.embabel.agent.core.Goal;
+import com.embabel.agent.core.ProcessOutcome;
+import com.embabel.agent.core.ProcessOutcomeCode;
 import com.embabel.agent.test.integration.IntegrationTestUtils;
 import org.junit.jupiter.api.Test;
 
@@ -68,7 +71,6 @@ class EvolvingInvocationJavaTest {
             return new ObjectivePlan(
                 "java-collect-zone-a",
                 List.of(AgendaEntry.of("java-collect-sample", sampleStoredGoal)
-                    .withLane(AgendaLane.ECONOMIC)
                     .withCompletionMode(AgendaCompletionMode.TERMINAL)),
                 List.of(new JavaSampleAvailable(collectSamplesUntil.zone())),
                 null
@@ -83,5 +85,33 @@ class EvolvingInvocationJavaTest {
         assertThat(result.getStatus()).isEqualTo(AgentProcessStatusCode.COMPLETED);
         assertThat(result.lastResult()).isEqualTo(new JavaSampleStored("zone-a"));
         assertThat(NIRVANA.getName()).isEqualTo("Nirvana");
+    }
+
+    @Test
+    void javaCanAuthorRuntimeFactPolicy() {
+        var agentPlatform = IntegrationTestUtils.dummyAgentPlatform();
+        var objective = new JavaCollectSamplesUntil("zone-a", 1);
+        ObjectiveAuthor objectiveAuthor = request -> {
+            var collectSamplesUntil = request.objectiveAs(JavaCollectSamplesUntil.class);
+            CompletionPolicy completeWhenStored = (process, agenda) -> process.getObjects().stream()
+                .anyMatch(JavaSampleStored.class::isInstance) ?
+                new ProcessOutcome(ProcessOutcomeCode.COMPLETED, "sample stored", null) :
+                new ProcessOutcome();
+            return new ObjectivePlan(
+                "java-policy-collect-zone-a",
+                List.of(),
+                List.of(new JavaSampleAvailable(collectSamplesUntil.zone())),
+                completeWhenStored,
+                EvolutionPolicy.EMPTY.onEvent(JavaSampleAvailable.class, JavaSampleStored.class)
+            );
+        };
+
+        var result = EvolvingInvocation.on(agentPlatform)
+            .withScope(AgentScopeBuilder.fromInstance(new JavaCollectionCapabilities()))
+            .withObjectiveAuthor(objectiveAuthor)
+            .run(objective);
+
+        assertThat(result.getStatus()).isEqualTo(AgentProcessStatusCode.COMPLETED);
+        assertThat(result.lastResult()).isEqualTo(new JavaSampleStored("zone-a"));
     }
 }

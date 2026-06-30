@@ -28,9 +28,10 @@ Mode a first-class runtime mechanism.
 
 Declared agent and capability metadata should remain immutable.
 
-A running process may add, remove, or reprioritize process-local runtime goals.
-Those runtime goals are not mutations of `@Agent` declared goals. They are active
-objectives for this process instance.
+A running process may add or remove process-local runtime goals. Those runtime
+goals are not mutations of `@Agent` declared goals. They are active objectives
+for this process instance; normal GOAP, Utility, or Hybrid arbitration decides
+what runs.
 
 ```text
 @Agent / @EmbabelComponent metadata = stable capability declaration
@@ -40,6 +41,106 @@ EvolutionPolicy = maps facts to runtime goals
 
 This is how Evolving Mode can satisfy the README direction of "add further
 goals" without rewriting user declarations at runtime.
+
+## Maintainer Feedback Shape
+
+The proposal should separate three concerns that were easy to blur together:
+
+- declared capabilities: immutable `@Agent` and `@EmbabelComponent` actions,
+  conditions, and declared goals
+- runtime facts: process-local state available at planning ticks
+- runtime goals: process-local active objectives added or removed by an
+  evolution policy
+
+This keeps the "mutable" part of Evolving Mode inside the running process. The
+effective planning system for that process may change, but Embabel does not
+rewrite user-declared agent metadata.
+
+Runtime facts are a substrate rather than the whole feature. Internally driven
+evolution can start with facts produced by normal actions. Externally driven
+evolution needs a sanctioned ingress path so a known running process can receive
+facts from the host application. Both paths feed the same evolution engine.
+
+Incremental delivery can therefore be framed as:
+
+1. internal action-produced runtime facts: normal action outputs activate
+   process-local runtime goals
+2. external triggers/events: host-published facts enter the same process safely
+   at planning seams
+3. observability support: each wake-up remains attached to the existing
+   process/session, with clean turn boundaries and runtime-goal lifecycle events
+
+Pub/sub fan-out is related but separate. This proposal only needs point-to-point
+fact publication to one known running process.
+
+## Practical Use Case
+
+A concrete consumer scenario is:
+
+```text
+Collect samples in Zone A until 500 samples are stored.
+```
+
+The process runs over scoped capabilities such as:
+
+- collection
+- navigation
+- storage
+- hazard response
+- buffer or workspace state
+
+The collection capability should not directly call storage or navigation. It
+should produce or consume domain facts, while Embabel composes the scoped
+capabilities through the planner.
+
+Example runtime facts:
+
+- `BufferSnapshot`
+- `BufferFull`
+- `StorageNeeded`
+- `ArrivedAtStorage`
+- `StorageCompleted`
+- `HazardDetected`
+- `HazardHandled`
+
+Example evolution rules:
+
+```java
+.onFact(StorageNeeded.class)
+    .handleWith(StorageCompleted.class)
+    .resumable()
+
+.onFact(HazardDetected.class)
+    .handleWith(HazardHandled.class)
+    .resumable()
+```
+
+These rules are for committed occurrences that should finish and consume their
+source identity. Memoryless level state such as "buffer is full" should usually
+be modeled with `@Condition`, ordinary action values, and standing `NIRVANA`
+utility work unless the consumer needs a committed runtime goal.
+
+The resulting loop is:
+
+```text
+external snapshot/event or action output
+  -> event-shaped runtime fact
+  -> evolution policy
+  -> process-local runtime goal
+  -> existing GOAP / Utility / Hybrid planner
+  -> declared action
+```
+
+The same engine should support:
+
+- buffer full level -> storage actions become achievable or valuable through
+  conditions and ordinary arbitration
+- committed storage-needed occurrence -> storage runtime goal if the reaction
+  should finish across ticks and consume source identity
+- storage complete -> collection resumes
+- hazard detected -> normal arbitration can select hazard response ahead of
+  ordinary work when the handler goal is modeled accordingly
+- target reached -> complete
 
 ## Why `trigger` Was Limiting
 
@@ -51,6 +152,9 @@ That is useful, but too positional for long-lived event-driven processes:
 - it depends on `lastResult`, so a prefix action can overwrite the trigger before
   the triggered action runs
 - it does not compose cleanly inside forward GOAP plans
+- a trigger-gated chain can park `STUCK` before any action executes, because
+  the planner cannot route through an event that is not already the latest
+  result
 - it does not define process ingress, dedupe, wakeup, coalescing, lifecycle, or
   scope
 - it pushed consumers toward activation keys, edge tracking, and manual rearming
@@ -60,10 +164,10 @@ not make it the main Evolving Mode event-driven API.
 
 ## Core Public Shape
 
-The core Evolving Mode proposal can land as fact ingress, evolution policy, and
-process-local runtime goals. The fact derivation layer below is a useful next
-layer for better developer experience, but it should not be a prerequisite for
-the core runtime-goal mechanism.
+The core Evolving Mode proposal can land as an evolution policy over runtime
+facts and process-local runtime goals. External fact ingress and fact derivation
+are important developer-experience layers, but neither should obscure the core
+runtime-goal mechanism.
 
 ```java
 EvolvingInvocation.on(agentPlatform)
@@ -74,45 +178,120 @@ EvolvingInvocation.on(agentPlatform)
         collectionCapabilities,
         hazardResponseCapabilities
     ))
-    .withEventSource(domainEvents)  // Optional adapter over fact ingress
     .withEvolution(evolution -> evolution
-        .onFact(BufferFlushNeeded.class)
-            .addRuntimeGoal(BufferFlushed.class)
+        .onFact(StorageNeeded.class)
+            .handleWith(StorageCompleted.class)
             .resumable()
 
         .onFact(HazardDetected.class)
-            .addRuntimeGoal(HazardHandled.class)
-            .interrupt()
-
-        .onFact(TransientOpportunity.class)
-            .addRuntimeGoal(OpportunityHandled.class)
+            .handleWith(HazardHandled.class)
             .resumable()
-            .expires(Duration.ofSeconds(30))
     )
     .run(objective);
 ```
 
-`.addRuntimeGoal(BufferFlushed.class)` compiles to a process-local agenda
-entry wrapping a canonical goal from the active scope. Ambiguous output-type
-matches should fail unless the rule names the declared goal explicitly.
+`.handleWith(StorageCompleted.class)` compiles to a process-local agenda entry
+wrapping a canonical goal from the active scope. Ambiguous output-type matches
+should fail unless the rule names the declared goal explicitly.
 
-Ingress should feel like normal fact publication:
+An optional event-source adapter can sit above fact ingress for host applications
+that already have a domain event stream:
 
 ```java
-process.facts().publishState(new BufferSnapshot(...));
-process.facts().publishEvent(new HazardDetected(...));
+EvolvingInvocation.on(agentPlatform)
+    .withScope(scope)
+    .withEventSource(domainEvents)  // Optional adapter over fact ingress
+    .withEvolution(evolution)
+    .run(objective);
 ```
+
+External ingress should feel like normal fact publication:
+
+```java
+// Conservative spelling.
+process.ingress().publish(new HazardDetected(...));
+
+// Friendlier spelling if Embabel wants a facts facade.
+process.facts().publish(new HazardDetected(...));
+```
+
+The local throwaway POC used this Java/Kotlin spelling:
+
+```java
+process.getIngress().publish(new HazardDetected(...));
+```
+
+```kotlin
+process.ingress.publish(HazardDetected(...))
+```
+
+That POC spelling was backed by a local `BlackboardIngress` type. It is not an
+upstream Embabel API and should not be PR'd as-is. The useful contract is a
+sanctioned process-local fact ingress seam. `process.ingress()` is probably the
+most conservative upstream spelling because it names the seam without
+introducing a first-class `Facts` vocabulary. `process.facts()` is a good DX
+option if maintainers want a friendlier facade over blackboard object
+publication. Either way, it should be a wrapper over the same ingress seam
+rather than a separate state channel. The mapping is:
+
+- event publication maps to occurrence-style or append-mode ingress with
+  explicit duplicate behavior
+- `.onFact(E).handleWith(G)` compiles to an agenda entry wrapping a
+  canonical scoped goal for `G`
+- the local POC now includes a minimal `EvolutionPolicy` proving that visible
+  process facts can activate process-local runtime goals without raw activation
+  keys
+- external ingress may still use typed trigger/latch/source-identity semantics
+  underneath; the current `ActivationTrigger` API is a POC primitive for
+  external ingress
+- raw `activationKey`, manual `clearActivationKey(...)`, and TTL/latch details
+  should be hidden from the normal policy API
+
+So the intended direction is not to discard `ActivationTrigger`. It is to make
+it the typed low-level primitive underneath an evolution-policy API.
+
+Do not bless direct blackboard mutation as the phase 2 happy path:
+
+```java
+process.blackboard().add(new HazardDetected(...));
+```
+
+Raw blackboard mutation is too shallow for external ingress. It does not carry
+process-seam timing, wake-up behavior, source identity, duplicate semantics, or
+observability.
 
 Suggested semantics:
 
-- `publishState`: current truth, latest/coalesced by type or key
-- `publishEvent`: this happened; process once unless repeated explicitly
+- publication means this fact should enter the running process; event/state
+  semantics can be configured by policy, metadata, or optional publication
+  options rather than by separate happy-path method names
 - facts become visible at the next planning tick
 - consumers should not manage activation keys or clear latches manually
 
 Event identity must be explicit enough for repeat behavior to be deterministic:
 use framework-generated occurrence identity, caller-supplied ids, or an explicit
 "always fire" mode.
+
+## Blackboard And Ingress Boundary
+
+The blackboard is process-local working memory for an `AgentProcess`. It should
+not be treated as a mutable world-state database, pub/sub bus, or consumer-owned
+latch system.
+
+Action inputs are resolved from the blackboard. Action outputs are automatically
+appended to it. Objects are ordered and append-only: the latest visible object
+of a type is the default match, named bindings are available when type alone is
+ambiguous, and hiding an object removes it from future planning/API visibility
+without deleting process history.
+
+Planning conditions are separate booleans, normally supplied by `@Condition`.
+They are not ordinary blackboard objects and should not be reused as event
+activation latches.
+
+External async facts should enter through a sanctioned process-local ingress
+API. The local POC called this `BlackboardIngress`; upstream should treat the
+name and exact shape as open. Ingress queues publication safely and drains at
+planning ticks, where the facts become ordinary blackboard facts for planning.
 
 ## Next Layer: Fact Derivation
 
@@ -195,6 +374,13 @@ reactive dataflow graph. The implementation needs explicit rules for:
 Without this, multi-step derivations will have nondeterministic ordering and
 unclear retraction semantics.
 
+If a consumer models mutable level state directly as a blackboard fact rather
+than as a framework-owned derivation, the consumer owns that fact's lifecycle.
+When the level falls false, hide or replace the visible fact explicitly through
+blackboard hiding, latest/coalesced ingress, TTL, or another configured
+lifecycle rule. Runtime-goal completion can consume its own source occurrence,
+but it should not infer retraction for arbitrary level facts.
+
 ## Singleton And Keyed Facts
 
 `Optional<T>` is a good shape for singleton level facts:
@@ -207,8 +393,8 @@ BufferSnapshot(notFull) -> Optional.empty()
 But event-driven systems also need keyed set facts:
 
 ```text
-TransientOpportunity(id=414)
-TransientOpportunity(id=415)
+HazardDetected(id=414)
+HazardDetected(id=415)
 ```
 
 The derivation model should support retracting one keyed fact without retracting
@@ -218,8 +404,8 @@ Possible shape:
 
 ```java
 @DerivesFact
-DerivedFacts<TransientOpportunity> transientOpportunities(ObservationSnapshot snapshot) {
-    return DerivedFacts.keyedBy(TransientOpportunity::id, snapshot.opportunities());
+DerivedFacts<HazardDetected> hazards(ObservationSnapshot snapshot) {
+    return DerivedFacts.keyedBy(HazardDetected::id, snapshot.hazards());
 }
 ```
 
@@ -275,7 +461,7 @@ Storage capability:
   BufferFlushNeeded -> ArrivedAt -> BufferFlushed
 ```
 
-This keeps reusable capability modules objective-agnostic.
+This keeps reusable `@Agent` or `@EmbabelComponent` instances objective-agnostic.
 
 ## Runtime Goals
 
@@ -286,15 +472,26 @@ Preferred:
 
 ```java
 .withEvolution(evolution -> evolution
-    .onFact(BufferFlushNeeded.class)
-        .addRuntimeGoal(BufferFlushed.class)
-        .includeFact(BufferFlushNeeded.class)
+    .onFact(StorageNeeded.class)
+        .handleWith(StorageCompleted.class)
         .resumable()
 )
 ```
 
+The core runtime goal carries the source identity that fired the rule for
+dedupe, consume-on-completion, and rearm. It does not need a payload-binding API
+in the first slice; handlers should re-sense current state or read normal
+objective/context facts.
+
 Avoid making normal capabilities return `GoalRequest` by default. That mixes
 business capability logic with orchestration.
+
+Handlers selected by `.onFact(...).handleWith(...)` must be goal producers in
+the active scope, for example by producing the goal's satisfied-by type and, in
+annotation style, using `@AchievesGoal` where appropriate. Standing level
+reactions should usually remain plain value-selected actions under `NIRVANA`;
+marking them as achieved goals can accidentally turn normal utility work into
+process completion or agenda completion.
 
 Action-returned goal requests can remain as an advanced escape hatch for
 deliberative or discovery work:
@@ -314,6 +511,22 @@ evolution policy maps facts to runtime goals
 planner satisfies runtime goals
 ```
 
+## Base Policy And Objective Policy
+
+Separate universal host policy from objective-authored policy.
+
+Base policy is installed by the host for every relevant process. It should cover
+events the `ObjectiveAuthor` should not have to remember, such as hazards,
+blocking prompts, and session recovery.
+
+Objective policy is produced for a particular run. It should cover objective
+completion, objective-specific event rules, scheduled interruptions, utility
+defaults, and initial facts.
+
+At launch, the framework should merge base policy and objective policy, validate
+all runtime-goal targets against the active scope, and fail fast if any handler
+has no scoped producing capability.
+
 ## Runtime Goal Lifecycle
 
 The lifecycle of runtime goals should be framework-owned.
@@ -323,73 +536,98 @@ the framework should define what happens when `BufferFlushNeeded` disappears.
 
 Recommended default:
 
-- when the source fact retracts, stop planning new work toward the runtime goal
+- when the source event retracts, stop planning new work toward the runtime goal
 - do not interrupt an active action by default
-- interrupt only when the rule is marked `interrupt()` or explicitly configured
-  to cancel on retraction
+- interrupt only when explicitly configured to cancel on retraction
+- for the internal-events-only phase, a successful `resumable()` runtime goal
+  consumes or retracts the source identity that created it for that rule
 
 This cannot be left to consumer-side `none()` facts or manual clear calls.
 
-## Execution-Level Interrupts
+## Action Granularity And Replanning
 
-Plan-level selection is not enough for interrupting work.
+The core Evolving Mode contract should be GOAP-native: adding a runtime goal
+requests replanning on the next planning tick, and normal Embabel goal
+arbitration decides whether that runtime goal runs before ordinary work.
 
-If `HazardDetected` arrives while a long-running ordinary action is already
-executing, it is not enough for the next plan to prefer `HazardHandled`. The
-running action must have a way to yield or be interrupted at a cooperative
-checkpoint.
+For responsive behavior, long-running activities should be decomposed into
+small, resumable actions whose preconditions are rechecked between steps. If
+`HazardDetected` arrives while ordinary work is between action boundaries, the
+next planning seam can select `HazardHandled` if that goal is modeled to win
+normal arbitration.
 
-The same issue applies when a runtime goal is retracted mid-action. For example,
-`BufferFlushNeeded` might disappear while `navigateToDestination` is still
-running.
+Execution-level cancellation for irreducibly blocking actions is a later
+extension, not part of the core event-goal primitive.
 
-Evolving Mode therefore needs an execution-level interrupt contract in addition
-to runtime goal arbitration:
-
-- long-running actions observe a cancellation/interrupt signal
-- actions define safe yield checkpoints
-- an `interrupt()` runtime goal trips that signal
-- the process replans after the action exits at a checkpoint
+Hard interruption should be expressed as availability, not as an Evolving-specific
+priority mechanism. Existing Embabel primitives already cover this: use
+`@Condition` and `@Action(pre = ...)` so ordinary work is not achievable while a
+domain condition holds, and make the recovery or hazard handler the achievable
+path. Goal and action values remain useful for soft ordering when more than one
+path is available.
 
 Acceptance test to add:
 
 ```text
-Given a long-running ordinary action is executing
-When a hazard fact enters the process
-Then the ordinary action exits within N ticks/checkpoints
-And the interrupting runtime goal is planned next
+Given ordinary work is decomposed into resumable actions
+When a hazard event enters the process
+Then the runtime goal is added
+And the next planning seam uses normal Embabel arbitration
+And a correctly modeled hazard goal can be selected before ordinary work
 ```
 
-Without this test, "hazards interrupt ordinary work" can pass at the planner level
-while failing in real behavior.
+Add a parallel hard-availability acceptance test:
+
+```text
+Given ordinary work is gated by an existing Embabel condition such as
+  @Action(pre = "... && !hazardActive")
+When hazardActive holds
+Then ordinary work is unachievable
+And the hazard or recovery handler is the achievable path
+```
+
+Without these tests, "hazards interrupt ordinary work" can accidentally become a
+second Evolving-specific priority model rather than ordinary availability plus
+GOAP/Utility/Hybrid arbitration.
+
+## Observability Expectations
+
+Evolving Mode should use the existing process/session observability model. A
+process woken by ingress is not a fresh process; it is the same long-lived
+process beginning another unit of work.
+
+The observability contract should include:
+
+- wake-ups continue the existing process and reuse the stable session id
+- each wake-up has a clean turn boundary with start, end, and error handling
+- ingress facts record their source and correlation metadata as span attributes
+- runtime goals emit lifecycle events when added, completed, retracted,
+  suppressed, or rejected
+- per-turn runtime state is cleaned at turn end, not only at process termination
+
+Additional trace linking for fan-out or producer/consumer processes can be
+handled separately if a pub/sub use case appears.
 
 ## Runtime Goal Behavior Vocabulary
 
-Avoid global numeric priority as the default. Evolving Mode should change the
-effective planning system visible to GOAP, Utility, or Hybrid planners rather
-than introduce a second planner-independent scoring model.
+Avoid global numeric priority as the default. Evolving Mode should change which
+runtime goals are active, then let GOAP, Utility, or Hybrid planners arbitrate
+normally.
 
-Use lifecycle and execution behavior instead:
+Use a small runtime-goal vocabulary:
 
 ```java
 .resumable()
-.terminal()
-.interrupt()
-.expires(Duration.ofSeconds(30))
 ```
 
 Suggested meanings:
 
 - `resumable()`: completion removes this runtime goal and the process
   re-arbitrates remaining work
-- `terminal()`: completion can complete the process or parent objective
-- `interrupt()`: this runtime goal may request cooperative interruption of
-  in-flight work at checkpoints
-- `expires(Duration)`: remove this runtime goal if it remains incomplete past
-  the duration
 
-Advanced planner-specific ranking or value policies can still exist below this
-interface, but they should not be the default Evolving Mode vocabulary.
+Do not use numeric priority as the core Evolving Mode vocabulary. Long-running
+objective completion remains `CompletionPolicy`; event expiry/TTL and
+event-payload binding are later extensions.
 
 ## Side-Effect Discipline
 
@@ -425,54 +663,66 @@ These may still exist internally, but should not be the happy path:
 - `clearActivationKey`
 - consumer-authored edge detection
 - TTL as normal consumer-facing lifecycle
-- level/occurrence trigger taxonomy as primary DX
+- forcing consumers to choose level/occurrence trigger taxonomy before they can
+  express simple `.onFact(...).handleWith(...)` policies
 - normal actions returning `GoalRequest` for common state transitions
 
 The public model should be facts and runtime goals, not latches.
 
 ## Acceptance Tests
 
-1. State ingress coalesces
+1. Internal runtime fact creates runtime goal
+   - action produces `StorageNeeded`
+   - evolution policy adds `StorageCompleted` as a runtime goal
+   - planner satisfies it through declared scoped capabilities
+
+2. State ingress coalesces
    - publish multiple `BufferSnapshot`s
    - only the latest snapshot is visible to derivations and planning
 
-2. Event ingress processes once
+3. Event ingress processes once
    - publish `HazardDetected`
    - runtime goal is added once
    - duplicate behavior is explicit and tested
 
-3. Fact derivation creates and retracts singleton facts
+4. Fact derivation creates and retracts singleton facts
    - `BufferSnapshot(full)` derives `BufferFlushNeeded`
    - `BufferSnapshot(notFull)` retracts previous `BufferFlushNeeded`
    - no manual clear call
 
-4. Fact derivation handles keyed sets
-   - derive two `TransientOpportunity` facts
+5. Fact derivation handles keyed sets
+   - derive two `HazardDetected` facts
    - remove one source observation
    - only the matching keyed fact is retracted
 
-5. Runtime goal follows fact lifecycle
+6. Runtime goal follows fact lifecycle
    - `BufferFlushNeeded` creates `BufferFlushed` runtime goal
    - when `BufferFlushNeeded` disappears, the runtime goal follows the configured
      lifecycle rule
 
-6. Derivations do not compete with actions
+7. Derivations do not compete with actions
    - a collecting action can continue running
    - derivation still updates facts at planning ticks
 
-7. Execution-level interrupt
-   - a hazard fact arrives during a long-running ordinary action
-   - the ordinary action exits within N ticks/checkpoints
-   - the interrupting runtime goal is planned next
+8. Replanning uses normal arbitration
+   - a hazard event enters the process
+   - the hazard runtime goal is added
+   - the next planning seam uses normal Embabel arbitration
+   - a correctly modeled hazard goal can be selected before ordinary work
 
-8. Planner composes across capabilities
+9. Planner composes across capabilities
    - collection capability emits or depends on generic facts
    - navigation/storage capabilities satisfy the runtime goal
    - no direct calls between capabilities
 
-9. Objective-specific facts do not leak into reusable modules
+10. Objective-specific facts do not leak into reusable modules
    - reusable buffer/capacity module depends only on generic facts
    - objective module emits context facts like `StorageDestination`
+
+11. Observability preserves process/session continuity
+   - ingress wake-up starts a new turn on the existing process/session
+   - the turn closes cleanly on success, error, or no-op wake-up
+   - runtime-goal lifecycle events are visible
 
 ## Final Recommended Shape
 
@@ -492,8 +742,8 @@ Evolution policy
 Existing planner
   chooses real actions from the effective planning system
 
-Execution interrupt contract
-  lets safety/retraction affect in-flight long-running actions
+Action granularity and replanning
+  keeps the core GOAP-native; execution-level cancellation is a later extension
 
 Runtime goal lifecycle
   owned by framework, not consumers

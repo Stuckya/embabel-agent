@@ -25,9 +25,11 @@ import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentScope
 import com.embabel.agent.core.AgendaEntry
 import com.embabel.agent.core.EvolutionOptions
+import com.embabel.agent.core.EvolutionPolicy
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalAgenda
 import com.embabel.agent.core.ProcessOptions
+import com.embabel.agent.core.RuntimeGoalRule
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.spi.common.Constants.EMBABEL_PROVIDER
 import java.util.concurrent.CompletableFuture
@@ -121,7 +123,12 @@ data class EvolvingInvocation @JvmOverloads constructor(
                 source = "EvolutionOptions",
                 entries = processOptions.evolution.agendaCatalog.entries,
                 scope = scope,
-            ).agendaCatalog()
+            ).agendaCatalog(),
+            policy = canonicalizeEvolutionPolicy(
+                source = "EvolutionOptions",
+                policy = processOptions.evolution.policy,
+                scope = scope,
+            )
         )
         val canonicalObjectivePlan = objectivePlan?.let { canonicalizeObjectivePlan(it, scope) }
         return PreparedRun(
@@ -149,7 +156,12 @@ data class EvolvingInvocation @JvmOverloads constructor(
                 source = "ObjectivePlan ${objectivePlan.id}",
                 entries = objectivePlan.agendaEntries,
                 scope = scope,
-            )
+            ),
+            evolutionPolicy = canonicalizeEvolutionPolicy(
+                source = "ObjectivePlan ${objectivePlan.id}",
+                policy = objectivePlan.evolutionPolicy,
+                scope = scope,
+            ),
         )
 
     private fun canonicalizeAgendaEntries(
@@ -168,6 +180,37 @@ data class EvolvingInvocation @JvmOverloads constructor(
 
     private fun List<AgendaEntry>.agendaCatalog(): GoalAgenda =
         fold(GoalAgenda.EMPTY) { agenda, entry -> agenda.withEntry(entry) }
+
+    private fun canonicalizeEvolutionPolicy(
+        source: String,
+        policy: EvolutionPolicy,
+        scope: AgentScope,
+    ): EvolutionPolicy =
+        policy.copy(
+            rules = policy.rules.map { rule ->
+                rule.withGoal(canonicalRuntimeGoal(source, rule, scope))
+            }
+        )
+
+    private fun canonicalRuntimeGoal(
+        source: String,
+        rule: RuntimeGoalRule,
+        scope: AgentScope,
+    ): Goal {
+        rule.goal?.let {
+            return scope.canonicalGoal(it)
+                ?: throw IllegalArgumentException(
+                    "$source references runtime rule ${rule.id} " +
+                            "with goal ${it.name}, which is not in the active AgentScope"
+                )
+        }
+        val matchingGoals = scope.goals.filter { it.outputType?.name == rule.runtimeAction.name }
+        return matchingGoals.singleOrNull()
+            ?: throw IllegalArgumentException(
+                "$source references runtime action ${rule.runtimeAction.name}, " +
+                        "which is not uniquely satisfied by a goal in the active AgentScope"
+            )
+    }
 
     private fun AgentScope.canonicalGoal(goal: Goal): Goal? {
         if (goal == NIRVANA) {

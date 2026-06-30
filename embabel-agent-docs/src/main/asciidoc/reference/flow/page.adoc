@@ -80,6 +80,8 @@ It implements the https://en.wikipedia.org/wiki/Blackboard_(design_pattern)[Blac
 
 Most of the time, user code doesn't need to interact with the blackboard directly, as it is managed by the framework.
 For example, action inputs come from the blackboard, and action outputs are automatically added to the blackboard, and conditions are evaluated based on its contents.
+The blackboard is process-local working memory, not a mutable world-state database or pub/sub event bus.
+For future evolving-mode APIs, external async facts should enter a running process through a sanctioned process ingress seam, then become blackboard facts at process seams.
 
 **Key Characteristics:**
 

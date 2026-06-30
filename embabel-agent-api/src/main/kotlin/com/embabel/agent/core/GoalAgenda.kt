@@ -48,7 +48,6 @@ data class AgendaEntry @JvmOverloads constructor(
     val goal: Goal,
     val bindings: Map<String, Any> = emptyMap(),
     val source: Any? = null,
-    val lane: AgendaLane = AgendaLane.ECONOMIC,
     val completionMode: AgendaCompletionMode = AgendaCompletionMode.TERMINAL,
     val activationKey: String? = null,
     val ttl: Duration? = null,
@@ -67,9 +66,6 @@ data class AgendaEntry @JvmOverloads constructor(
 
     fun withSource(source: Any?): AgendaEntry =
         copy(source = source)
-
-    fun withLane(lane: AgendaLane): AgendaEntry =
-        copy(lane = lane)
 
     fun withCompletionMode(completionMode: AgendaCompletionMode): AgendaEntry =
         copy(completionMode = completionMode)
@@ -121,15 +117,60 @@ data class AgendaPlanningGoal(
     ): String = entry.goal.infoString(verbose, indent)
 }
 
-enum class AgendaLane {
-    ECONOMIC,
-    SAFETY,
-}
-
 enum class AgendaCompletionMode {
     TERMINAL,
     RESUMABLE,
     COMPOSITE_TERMINAL,
+}
+
+data class EvolutionPolicy @JvmOverloads constructor(
+    val rules: List<RuntimeGoalRule> = emptyList(),
+) {
+
+    @JvmOverloads
+    fun onEvent(
+        eventType: Class<*>,
+        runtimeAction: Class<*>,
+        completionMode: AgendaCompletionMode = AgendaCompletionMode.RESUMABLE,
+    ): EvolutionPolicy =
+        withRule(
+            RuntimeGoalRule(
+                eventType = eventType,
+                runtimeAction = runtimeAction,
+                completionMode = completionMode,
+            )
+        )
+
+    fun withRule(rule: RuntimeGoalRule): EvolutionPolicy =
+        copy(rules = rules + rule)
+
+    companion object {
+
+        @JvmField
+        val EMPTY = EvolutionPolicy()
+    }
+}
+
+data class RuntimeGoalRule @JvmOverloads constructor(
+    val eventType: Class<*>,
+    val runtimeAction: Class<*>,
+    val completionMode: AgendaCompletionMode = AgendaCompletionMode.RESUMABLE,
+    val goal: Goal? = null,
+    val id: String = "${eventType.name}->${runtimeAction.name}",
+) {
+
+    fun withGoal(goal: Goal): RuntimeGoalRule =
+        copy(goal = goal)
+
+    fun toAgendaEntry(sourceFact: Any): AgendaEntry {
+        val canonicalGoal = goal ?: error("Runtime goal rule $id has not been canonicalized")
+        return AgendaEntry(
+            id = "$id:${System.identityHashCode(sourceFact)}",
+            goal = canonicalGoal,
+            source = sourceFact,
+            completionMode = completionMode,
+        )
+    }
 }
 
 fun interface AgendaCompletionPredicate {
@@ -145,7 +186,6 @@ data class AgendaEntryApprovalRequest @JvmOverloads constructor(
     val entry: AgendaEntry,
     val sourceFact: Any? = null,
     val sourceType: String? = sourceFact?.javaClass?.name,
-    val lane: AgendaLane = entry.lane,
     val bindings: Map<String, Any> = entry.bindings,
     val currentAgenda: GoalAgenda = GoalAgenda.EMPTY,
     val agentProcess: AgentProcess? = null,
@@ -187,6 +227,7 @@ data class EvolutionOptions @JvmOverloads constructor(
     val agendaCatalog: GoalAgenda = GoalAgenda.EMPTY,
     val agendaEntryApprover: AgendaEntryApprover = AgendaEntryApprover.APPROVE_ALL,
     val completionPolicy: CompletionPolicy = CompletionPolicy.CONTINUE,
+    val policy: EvolutionPolicy = EvolutionPolicy.EMPTY,
 ) {
 
     @Deprecated("Use agendaCatalog; agenda entries here are an activatable catalog, not active initial state.")

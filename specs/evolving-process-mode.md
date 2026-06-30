@@ -9,22 +9,37 @@ long-lived processes whose objectives can change while running.
 
 Evolving Process Mode fills that runtime seam without introducing a new
 `PlannerType` or repeatedly invoking Open/Supervisor mode. It lets a running
-agent process add, remove/expire, and prioritize active goals while preserving
-Embabel's existing planner model.
+agent process add and remove or expire active runtime goals while preserving
+Embabel's existing planner arbitration model.
 
 Evolving mode composes with GOAP, Utility, and Hybrid planners by changing the
 effective planning system available to a process at OODA seams. Agenda
 projection does not mutate `Agent.goals`.
 
-The current implementation is a POC for the roadmap shape described in the
-README: a process can work with multiple goals and modify the running process as
-new facts make additional agenda goals relevant.
+The current implementation is a local throwaway POC for the roadmap shape
+described in the README: a process can work with multiple goals and modify the
+running process as new facts make additional agenda goals relevant. The POC code
+and names are not intended to be PR'd as-is; the upstream contribution should be
+based on the contracts and acceptance tests that survive dogfooding.
 
 V1 evolves agenda entries over the `AgentScope` created for the process. The
 current POC runs `ObjectiveAuthor` after that scope has been created. Choosing
 or assembling scope based on the objective before launch is future work, and
-adding new agents, actions, or capability modules to an already-running process
+adding new scoped `@Agent` or `@EmbabelComponent` instances to an already-running process
 is out of scope for this POC.
+
+The upstream proposal should be incremental:
+
+1. internal action-produced runtime facts: normal action outputs activate
+   process-local runtime goals
+2. external triggers/events: host-published facts enter a known running process
+   through sanctioned ingress and feed the same evolution engine
+3. observability support: each wake-up remains attached to the existing
+   process/session with clean turn boundaries and runtime-goal lifecycle events
+
+Pub/sub fan-out is a related but separate problem. Evolving Mode only requires a
+single running process to evolve its own runtime goals over its configured
+scope.
 
 ## Problem Statement
 
@@ -36,7 +51,8 @@ orchestrate other agents.
 For example, a consumer objective like "Collect samples in Zone A until 500
 samples are stored" must react while running:
 
-- workspace becomes full -> store samples
+- workspace becomes full -> storage actions become achievable or valuable
+  through conditions
 - session reaches storage -> deposit samples
 - workspace becomes empty -> return to the collection zone
 - nearby item appears -> collect it
@@ -77,12 +93,13 @@ session state.
   user input or an `Objective` into typed `Objective`s or `ObjectivePlan`s. It
   does not execute runtime actions and does not mutate the agenda directly.
 - Goal: Embabel planner goal.
+- EvolutionPolicy: process-local policy that maps selected runtime facts to
+  runtime goals over the active scope.
 - AgendaEntry: runtime wrapper that projects a `Goal` into the active process
-  with bindings, lane, completion mode, activation key, and source context.
-- ActivationTrigger: typed ingress-to-agenda trigger used by normal consumers.
-  Level triggers model external state that can become true or false.
-  Occurrence triggers model identifiable events that should dedupe repeated
-  reports of the same occurrence.
+  with bindings, completion mode, activation key, and source context.
+- ActivationTrigger: local POC primitive for typed ingress latches. It is not
+  the intended happy-path upstream API; normal consumers should use
+  `EvolutionPolicy` rules over facts rather than manage trigger taxonomy.
 
 ## Public Interface: EvolvingInvocation
 
@@ -104,7 +121,7 @@ The public stack is:
 - `EvolvingInvocation`: public invocation interface
 - `ObjectiveAuthor`: optional LLM or deterministic objective authoring seam
 - `GoalAgenda`: runtime mechanism
-- `AgendaEntryApprover`: authorization and safety seam
+- `AgendaEntryApprover`: authorization seam
 - Planner: deterministic action selection over declared actions
 
 Target LLM-assisted shape:
@@ -142,9 +159,9 @@ need to publish ingress before the first tick, or drive `tick()`/`run()` from an
 external loop, can call `createProcess(...)` to receive a configured but
 unstarted `AgentProcess`.
 Scope instances may be `@EmbabelComponent` or `@Agent` instances, including
-domain capability modules packaged with those annotations.
+domain capabilities packaged with those annotations.
 
-Manual-drive shape, matching the POC test fixture:
+Manual-drive shape, matching the local throwaway POC test fixture:
 
 ```kotlin
 val process = EvolvingInvocation.on(agentPlatform)
@@ -153,8 +170,7 @@ val process = EvolvingInvocation.on(agentPlatform)
     .createProcess(CollectSamplesUntil(zone = "zone-a", target = 1))
 
 process.ingress.publish(
-    CollectionActivated("zone-a"),
-    IngressOptions(activationKey = "collect-sample", wake = IngressWake.WAKE),
+    StorageNeeded("zone-a"),
 )
 process.tick()
 ```
@@ -191,9 +207,9 @@ follow-up rather than existing Open mode behavior.
 
 - `ObjectiveAuthor` proposes typed `Objective`s or `ObjectivePlan`s.
 - The framework validates them against the active `AgentScope`.
-- `ObjectivePlan`s are compiled into agenda entries. The POC `ObjectivePlan`
-  carries agenda entries directly; richer objective-to-entry compilation remains
-  a Remaining POC Gap.
+- `ObjectivePlan`s are compiled into agenda entries and/or `EvolutionPolicy`
+  rules. The POC `ObjectivePlan` can carry agenda entries and policy directly;
+  richer objective-to-entry compilation remains a Remaining POC Gap.
 - `AgendaEntryApprover` authorizes entry activation.
 - The evolving process projects approved entries into planner-visible agenda
   goals.
@@ -201,7 +217,9 @@ follow-up rather than existing Open mode behavior.
 - LLMs do not run the hot loop.
 - LLMs do not directly mutate the agenda.
 - Runtime facts enter through ingress.
-- Safety preemption remains deterministic and approver-gated.
+- Hard interruption is modeled with existing planning availability primitives:
+  consumer-authored `@Condition` methods and `@Action(pre = ...)` preconditions
+  can make ordinary work unavailable while a domain condition holds.
 
 This contract is the core boundary between flexible objective authoring and
 deterministic execution.
@@ -214,7 +232,7 @@ importing CrewAI's runtime semantics into Embabel.
 The mapping is:
 
 - Crew/capability set -> `AgentScopeBuilder`
-- Purpose-built agents -> reusable Embabel agents/capability modules
+- Purpose-built agents -> reusable Embabel `@Agent` or `@EmbabelComponent` instances
 - Task/objective -> typed `Objective` or `ObjectivePlan`
 - Manager/dispatcher -> `EvolvingInvocation`
 - Guardrails, in CrewAI's sense of task authorization -> `AgendaEntryApprover`
@@ -261,6 +279,7 @@ the proposed public interface above.
 `ProcessOptions.evolution` carries an `EvolutionOptions` value with:
 
 - `agendaCatalog`: an activatable catalog of agenda entries
+- `policy`: process-local rules that map selected facts to runtime goals
 - `agendaEntryApprover`: an approval seam for catalog activation and runtime
   entry proposals
 - `completionPolicy`: a process outcome policy
@@ -271,33 +290,85 @@ the proposed public interface above.
 `agendaCatalog` is part of the low-level POC surface and should become an
 escape hatch beneath `EvolvingInvocation`, not the normal user entry point.
 
-### BlackboardIngress
+### EvolutionPolicy
 
-`BlackboardIngress` is exposed from both `AgentProcess` and `ProcessContext`.
-`publish` queues a typed fact for the next process seam and returns an
+`EvolutionPolicy` is the refined POC path for runtime goals.
+It maps selected visible process facts to process-local agenda entries. A rule
+such as `StorageNeeded -> StorageCompleted` is canonicalized against
+the active `AgentScope` before launch, so runtime rules cannot smuggle altered
+goal preconditions, values, or metadata through lookalike goals.
+
+At each planning tick, matching visible facts propose runtime agenda entries.
+Those entries use the same `AgendaEntryApprover`, planner projection, and
+completion behavior as lower-level agenda entries. `RESUMABLE` policy-created
+entries consume both stale satisfying outputs and the source fact that fired the
+rule, so the same fact does not repeatedly retrigger the same runtime goal.
+
+Actions that handle policy-created runtime goals must be declared as goal
+producers in the active scope, for example by producing the goal's satisfied-by
+type and, in annotation style, using `@AchievesGoal` where appropriate. Standing
+level reactions should usually stay plain value-selected actions under
+`NIRVANA`; making a level reaction an achieved goal can accidentally turn normal
+utility work into process completion or agenda completion.
+
+This is the behavior the throwaway branch now uses to prove phase 1:
+action-produced facts can activate process-local runtime goals without manual
+activation-key clearing.
+
+### Local POC Fact Ingress
+
+The local throwaway POC calls its fact-ingress seam `BlackboardIngress` and
+exposes it from both `AgentProcess` and `ProcessContext`. This name and exact
+shape are not upstream Embabel API.
+`publish` queues a typed fact for the next planning tick and returns an
 `IngressReceipt`.
 `IngressReceipt` acknowledges publication and provides a correlation id for
 events, logging, and tests. It does not mean the fact has already been drained
 into the blackboard.
 
+The blackboard itself remains Embabel's process-local typed working memory. It
+is not a mutable world-state database, pub/sub bus, or agenda latch system.
+Action inputs are resolved from the blackboard, action outputs are automatically
+appended, and planning conditions are separate booleans normally supplied by
+`@Condition`.
+
+Blackboard objects are ordered and append-only. The latest visible object of a
+type is the default match; named binding is available when type alone is
+ambiguous. Hiding removes an object from future planning and API visibility
+without deleting process history. External async facts should therefore enter
+through a sanctioned process-local ingress seam and drain at planning ticks rather
+than mutating the blackboard directly from host threads.
+
+If a mutable level is modeled as a blackboard fact, the consumer owns that
+fact's lifecycle unless explicit ingress lifecycle options are configured. When
+the level is no longer true, hide or replace the visible fact, for example with
+`Blackboard.hide(...)`, `IngressMode.LATEST`, coalescing, TTL, or a configured
+level trigger. The framework automatically hides source facts for
+policy-created `onFact` occurrences on `RESUMABLE` completion; it does not
+infer that an arbitrary level fact should retract just because a reaction ran.
+
 `IngressOptions` describes one publish operation:
 
 - `mode`: `APPEND` or `LATEST`
-- `wake`: `NONE`, `WAKE`, or `SAFETY_PREEMPT`
+- `wake`: `NONE` or `WAKE`
 - `coalesceKey`: replaces pending ingress with the same key before drain
 - `activationKey`: activates matching catalog entries at drain time
 - `ttl`: hides the drained fact after the duration expires
 
-The happy-path API for agenda activation is `ActivationTrigger`, not raw string
-keys. `ActivationTrigger.level(K, Fact.class)` can be used with
-`BlackboardIngress.update(trigger, active, supplier)`: `false -> true` publishes
-a fact and activates matching entries, `true -> true` remains idempotent,
-`true -> false` rearms the process-private latch, and `false -> false` is a
-no-op. Level triggers may opt into `hideOnInactive()`, which hides the visible
-level fact at the next process seam when the trigger falls false.
+`ActivationTrigger` is a local POC primitive for low-level ingress-to-agenda
+latches. It is not the desired upstream happy path. A future
+`.onFact(...).handleWith(...)` style policy API should sit above any typed
+trigger/latch mechanics, so consumers publish domain facts and the framework
+owns dedupe, source identity, and rearm behavior.
+`ActivationTrigger.level(K, Fact.class)` can be used with
+`BlackboardIngress.update(trigger, active, supplier)` for explicit low-level
+tests: `false -> true` publishes a fact and activates matching entries,
+`true -> true` remains idempotent, `true -> false` rearms the process-private
+latch, and `false -> false` is a no-op. Level triggers may opt into
+`hideOnInactive()`, which hides the visible level fact at the next planning tick
+when the trigger falls false.
 `ActivationTrigger.occurrence(K, Fact.class).occurrenceId(...)` can be used with
-`BlackboardIngress.occurred(trigger, fact)`: repeated occurrence ids are
-suppressed, while a different occurrence id can activate matching entries again.
+`BlackboardIngress.occurred(trigger, fact)` for low-level occurrence tests.
 Both trigger styles project to the lower-level `activationKey` internally.
 
 `activationKey` bridges ingress to agenda activation: when a fact drains with
@@ -311,10 +382,9 @@ escape hatches for tests, explicit control, and migration.
 
 `BlackboardIngress.publish` is safe to call from non-process threads. It queues
 pending ingress under lock and does not mutate the blackboard directly. Normal
-blackboard writes happen at process seams. `SAFETY_PREEMPT` is the narrow
-exception: it may signal currently active actions immediately so cooperative
-actions can exit at their next checkpoint. If no action is active, it does not
-create cancellation for a future action.
+blackboard writes happen at planning ticks. Cooperative action cancellation
+remains available through `AgentProcess.terminateAction`, but it is not a
+separate Evolving-ingress wake mode in the simplified POC.
 
 `BlackboardIngress` is distinct from `ReplanRequestedException`.
 `ReplanRequestedException` is initiated by an action or tool loop that is already
@@ -326,10 +396,14 @@ Consumer dogfooding found that append-only blackboard facts are a poor fit for
 mutable world-state booleans unless hiding, coalescing, or TTL semantics are
 explicit. Prefer one of these patterns:
 
+- use `EvolutionPolicy` for facts that should activate process-local runtime
+  goals
 - use `IngressMode.LATEST`, `coalesceKey`, and `ttl` for external facts whose
   visible state should replace or expire older facts
-- use typed `ActivationTrigger`s when external state or events should activate
-  runtime agenda entries
+- explicitly hide or replace consumer-owned level facts when the external level
+  falls false
+- reserve typed `ActivationTrigger`s for low-level POC tests and explicit latch
+  control
 - avoid modeling toggled state as permanent append-only facts unless the
   corresponding hide/coalesce rule is part of the design
 
@@ -351,7 +425,6 @@ An `AgendaEntry` references a known goal and carries runtime context:
 - `goal`
 - `bindings`
 - `source`
-- `lane`: `ECONOMIC` or `SAFETY`
 - `completionMode`
 - `activationKey`
 - `ttl`
@@ -382,7 +455,7 @@ agenda-wrapped `NIRVANA` still reaches Hybrid utility planning.
 ### AgendaEntryApprover
 
 `AgendaEntryApprover` approves or rejects agenda entry activation. The request
-includes the proposed entry, source fact, source type, lane, bindings, current
+includes the proposed entry, source fact, source type, bindings, current
 agenda, and agent process.
 
 The approver is used for both catalog activation and direct runtime proposals
@@ -433,9 +506,7 @@ completion.
 `ProcessContext.cancellationToken` exposes a pollable token for blocking action
 code. During action execution, the action receives a `ProcessContext` whose
 token is scoped to that action and can be passed to delegated worker threads.
-`IngressWake.SAFETY_PREEMPT` trips action-scope termination signals for actions
-active at publish time, so cooperative blocking actions can exit at bounded
-checkpoints. The current primitive is `AgentProcess.terminateAction`, backed by
+The current primitive is `AgentProcess.terminateAction`, backed by
 `TerminationSignal(TerminationScope.ACTION)`.
 
 If an action returns normally after observing an action-scope termination signal,
@@ -456,6 +527,7 @@ At drain time, the process:
 5. activates matching catalog entries through the approver when `activationKey`
    is present and not already active
 6. records the drained fact as active ingress for TTL tracking
+7. applies `EvolutionPolicy` rules over visible facts to propose runtime goals
 
 TTL expiry hides facts and emits a hidden-ingress event. It does not delete or
 mutate facts.
@@ -463,16 +535,7 @@ mutate facts.
 Wake ingress moves a blocked process from `WAITING`, `STUCK`, or `PAUSED` back
 to `RUNNING`. Terminal statuses remain terminal.
 
-Safety preempt is narrow:
-
-1. a fact is published with `IngressWake.SAFETY_PREEMPT`
-2. action-scope termination is signalled for actions active at publish time
-3. a cooperative in-flight action exits at a checkpoint
-4. ingress drains at the process seam
-5. any matching safety agenda entry activates
-6. safety-lane planning preempts economic agenda entries
-
-Catalog entries without an `activationKey` activate at a process seam once per
+Catalog entries without an `activationKey` activate at a planning tick once per
 entry id. Keyed catalog entries activate when matching ingress is drained and
 the process-private activation key transitions from inactive to active.
 Duplicate matching ingress while the key remains active does not re-propose the
@@ -480,7 +543,7 @@ entry; call `BlackboardIngress.clearActivationKey` when the external trigger has
 cleared and should be allowed to fire again. An already active entry id is
 rejected.
 
-Typed `ActivationTrigger`s layer over this latch:
+Typed `ActivationTrigger`s layer over this latch for low-level POC coverage:
 
 - level triggers own the false-to-true edge and false rearm through
   `BlackboardIngress.update`, with optional visible fact hiding via
@@ -488,7 +551,8 @@ Typed `ActivationTrigger`s layer over this latch:
 - occurrence triggers dedupe by occurrence id and reactivate for new occurrence
   ids
 - raw `activationKey` remains available for low-level/manual use, but examples
-  should prefer typed triggers
+  should prefer policy-driven runtime goals unless they are explicitly testing
+  ingress latch behavior
 
 Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
 Direct runtime additions are not remembered as one-shot catalog activations, so a
@@ -503,12 +567,20 @@ Active agenda entries are projected as `AgendaPlanningGoal` values. The wrapper
 keeps the underlying goal's semantic name and carries agenda identity on
 `AgendaPlanningGoal.entry`.
 
-If any active agenda entry is in `AgendaLane.SAFETY`, only safety entries are
-projected for that planning cycle. Otherwise all active agenda entries are
-projected.
+Active agenda entries are projected for the planning cycle. Runtime goals
+compose with standing agenda-wrapped `NIRVANA` through normal planner
+arbitration, preserving Hybrid's existing "real goal plus useful next action"
+semantics. If any non-`NIRVANA` runtime goal is already satisfied, the process
+withholds agenda-wrapped `NIRVANA` for that tick so completion behavior can
+consume outputs, hide source facts, and remove resumable entries before utility
+work resumes.
 
-Safety uses a hard lane rather than high utility because value or net-value
-ranking is still soft preference; it cannot guarantee preemption.
+Hard interruption is an availability problem, not a framework priority problem.
+Consumers can use existing `@Condition` methods and `@Action(pre = ...)`
+preconditions to make ordinary work unavailable while a domain condition holds,
+then let hazard or recovery actions become the achievable path. Goal and action
+values remain the ordinary soft arbitration mechanism when more than one path is
+available.
 
 When the active agenda is empty, planning falls back to the agent's base planning
 system. Completed resumable agenda goals are suppressed from that base planning
@@ -524,9 +596,10 @@ Agenda goals use their entry's `AgendaCompletionMode`:
 - `TERMINAL` sets a completed outcome and completes the process.
 - `RESUMABLE` removes the selected agenda entry, records the underlying goal as
   completed for base-goal suppression, consumes visible blackboard outputs that
-  satisfy the entry goal, sets a continue outcome, and re-runs arbitration. This
-  prevents a reactivated entry from being immediately satisfied by stale output
-  from its previous activation.
+  satisfy the entry goal, hides the source fact for policy-created entries, sets
+  a continue outcome, and re-runs arbitration. This prevents a reactivated entry
+  from being immediately satisfied by stale output from its previous activation
+  and prevents one handled source fact from repeatedly firing the same rule.
 - `COMPOSITE_TERMINAL` completes only when `completionPredicate` returns true.
   If the wrapped child goal is achieved before the composite predicate is true,
   the process moves to `WAITING`.
@@ -539,7 +612,7 @@ recoverable stuck path.
 
 - Preserve blackboard append/hide semantics: ingress adds and hides objects,
   never mutates or removes them.
-- Preserve the OODA loop: normal evolution happens at process seams.
+- Preserve the OODA loop: normal evolution happens at planning ticks.
 - Preserve planner independence: Evolving is not a new `PlannerType`.
 - Preserve deterministic activation: typed facts and direct runtime proposals go
   through the same approval seam.
@@ -556,6 +629,9 @@ The POC has focused tests for:
 - `EvolvingInvocation.createProcess(...)` creating an unstarted process with
   objective-authored evolution, initial facts, canonicalized goals, and manual
   ingress/tick control
+- action-produced runtime facts activating process-local runtime goals through
+  `EvolutionPolicy`
+- `ObjectiveAuthor` returning an `ObjectivePlan` with an `EvolutionPolicy`
 - activation keys and one-shot unkeyed catalog activation
 - activation-key idempotence for completed keyed `RESUMABLE` entries, with
   explicit false-then-true rearm behavior
@@ -565,41 +641,49 @@ The POC has focused tests for:
   reactivation
 - direct runtime agenda addition and approval rejection
 - duplicate goal names distinguished by agenda entry identity and bindings
-- safety-lane hard priority over economic entries
+- high-value runtime goals winning through normal arbitration
+- condition-gated ordinary work becoming unavailable during normal arbitration
+- runtime goals composing with agenda-wrapped `NIRVANA` for partial progress
+  without starving satisfied runtime-goal completion
 - agenda-wrapped `NIRVANA` preserving Hybrid utility behavior
 - resumable completion, base-goal suppression, and exhausted agenda handling
 - composite terminal completion and waiting behavior
 - `CompletionPolicy` outcomes for completed, exhausted, and cancelled
 - ingress wake from `WAITING`, `STUCK`, and `PAUSED`
 - latest/coalesced ingress hide behavior and TTL hide behavior
-- safety preempt of a cooperative blocking action
+- action-scope cancellation through the existing `terminateAction` primitive
 - Java construction of `EvolutionOptions`, `AgendaEntry`, and
   `AgendaEntryApprover`
 - Java use of `ObjectiveAuthorRequest.objectiveAs(Class<T>)`,
   `AgendaEntry.of(...).with...`, and `Nirvana.NIRVANA`
-- Java use of typed `ActivationTrigger` with
-  `AgendaEntry.of(...).activatedBy(trigger)` and `BlackboardIngress.update`
+- Java use of `ObjectiveAuthor` with `EvolutionPolicy`
+- Java use of typed `ActivationTrigger` with local POC fact ingress
 
 ## POC Boundary and Cleanup Direction
 
-Current conclusion: the branch is directionally right, and
-`EvolvingInvocation` plus `ObjectiveAuthor` are now the POC public interface.
-Some lower-level POC pieces should therefore become internal, experimental, or
-low-level escape hatches after the public interface is dogfooded. Do not delete
-the runtime mechanism yet.
+Current conclusion: the branch is directionally right as a throwaway
+implementation POC. The upstream proposal should not PR these names and classes
+as-is. `EvolvingInvocation` plus `ObjectiveAuthor` are useful target concepts,
+while lower-level POC pieces should either become internal implementation
+details, be redesigned, or disappear after the desired contracts are expressed
+with upstream-friendly APIs.
 
-Keep as core runtime substrate:
+Keep as conceptual runtime substrate:
 
-- `BlackboardIngress` and ingress events: the right seam for external facts
-  entering a running process
-- `ProcessCancellationToken`: needed for safety preemption and cooperative
-  blocking actions
-- `GoalAgenda`, `AgendaEntry`, and `AgendaLane.SAFETY`: the runtime mechanism
-  underneath `EvolvingInvocation`
+- sanctioned process-local fact ingress: the right seam for external facts
+  entering a running process. The local POC name is `BlackboardIngress`, but
+  upstream should treat naming and shape as open. Likely public spellings are
+  `process.ingress().publish(...)` as the conservative seam-oriented option or
+  `process.facts().publish(...)` as a friendlier facade if Embabel wants to
+  introduce first-class `Facts` vocabulary. Do not bless direct
+  `blackboard.add(...)` as the happy path for external ingress.
+- `ProcessCancellationToken`: needed for cooperative blocking actions
+- `GoalAgenda` and `AgendaEntry`: the runtime mechanism underneath
+  `EvolvingInvocation`
 - `CompletionPolicy` and `ProcessOutcome`: needed to distinguish completed,
   exhausted, cancelled, and continue outcomes
-- existing tests around ingress, safety preempt, agenda projection, Java
-  construction, and completion behavior
+- existing tests around ingress, agenda projection, Java construction, and
+  completion behavior
 
 Keep, but demote from the normal user-facing path:
 
@@ -613,10 +697,10 @@ mutation.
 
 Revisit after more consumer dogfood and framework-level acceptance coverage:
 
-- `ActivationTrigger` and `activationKey`: typed triggers are now the normal
-  consumer-facing ingress-to-agenda path. Raw `activationKey` may stay
-  low-level, but objective handlers or `ObjectiveAuthor` should own higher
-  level fact-to-objective mapping.
+- `ActivationTrigger` and `activationKey`: these are useful low-level POC
+  primitives, but objective handlers, `ObjectiveAuthor`, and `EvolutionPolicy`
+  should own higher-level fact-to-runtime-goal mapping. A future upstream API
+  should hide trigger/latch taxonomy from normal consumers.
 - `AgendaEntryApprover`: duplicates `GoalChoiceApprover`'s approval protocol
   shape, although its request payload is agenda-specific. Prefer a shared
   approval response/protocol abstraction over directly reusing
@@ -641,8 +725,8 @@ Guiding principle:
 - `EvolvingInvocation` = public interface
 - `ObjectiveAuthor` = optional objective-authoring seam
 - `GoalAgenda` = runtime mechanism
-- `BlackboardIngress` = external-event ingress
-- `AgendaEntryApprover` = authorization and safety seam
+- process-local fact ingress = external-event ingress
+- `AgendaEntryApprover` = authorization seam
 - Planner = deterministic execution
 
 ## Remaining POC Gap
@@ -656,8 +740,8 @@ Guiding principle:
   agenda entries, which avoids manual runtime `GoalAgenda` mutation but leaves
   reusable compilation helpers as future work.
 - Add a framework-level dogfood acceptance test mirroring the external consumer
-  scenario: repeatedly collect, store, resume, safety-preempt, and complete
-  without stale one-shot goal satisfaction.
+  scenario: repeatedly collect, store, resume, handle hazards through normal
+  arbitration, and complete without stale one-shot goal satisfaction.
 - Broaden user-facing examples once the API has more consumer mileage beyond the
   current deterministic `ObjectiveAuthor` and low-level `EvolutionOptions`
   examples.
@@ -665,14 +749,3 @@ Guiding principle:
   agenda-wrapped `NIRVANA` path has more consumer mileage.
 - Revisit whether any API should be marked internal or moved before an upstream
   PR.
-
-## Branch Scope
-
-Uncommitted Log4j2/logging changes appear unrelated to evolving mode and should
-not ride along with evolving-mode unless a real dependency appears. They may be
-good work, but they likely belong in a separate branch or PR:
-
-- `AgentLoggingEnvironmentPostProcessor.java`
-- `agent-platform.properties`
-- `log4j2-embabel.xml`
-- logging docs, tests, and test resources

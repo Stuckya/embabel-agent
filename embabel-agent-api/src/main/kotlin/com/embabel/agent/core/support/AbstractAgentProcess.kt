@@ -286,9 +286,6 @@ abstract class AbstractAgentProcess(
         if (options.wake != IngressWake.NONE) {
             wakeIfBlocked()
         }
-        if (options.wake == IngressWake.SAFETY_PREEMPT) {
-            terminateAction("Safety ingress published: ${receipt.factType}")
-        }
         return receipt
     }
 
@@ -389,6 +386,30 @@ abstract class AbstractAgentProcess(
             }
     }
 
+    private fun activatePolicyEntriesFromFacts() {
+        processOptions.evolution.policy.rules.forEach { rule ->
+            val goal = canonicalRuntimeGoal(rule)
+            blackboard.objects
+                .filter { rule.eventType.isInstance(it) }
+                .forEach {
+                    activateAgendaEntry(
+                        entry = rule.withGoal(goal).toAgendaEntry(it),
+                        sourceFact = it,
+                        rememberActivation = false,
+                    )
+                }
+        }
+    }
+
+    private fun canonicalRuntimeGoal(rule: RuntimeGoalRule): Goal {
+        rule.goal?.let { return it }
+        return agent.goals.filter { it.outputType?.name == rule.runtimeAction.name }.singleOrNull()
+            ?: throw IllegalArgumentException(
+                "Evolution policy runtime action ${rule.runtimeAction.name} " +
+                        "is not uniquely satisfied by a goal in agent ${agent.name}"
+            )
+    }
+
     private fun activateAgendaEntry(
         entry: AgendaEntry,
         sourceFact: Any?,
@@ -398,7 +419,6 @@ abstract class AbstractAgentProcess(
             entry = entry,
             sourceFact = sourceFact,
             sourceType = sourceFact?.javaClass?.name,
-            lane = entry.lane,
             bindings = entry.bindings,
             currentAgenda = _goalAgenda,
             agentProcess = this,
@@ -444,6 +464,7 @@ abstract class AbstractAgentProcess(
         return _goalAgenda.entries.isNotEmpty() ||
                 activeIngress.isNotEmpty() ||
                 evolution.agendaCatalog.entries.isNotEmpty() ||
+                evolution.policy.rules.isNotEmpty() ||
                 evolution.completionPolicy !== CompletionPolicy.CONTINUE ||
                 hasPendingIngress()
     }
@@ -454,12 +475,8 @@ abstract class AbstractAgentProcess(
         }
 
     protected fun effectivePlanningSystem(): PlanningSystem {
-        val activeEntries = if (goalAgenda.entries.any { it.lane == AgendaLane.SAFETY }) {
-            goalAgenda.entries.filter { it.lane == AgendaLane.SAFETY }
-        } else {
-            goalAgenda.entries
-        }
-        val activeGoals = activeEntries.map { AgendaPlanningGoal(it) }.toSet()
+        val entries = activeAgendaEntriesForPlanning()
+        val activeGoals = entries.map { AgendaPlanningGoal(it) }.toSet()
         return if (activeGoals.isEmpty()) {
             basePlanningSystem()
         } else {
@@ -467,6 +484,20 @@ abstract class AbstractAgentProcess(
                 actions = agent.actions.toSet(),
                 goals = activeGoals,
             )
+        }
+    }
+
+    private fun activeAgendaEntriesForPlanning(): List<AgendaEntry> {
+        val entries = goalAgenda.entries
+        if (entries.none { it.goal == NIRVANA }) {
+            return entries
+        }
+        val worldState = worldStateDeterminer.determineWorldState()
+        // Prefer satisfied runtime-goal cleanup for one tick; utility work can resume after sources and outputs are hidden.
+        return if (entries.any { it.goal != NIRVANA && AgendaPlanningGoal(it).isAchievable(worldState) }) {
+            entries.filterNot { it.goal == NIRVANA }
+        } else {
+            entries
         }
     }
 
@@ -623,6 +654,7 @@ abstract class AbstractAgentProcess(
 
             AgendaCompletionMode.RESUMABLE -> {
                 consumeGoalOutputs(agendaEntry.goal)
+                agendaEntry.source?.let { blackboard.hide(it) }
                 _goalAgenda = _goalAgenda.withoutEntry(agendaEntry.id)
                 completedAgendaGoals += agendaEntry.goal
                 _outcome = ProcessOutcome(
@@ -893,6 +925,7 @@ abstract class AbstractAgentProcess(
         if (
             agent.goals.isEmpty() &&
             processOptions.evolution.agendaCatalog.entries.isEmpty() &&
+            processOptions.evolution.policy.rules.isEmpty() &&
             processOptions.plannerType.needsGoals
         ) {
             logger.info("🛑 Process {} has no goals: {}", this.id, agent.goals)
@@ -1097,6 +1130,7 @@ abstract class AbstractAgentProcess(
                 sourceFact = null,
             )
             drainIngress()
+            activatePolicyEntriesFromFacts()
             if (applyCompletionPolicy()) {
                 platformServices.agentProcessRepository.update(this)
                 return this

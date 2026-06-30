@@ -17,7 +17,6 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.api.dsl.agent
-import com.embabel.agent.api.event.ActionExecutionResultEvent
 import com.embabel.agent.core.AgendaCompletionMode
 import com.embabel.agent.core.AgendaCompletionPredicate
 import com.embabel.agent.core.AgendaEntry
@@ -25,14 +24,13 @@ import com.embabel.agent.core.AgendaEntryApprovalRequest
 import com.embabel.agent.core.AgendaEntryApprovalResponse
 import com.embabel.agent.core.AgendaEntryApproved
 import com.embabel.agent.core.AgendaEntryApprover
-import com.embabel.agent.core.AgendaLane
 import com.embabel.agent.core.AgendaPlanningGoal
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.ActionStatusCode
 import com.embabel.agent.core.ActivationTrigger
 import com.embabel.agent.core.CompletionPolicy
 import com.embabel.agent.core.EvolutionOptions
+import com.embabel.agent.core.EvolutionPolicy
 import com.embabel.agent.core.GoalAgenda
 import com.embabel.agent.core.IngressOptions
 import com.embabel.agent.core.IngressWake
@@ -47,7 +45,6 @@ import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServ
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -77,28 +74,25 @@ data class DuplicateSecondOutcome(
     val name: String,
 )
 
-data class BlockingWorkSignal(
-    val name: String,
-)
-
-data class BlockingWorkOutcome(
-    val name: String,
-)
-
 data class PlanningConditionCollisionOutcome(
     val name: String,
 )
 
-object SafetyPreemptProbe {
+data class CollectionTick(
+    val zone: String,
+)
 
-    lateinit var actionStarted: CountDownLatch
-    lateinit var cancellationObserved: CountDownLatch
+data class AdditionalStorageNeeded(
+    val zone: String,
+)
 
-    fun reset() {
-        actionStarted = CountDownLatch(1)
-        cancellationObserved = CountDownLatch(1)
-    }
-}
+data class StorageCompleted(
+    val zone: String,
+)
+
+data class AtStorage(
+    val zone: String,
+)
 
 val EvolvingAgendaAgent = agent("EvolvingAgendaAgent", description = "Tests evolving agenda projection") {
     transformation<EconomicSignal, EconomicOutcome>(name = "economic-work") {
@@ -178,32 +172,31 @@ val ResumableSuppressionAgent = agent("ResumableSuppressionAgent", description =
     )
 }
 
-val SafetyPreemptAgent = agent("SafetyPreemptAgent", description = "Tests safety preemption") {
-    transformation<BlockingWorkSignal, BlockingWorkOutcome>(name = "blocking-economic-work") {
-        SafetyPreemptProbe.actionStarted.countDown()
-        val token = AgentProcess.get()!!.processContext.cancellationToken
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-        while (System.nanoTime() < deadline) {
-            if (token.isCancellationRequested) {
-                SafetyPreemptProbe.cancellationObserved.countDown()
-                return@transformation BlockingWorkOutcome("cancelled")
-            }
-            Thread.sleep(10)
-        }
-        BlockingWorkOutcome("completed")
+val ConditionGatedInterruptionAgent = agent(
+    "ConditionGatedInterruptionAgent",
+    description = "Tests condition-gated availability during agenda arbitration",
+) {
+    val ordinaryWorkAvailable by conditionOf("ordinary-work-available") {
+        it.last(SafetySignal::class.java) == null
     }
-    transformation<SafetySignal, SafetyOutcome>(name = "preempt-safety-work") {
+    transformation<EconomicSignal, EconomicOutcome>(
+        name = "condition-gated-economic-work",
+        preConditions = listOf(ordinaryWorkAvailable),
+    ) {
+        EconomicOutcome(it.input.name)
+    }
+    transformation<SafetySignal, SafetyOutcome>(name = "condition-gated-hazard-work") {
         SafetyOutcome(it.input.name)
     }
     goal(
         name = "economic-goal",
-        description = "Complete blocking economic work",
-        satisfiedBy = BlockingWorkOutcome::class,
+        description = "Complete economic work",
+        satisfiedBy = EconomicOutcome::class,
         value = { 1.0 },
     )
     goal(
-        name = "safety-goal",
-        description = "Complete safety work",
+        name = "hazard-goal",
+        description = "Handle the hazard",
         satisfiedBy = SafetyOutcome::class,
         value = { 0.1 },
     )
@@ -236,6 +229,90 @@ val ActivationConditionCollisionAgent = agent(
     )
 }
 
+val RuntimeFactEvolutionAgent = agent("RuntimeFactEvolutionAgent", description = "Tests runtime fact policy") {
+    transformation<CollectionTick, AdditionalStorageNeeded>(
+        name = "notice-storage-needed",
+        canRerun = true,
+        value = { 1.0 },
+    ) {
+        AdditionalStorageNeeded(it.input.zone)
+    }
+    transformation<AdditionalStorageNeeded, StorageCompleted>(
+        name = "store-collected-items",
+        canRerun = true,
+        value = { 10.0 },
+    ) {
+        StorageCompleted(it.input.zone)
+    }
+    goal(
+        name = "storage-completed",
+        description = "Complete storage work",
+        satisfiedBy = StorageCompleted::class,
+        value = { 1.0 },
+    )
+}
+
+val HybridRuntimeGoalAgent = agent(
+    "HybridRuntimeGoalAgent",
+    description = "Tests runtime goals composed with standing utility work",
+) {
+    transformation<AdditionalStorageNeeded, AtStorage>(
+        name = "navigate-to-storage",
+        canRerun = true,
+        value = { 5.0 },
+    ) {
+        AtStorage(it.input.zone)
+    }
+    transformation<AtStorage, StorageCompleted>(
+        name = "store-after-navigation",
+        canRerun = true,
+        value = { 10.0 },
+    ) {
+        StorageCompleted(it.input.zone)
+    }
+    goal(
+        name = "storage-completed",
+        description = "Complete storage work",
+        satisfiedBy = StorageCompleted::class,
+        value = { 1.0 },
+    )
+}
+
+val HybridMultipleRuntimeGoalAgent = agent(
+    "HybridMultipleRuntimeGoalAgent",
+    description = "Tests completion cleanup before standing utility work resumes",
+) {
+    transformation<AdditionalStorageNeeded, AtStorage>(
+        name = "navigate-to-storage",
+        canRerun = true,
+        value = { 5.0 },
+    ) {
+        AtStorage(it.input.zone)
+    }
+    transformation<AtStorage, StorageCompleted>(
+        name = "store-after-navigation",
+        canRerun = true,
+        value = { 10.0 },
+    ) {
+        StorageCompleted(it.input.zone)
+    }
+    transformation<SafetySignal, SafetyOutcome>(name = "cleanup-work") {
+        SafetyOutcome(it.input.name)
+    }
+    goal(
+        name = "storage-completed",
+        description = "Complete storage work",
+        satisfiedBy = StorageCompleted::class,
+        value = { 1.0 },
+    )
+    goal(
+        name = "cleanup-completed",
+        description = "Complete cleanup work",
+        satisfiedBy = SafetyOutcome::class,
+        value = { 1.0 },
+    )
+}
+
 class EvolvingProcessModeTest {
 
     @Test
@@ -247,7 +324,6 @@ class EvolvingProcessModeTest {
             id = "safety-entry",
             goal = safetyGoal,
             source = "test",
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.TERMINAL,
             activationKey = "danger",
         )
@@ -291,7 +367,6 @@ class EvolvingProcessModeTest {
             id = "safety-entry",
             goal = safetyGoal,
             source = "test",
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.TERMINAL,
             activationKey = "danger",
         )
@@ -325,6 +400,55 @@ class EvolvingProcessModeTest {
     }
 
     @Test
+    fun `runtime fact policy activates resumable runtime goal and consumes handled source`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += CollectionTick("zone-a")
+        val storageGoal = RuntimeFactEvolutionAgent.goals.single { it.name == "storage-completed" }
+        val agentProcess = SimpleAgentProcess(
+            id = "test-runtime-fact-policy",
+            agent = RuntimeFactEvolutionAgent,
+            processOptions = ProcessOptions()
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolution(
+                    EvolutionOptions(
+                        agendaCatalog = GoalAgenda.EMPTY.withEntry(
+                            AgendaEntry(
+                                id = "collect-loop",
+                                goal = NIRVANA,
+                                completionMode = AgendaCompletionMode.TERMINAL,
+                            )
+                        ),
+                        policy = EvolutionPolicy.EMPTY.onEvent(
+                            eventType = AdditionalStorageNeeded::class.java,
+                            runtimeAction = StorageCompleted::class.java,
+                        ),
+                    )
+                ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.tick()
+        assertEquals(listOf(AdditionalStorageNeeded("zone-a")), agentProcess.objects.filterIsInstance<AdditionalStorageNeeded>())
+
+        agentProcess.tick()
+        assertEquals(listOf(StorageCompleted("zone-a")), agentProcess.objects.filterIsInstance<StorageCompleted>())
+
+        agentProcess.tick()
+        assertEquals(emptyList<AdditionalStorageNeeded>(), agentProcess.objects.filterIsInstance<AdditionalStorageNeeded>())
+        assertEquals(emptyList<StorageCompleted>(), agentProcess.objects.filterIsInstance<StorageCompleted>())
+        assertEquals(listOf("collect-loop"), agentProcess.goalAgenda.entries.map { it.id })
+
+        agentProcess.addObject(AdditionalStorageNeeded("zone-a"))
+        agentProcess.tick()
+
+        assertEquals(2, agentProcess.history.count { it.actionName == "store-collected-items" })
+        assertEquals(storageGoal, agentProcess.goalAgenda.entries.single { it.id != "collect-loop" }.goal)
+    }
+
+    @Test
     fun `resumable agenda entry is removed and process re-arbitrates`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
@@ -334,7 +458,6 @@ class EvolvingProcessModeTest {
             id = "safety-entry",
             goal = safetyGoal,
             source = "test",
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
         )
         val agentProcess = SimpleAgentProcess(
@@ -537,6 +660,99 @@ class EvolvingProcessModeTest {
     }
 
     @Test
+    fun `hybrid agenda keeps nirvana visible alongside runtime goal for partial progress`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += AdditionalStorageNeeded("zone-a")
+        val nirvanaEntry = AgendaEntry(
+            id = "standing-work",
+            goal = NIRVANA,
+            completionMode = AgendaCompletionMode.TERMINAL,
+        )
+        val storageEntry = AgendaEntry(
+            id = "runtime-storage",
+            goal = HybridRuntimeGoalAgent.goals.single { it.name == "storage-completed" },
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-hybrid-runtime-goal-partial-progress",
+            agent = HybridRuntimeGoalAgent,
+            processOptions = ProcessOptions()
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolution(
+                    EvolutionOptions(
+                        agendaCatalog = GoalAgenda()
+                            .withEntry(nirvanaEntry)
+                            .withEntry(storageEntry),
+                    )
+                ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.tick()
+
+        assertEquals(AtStorage("zone-a"), agentProcess.lastResult())
+        assertEquals("navigate-to-storage", agentProcess.history.last().actionName)
+    }
+
+    @Test
+    fun `satisfied runtime goal cleanup runs before nirvana resumes partial progress`() {
+        val blackboard = InMemoryBlackboard()
+        val cleanupSource = SafetySignal("handled")
+        blackboard += AdditionalStorageNeeded("zone-a")
+        blackboard += cleanupSource
+        blackboard += SafetyOutcome("handled")
+        val nirvanaEntry = AgendaEntry(
+            id = "standing-work",
+            goal = NIRVANA,
+            completionMode = AgendaCompletionMode.TERMINAL,
+        )
+        val cleanupEntry = AgendaEntry(
+            id = "runtime-cleanup",
+            goal = HybridMultipleRuntimeGoalAgent.goals.single { it.name == "cleanup-completed" },
+            source = cleanupSource,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val storageEntry = AgendaEntry(
+            id = "runtime-storage",
+            goal = HybridMultipleRuntimeGoalAgent.goals.single { it.name == "storage-completed" },
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-hybrid-runtime-cleanup-before-partial-progress",
+            agent = HybridMultipleRuntimeGoalAgent,
+            processOptions = ProcessOptions()
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolution(
+                    EvolutionOptions(
+                        agendaCatalog = GoalAgenda()
+                            .withEntry(nirvanaEntry)
+                            .withEntry(cleanupEntry)
+                            .withEntry(storageEntry),
+                    )
+                ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.tick()
+
+        assertEquals(listOf("standing-work", "runtime-storage"), agentProcess.goalAgenda.entries.map { it.id })
+        assertEquals(emptyList<SafetyOutcome>(), agentProcess.objects.filterIsInstance<SafetyOutcome>())
+        assertEquals(emptyList<SafetySignal>(), agentProcess.objects.filterIsInstance<SafetySignal>())
+        assertTrue(agentProcess.history.isEmpty())
+
+        agentProcess.tick()
+
+        assertEquals(AtStorage("zone-a"), agentProcess.lastResult())
+        assertEquals("navigate-to-storage", agentProcess.history.last().actionName)
+    }
+
+    @Test
     fun `agenda completion modes stay within first POC surface`() {
         assertEquals(
             setOf("TERMINAL", "RESUMABLE", "COMPOSITE_TERMINAL"),
@@ -647,32 +863,68 @@ class EvolvingProcessModeTest {
     }
 
     @Test
-    fun `safety lane has hard priority over higher value economic agenda entries`() {
+    fun `high value agenda entry wins through normal goal arbitration`() {
         val blackboard = InMemoryBlackboard()
         blackboard += SafetySignal("danger")
         blackboard += EconomicSignal("profitable")
-        val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
-        val economicGoal = EvolvingAgendaAgent.goals.single { it.name == "economic-goal" }
+        val safetyGoal = ResumableSuppressionAgent.goals.single { it.name == "safety-goal" }
+        val economicGoal = ResumableSuppressionAgent.goals.single { it.name == "economic-goal" }
         val safetyEntry = AgendaEntry(
             id = "safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
         )
         val economicEntry = AgendaEntry(
             id = "economic-entry",
             goal = economicGoal,
-            lane = AgendaLane.ECONOMIC,
             completionMode = AgendaCompletionMode.RESUMABLE,
         )
         val agentProcess = SimpleAgentProcess(
-            id = "test-safety-lane-priority",
-            agent = EvolvingAgendaAgent,
+            id = "test-safety-value-priority",
+            agent = ResumableSuppressionAgent,
             processOptions = ProcessOptions().withEvolution(
                 EvolutionOptions(
                     agendaCatalog = GoalAgenda()
                         .withEntry(economicEntry)
                         .withEntry(safetyEntry),
+                )
+            ),
+            blackboard = blackboard,
+            platformServices = dummyPlatformServices(),
+            plannerFactory = DefaultPlannerFactory,
+            parentId = null,
+        )
+
+        agentProcess.tick()
+
+        assertTrue(agentProcess.lastResult() is SafetyOutcome)
+    }
+
+    @Test
+    fun `condition gated ordinary work becomes unavailable during agenda arbitration`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard += SafetySignal("danger")
+        blackboard += EconomicSignal("profitable")
+        val hazardGoal = ConditionGatedInterruptionAgent.goals.single { it.name == "hazard-goal" }
+        val economicGoal = ConditionGatedInterruptionAgent.goals.single { it.name == "economic-goal" }
+        val hazardEntry = AgendaEntry(
+            id = "hazard-entry",
+            goal = hazardGoal,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val economicEntry = AgendaEntry(
+            id = "economic-entry",
+            goal = economicGoal,
+            completionMode = AgendaCompletionMode.RESUMABLE,
+        )
+        val agentProcess = SimpleAgentProcess(
+            id = "test-condition-gated-availability",
+            agent = ConditionGatedInterruptionAgent,
+            processOptions = ProcessOptions().withEvolution(
+                EvolutionOptions(
+                    agendaCatalog = GoalAgenda()
+                        .withEntry(economicEntry)
+                        .withEntry(hazardEntry),
                 )
             ),
             blackboard = blackboard,
@@ -744,7 +996,6 @@ class EvolvingProcessModeTest {
         val safetyEntry = AgendaEntry(
             id = "runtime-safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.TERMINAL,
         )
         val agentProcess = SimpleAgentProcess(
@@ -779,7 +1030,6 @@ class EvolvingProcessModeTest {
         val safetyEntry = AgendaEntry(
             id = "rearmable-safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
             activationKey = "danger",
         )
@@ -830,7 +1080,6 @@ class EvolvingProcessModeTest {
             .wake(IngressWake.WAKE)
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
         val safetyEntry = AgendaEntry.of("typed-safety-entry", safetyGoal)
-            .withLane(AgendaLane.SAFETY)
             .withCompletionMode(AgendaCompletionMode.RESUMABLE)
             .activatedBy(dangerTrigger)
         val agentProcess = SimpleAgentProcess(
@@ -871,7 +1120,6 @@ class EvolvingProcessModeTest {
             .wake(IngressWake.WAKE)
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
         val safetyEntry = AgendaEntry.of("typed-safety-entry", safetyGoal)
-            .withLane(AgendaLane.SAFETY)
             .withCompletionMode(AgendaCompletionMode.RESUMABLE)
             .activatedBy(dangerTrigger)
         val agentProcess = SimpleAgentProcess(
@@ -940,7 +1188,6 @@ class EvolvingProcessModeTest {
             .occurrenceId { it.name }
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
         val safetyEntry = AgendaEntry.of("typed-occurrence-safety-entry", safetyGoal)
-            .withLane(AgendaLane.SAFETY)
             .withCompletionMode(AgendaCompletionMode.RESUMABLE)
             .activatedBy(dangerTrigger)
         val agentProcess = SimpleAgentProcess(
@@ -981,7 +1228,6 @@ class EvolvingProcessModeTest {
             .occurrenceId { it.name }
         val safetyGoal = EvolvingAgendaAgent.goals.single { it.name == "safety-goal" }
         val safetyEntry = AgendaEntry.of("typed-occurrence-safety-entry", safetyGoal)
-            .withLane(AgendaLane.SAFETY)
             .withCompletionMode(AgendaCompletionMode.RESUMABLE)
             .activatedBy(dangerTrigger)
         val agentProcess = SimpleAgentProcess(
@@ -1023,7 +1269,6 @@ class EvolvingProcessModeTest {
         val safetyEntry = AgendaEntry(
             id = "rearmable-safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
             activationKey = "danger",
         )
@@ -1077,7 +1322,6 @@ class EvolvingProcessModeTest {
         val safetyEntry = AgendaEntry(
             id = "collision-safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
             activationKey = "danger",
         )
@@ -1138,7 +1382,6 @@ class EvolvingProcessModeTest {
         val safetyEntry = AgendaEntry(
             id = "rearmable-safety-entry",
             goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
             completionMode = AgendaCompletionMode.RESUMABLE,
         )
         val agentProcess = SimpleAgentProcess(
@@ -1159,58 +1402,6 @@ class EvolvingProcessModeTest {
         agentProcess.tick()
 
         assertEquals(listOf(SafetyOutcome("danger")), agentProcess.objects.filterIsInstance<SafetyOutcome>())
-    }
-
-    @Test
-    fun `safety preempt marks cooperative in flight action terminated and replans to safety agenda`() {
-        SafetyPreemptProbe.reset()
-        val listener = EventSavingAgenticEventListener()
-        val blackboard = InMemoryBlackboard()
-        blackboard += BlockingWorkSignal("profitable")
-        val safetyGoal = SafetyPreemptAgent.goals.single { it.name == "safety-goal" }
-        val safetyEntry = AgendaEntry(
-            id = "preempt-safety-entry",
-            goal = safetyGoal,
-            lane = AgendaLane.SAFETY,
-            completionMode = AgendaCompletionMode.TERMINAL,
-            activationKey = "danger",
-        )
-        val agentProcess = SimpleAgentProcess(
-            id = "test-safety-preempt-end-to-end",
-            agent = SafetyPreemptAgent,
-            processOptions = ProcessOptions().withEvolution(
-                EvolutionOptions(
-                    agendaCatalog = GoalAgenda().withEntry(safetyEntry),
-                )
-            ),
-            blackboard = blackboard,
-            platformServices = dummyPlatformServices(listener),
-            plannerFactory = DefaultPlannerFactory,
-            parentId = null,
-        )
-        val executor = Executors.newSingleThreadExecutor()
-        try {
-            val run = executor.submit<AgentProcess> { agentProcess.run() }
-            assertTrue(SafetyPreemptProbe.actionStarted.await(1, TimeUnit.SECONDS))
-
-            agentProcess.ingress.publish(
-                SafetySignal("danger"),
-                IngressOptions(wake = IngressWake.SAFETY_PREEMPT, activationKey = "danger"),
-            )
-
-            assertTrue(SafetyPreemptProbe.cancellationObserved.await(1, TimeUnit.SECONDS))
-            val result = run.get(2, TimeUnit.SECONDS)
-
-            assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
-            assertTrue(result.lastResult() is SafetyOutcome)
-            val blockingActionResult = listener.processEvents
-                .filterIsInstance<ActionExecutionResultEvent>()
-                .single { it.action.name == "blocking-economic-work" }
-            assertEquals(ActionStatusCode.TERMINATED, blockingActionResult.actionStatus.status)
-        } finally {
-            agentProcess.terminateAgent("test cleanup")
-            executor.shutdownNow()
-        }
     }
 
     @Test

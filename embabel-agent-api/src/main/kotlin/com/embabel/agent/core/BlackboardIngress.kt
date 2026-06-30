@@ -84,7 +84,6 @@ enum class IngressMode {
 enum class IngressWake {
     NONE,
     WAKE,
-    SAFETY_PREEMPT,
 }
 
 data class IngressReceipt(
