@@ -59,14 +59,14 @@ rewrite user-declared agent metadata.
 Runtime facts are a substrate rather than the whole feature. Internally driven
 evolution can start with facts produced by normal actions. Externally driven
 evolution needs a sanctioned ingress path so a known running process can receive
-facts from the host application. Both paths feed the same evolution engine.
+facts from the consumer application. Both paths feed the same evolution engine.
 
 Incremental delivery can therefore be framed as:
 
 1. internal action-produced runtime facts: normal action outputs activate
    process-local runtime goals
-2. external triggers/events: host-published facts enter the same process safely
-   at planning seams
+2. external triggers/events: facts published by the consumer application enter
+   the same process safely at planning seams
 3. observability support: each wake-up remains attached to the existing
    process/session, with clean turn boundaries and runtime-goal lifecycle events
 
@@ -194,7 +194,7 @@ EvolvingInvocation.on(agentPlatform)
 wrapping a canonical goal from the active scope. Ambiguous output-type matches
 should fail unless the rule names the declared goal explicitly.
 
-An optional event-source adapter can sit above fact ingress for host applications
+An optional event-source adapter can sit above fact ingress for consumer applications
 that already have a domain event stream:
 
 ```java
@@ -513,11 +513,11 @@ planner satisfies runtime goals
 
 ## Base Policy And Objective Policy
 
-Separate universal host policy from objective-authored policy.
+Separate universal consumer-application policy from objective-authored policy.
 
-Base policy is installed by the host for every relevant process. It should cover
-events the `ObjectiveAuthor` should not have to remember, such as hazards,
-blocking prompts, and session recovery.
+Base policy is installed by the consumer application for every relevant process.
+It should cover events the `ObjectiveAuthor` should not have to remember, such
+as hazards, blocking prompts, and session recovery.
 
 Objective policy is produced for a particular run. It should cover objective
 completion, objective-specific event rules, scheduled interruptions, utility

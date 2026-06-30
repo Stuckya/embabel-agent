@@ -32,8 +32,8 @@ The upstream proposal should be incremental:
 
 1. internal action-produced runtime facts: normal action outputs activate
    process-local runtime goals
-2. external triggers/events: host-published facts enter a known running process
-   through sanctioned ingress and feed the same evolution engine
+2. external triggers/events: facts published by the consumer application enter a
+   known running process through sanctioned ingress and feed the same evolution engine
 3. observability support: each wake-up remains attached to the existing
    process/session with clean turn boundaries and runtime-goal lifecycle events
 
@@ -337,7 +337,7 @@ type is the default match; named binding is available when type alone is
 ambiguous. Hiding removes an object from future planning and API visibility
 without deleting process history. External async facts should therefore enter
 through a sanctioned process-local ingress seam and drain at planning ticks rather
-than mutating the blackboard directly from host threads.
+than mutating the blackboard directly from consumer application threads.
 
 If a mutable level is modeled as a blackboard fact, the consumer owns that
 fact's lifecycle unless explicit ingress lifecycle options are configured. When
@@ -556,10 +556,10 @@ Typed `ActivationTrigger`s layer over this latch for low-level POC coverage:
 
 Runtime code can call `AgentProcess.addAgendaEntry` to propose entries directly.
 Direct runtime additions are not remembered as one-shot catalog activations, so a
-host or action can propose a fresh entry again after the previous entry is no
-longer active. This is a low-level escape hatch for tests, explicit control, and
-advanced integrations; the normal public path should compile typed `Objective`s
-through `EvolvingInvocation`.
+consumer application or action can propose a fresh entry again after the
+previous entry is no longer active. This is a low-level escape hatch for tests,
+explicit control, and advanced integrations; the normal public path should
+compile typed `Objective`s through `EvolvingInvocation`.
 
 ## Planning Behavior
 
