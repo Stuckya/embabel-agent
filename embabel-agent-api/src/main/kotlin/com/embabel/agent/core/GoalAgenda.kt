@@ -127,7 +127,11 @@ data class EvolutionPolicy @JvmOverloads constructor(
     val rules: List<RuntimeGoalRule> = emptyList(),
 ) {
 
+    fun onFact(factType: Class<*>): RuntimeFactRuleSpec =
+        RuntimeFactRuleSpec(policy = this, factType = factType)
+
     @JvmOverloads
+    @Deprecated("Use onFact(...).handleWith(...).resumable() or onFact(...).handleWithGoal(...).resumable().")
     fun onEvent(
         eventType: Class<*>,
         runtimeAction: Class<*>,
@@ -151,21 +155,77 @@ data class EvolutionPolicy @JvmOverloads constructor(
     }
 }
 
+class RuntimeFactRuleSpec internal constructor(
+    private val policy: EvolutionPolicy,
+    private val factType: Class<*>,
+) {
+
+    fun handleWith(outputType: Class<*>): RuntimeGoalRuleSpec =
+        RuntimeGoalRuleSpec(
+            policy = policy,
+            factType = factType,
+            runtimeAction = outputType,
+            goal = null,
+        )
+
+    fun handleWithGoal(goal: Goal): RuntimeGoalRuleSpec =
+        RuntimeGoalRuleSpec(
+            policy = policy,
+            factType = factType,
+            runtimeAction = null,
+            goal = goal,
+        )
+}
+
+class RuntimeGoalRuleSpec internal constructor(
+    private val policy: EvolutionPolicy,
+    private val factType: Class<*>,
+    private val runtimeAction: Class<*>?,
+    private val goal: Goal?,
+) {
+
+    fun terminal(): EvolutionPolicy =
+        withCompletionMode(AgendaCompletionMode.TERMINAL)
+
+    fun resumable(): EvolutionPolicy =
+        withCompletionMode(AgendaCompletionMode.RESUMABLE)
+
+    fun compositeTerminal(): EvolutionPolicy =
+        withCompletionMode(AgendaCompletionMode.COMPOSITE_TERMINAL)
+
+    private fun withCompletionMode(completionMode: AgendaCompletionMode): EvolutionPolicy =
+        policy.withRule(
+            RuntimeGoalRule(
+                eventType = factType,
+                runtimeAction = runtimeAction,
+                completionMode = completionMode,
+                goal = goal,
+            )
+        )
+}
+
 data class RuntimeGoalRule @JvmOverloads constructor(
     val eventType: Class<*>,
-    val runtimeAction: Class<*>,
+    val runtimeAction: Class<*>? = null,
     val completionMode: AgendaCompletionMode = AgendaCompletionMode.RESUMABLE,
     val goal: Goal? = null,
-    val id: String = "${eventType.name}->${runtimeAction.name}",
+    val id: String = "${eventType.name}->${goal?.name ?: runtimeAction?.name ?: "runtime-goal"}",
 ) {
+
+    val factType: Class<*>
+        get() = eventType
 
     fun withGoal(goal: Goal): RuntimeGoalRule =
         copy(goal = goal)
 
-    fun toAgendaEntry(sourceFact: Any): AgendaEntry {
+    @JvmOverloads
+    fun toAgendaEntry(
+        sourceFact: Any,
+        activationId: String = System.identityHashCode(sourceFact).toString(),
+    ): AgendaEntry {
         val canonicalGoal = goal ?: error("Runtime goal rule $id has not been canonicalized")
         return AgendaEntry(
-            id = "$id:${System.identityHashCode(sourceFact)}",
+            id = "$id:$activationId",
             goal = canonicalGoal,
             source = sourceFact,
             completionMode = completionMode,

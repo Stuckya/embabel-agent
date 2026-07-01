@@ -6,23 +6,29 @@ generic.
 
 ## Problem Statement
 
-Event-driven applications need a boring, typed, deterministic way to let a
-running Embabel process react to external state without repeatedly invoking Open
-or Supervisor mode and without asking consumers to manage blackboard latches.
+Long-lived applications need a boring, typed, deterministic way to let a running
+Embabel process remember and complete selected units of follow-up work without
+repeatedly invoking Open or Supervisor mode and without asking consumers to
+manage blackboard latches.
 
 The public model should be:
 
 ```text
-external event/state
-  -> process fact ingress
-  -> optional fact derivation pass
-  -> published or derived domain facts
-  -> evolution policy maps selected facts to runtime goals
-  -> existing GOAP / Utility / Hybrid planner selects real actions
+external events / sensors
+  -> application-owned state modules
+  -> @Condition / action inputs for current truth
+
+occurrence facts
+  -> EvolutionPolicy maps selected facts to runtime goals
+  -> consume / rearm / resume
+
+user or LLM objectives
+  -> ObjectiveAuthor / ObjectivePlan
+  -> process-local runtime goals
 ```
 
 This preserves Embabel's existing action/fact/goal model while giving Evolving
-Mode a first-class runtime mechanism.
+Mode a first-class process-local objective mechanism.
 
 ## Core Principle
 
@@ -48,7 +54,9 @@ The proposal should separate three concerns that were easy to blur together:
 
 - declared capabilities: immutable `@Agent` and `@EmbabelComponent` actions,
   conditions, and declared goals
-- runtime facts: process-local state available at planning ticks
+- application-owned state modules: consumer-owned current truth exposed through
+  action inputs and `@Condition`
+- runtime facts: selected process-local facts available at planning ticks
 - runtime goals: process-local active objectives added or removed by an
   evolution policy
 
@@ -59,14 +67,20 @@ rewrite user-declared agent metadata.
 Runtime facts are a substrate rather than the whole feature. Internally driven
 evolution can start with facts produced by normal actions. Externally driven
 evolution needs a sanctioned ingress path so a known running process can receive
-facts from the consumer application. Both paths feed the same evolution engine.
+selected facts from the consumer application. High-frequency or reversible state
+should normally stay in application-owned state modules and be exposed through
+`@Condition` or action inputs.
+
+Normal Embabel planning should handle the main loop from current state. Evolving
+Mode should be reserved for side work or newly discovered objectives that need
+process-local lifecycle: track, retry, complete, consume, and resume.
 
 Incremental delivery can therefore be framed as:
 
 1. internal action-produced runtime facts: normal action outputs activate
    process-local runtime goals
-2. external triggers/events: facts published by the consumer application enter
-   the same process safely at planning seams
+2. selected external facts: facts published by the consumer application enter the
+   same process safely at planning seams
 3. observability support: each wake-up remains attached to the existing
    process/session, with clean turn boundaries and runtime-goal lifecycle events
 
@@ -107,24 +121,24 @@ Example evolution rules:
 
 ```java
 .onFact(StorageNeeded.class)
-    .handleWith(StorageCompleted.class)
+    .handleWithGoal(storageCompletedGoal)
     .resumable()
 
 .onFact(HazardDetected.class)
-    .handleWith(HazardHandled.class)
+    .handleWithGoal(hazardHandledGoal)
     .resumable()
 ```
 
-These rules are for committed occurrences that should finish and consume their
-source identity. Memoryless level state such as "buffer is full" should usually
+These rules are for occurrence facts that should finish and consume their
+rule-local activation. Memoryless level state such as "buffer is full" should usually
 be modeled with `@Condition`, ordinary action values, and standing `NIRVANA`
-utility work unless the consumer needs a committed runtime goal.
+utility work unless the consumer needs a remembered runtime goal.
 
 The resulting loop is:
 
 ```text
 external snapshot/event or action output
-  -> event-shaped runtime fact
+  -> runtime fact
   -> evolution policy
   -> process-local runtime goal
   -> existing GOAP / Utility / Hybrid planner
@@ -136,7 +150,7 @@ The same engine should support:
 - buffer full level -> storage actions become achievable or valuable through
   conditions and ordinary arbitration
 - committed storage-needed occurrence -> storage runtime goal if the reaction
-  should finish across ticks and consume source identity
+  should finish across ticks and consume its rule-local activation
 - storage complete -> collection resumes
 - hazard detected -> normal arbitration can select hazard response ahead of
   ordinary work when the handler goal is modeled accordingly
@@ -180,19 +194,20 @@ EvolvingInvocation.on(agentPlatform)
     ))
     .withEvolution(evolution -> evolution
         .onFact(StorageNeeded.class)
-            .handleWith(StorageCompleted.class)
+            .handleWithGoal(storageCompletedGoal)
             .resumable()
 
         .onFact(HazardDetected.class)
-            .handleWith(HazardHandled.class)
+            .handleWithGoal(hazardHandledGoal)
             .resumable()
     )
     .run(objective);
 ```
 
-`.handleWith(StorageCompleted.class)` compiles to a process-local agenda entry
-wrapping a canonical goal from the active scope. Ambiguous output-type matches
-should fail unless the rule names the declared goal explicitly.
+`.handleWithGoal(storageCompletedGoal)` compiles to a process-local agenda
+entry wrapping a canonical goal from the active scope. Earlier sketches used
+`.handleWith(StorageCompleted.class)` as output-type shorthand; that should be
+optional and should fail when the output type is ambiguous.
 
 An optional event-source adapter can sit above fact ingress for consumer applications
 that already have a domain event stream:
@@ -227,28 +242,25 @@ process.ingress.publish(HazardDetected(...))
 
 That POC spelling was backed by a local `BlackboardIngress` type. It is not an
 upstream Embabel API and should not be PR'd as-is. The useful contract is a
-sanctioned process-local fact ingress seam. `process.ingress()` is probably the
-most conservative upstream spelling because it names the seam without
-introducing a first-class `Facts` vocabulary. `process.facts()` is a good DX
-option if maintainers want a friendlier facade over blackboard object
-publication. Either way, it should be a wrapper over the same ingress seam
-rather than a separate state channel. The mapping is:
+sanctioned process-local fact ingress seam for selected external facts.
+`process.ingress()` is probably the most conservative upstream spelling because
+it names the seam without introducing a first-class `Facts` vocabulary.
+`process.facts()` is a good DX option if maintainers want a friendlier facade
+over blackboard object publication. Either way, it should be a wrapper over the
+same ingress seam rather than a separate state channel. The mapping is:
 
-- event publication maps to occurrence-style or append-mode ingress with
+- selected fact publication maps to occurrence-style or append-mode ingress with
   explicit duplicate behavior
-- `.onFact(E).handleWith(G)` compiles to an agenda entry wrapping a
+- `.onFact(E).handleWithGoal(G)` compiles to an agenda entry wrapping a
   canonical scoped goal for `G`
 - the local POC now includes a minimal `EvolutionPolicy` proving that visible
   process facts can activate process-local runtime goals without raw activation
   keys
-- external ingress may still use typed trigger/latch/source-identity semantics
-  underneath; the current `ActivationTrigger` API is a POC primitive for
-  external ingress
-- raw `activationKey`, manual `clearActivationKey(...)`, and TTL/latch details
-  should be hidden from the normal policy API
+- raw `activationKey`, manual `clearActivationKey(...)`, `ActivationTrigger`,
+  and TTL/latch details should be hidden from the normal policy API
 
-So the intended direction is not to discard `ActivationTrigger`. It is to make
-it the typed low-level primitive underneath an evolution-policy API.
+If `ActivationTrigger` survives, it should be internal, experimental, or a
+low-level test hook. It should not be the main user model.
 
 Do not bless direct blackboard mutation as the phase 2 happy path:
 
@@ -257,8 +269,8 @@ process.blackboard().add(new HazardDetected(...));
 ```
 
 Raw blackboard mutation is too shallow for external ingress. It does not carry
-process-seam timing, wake-up behavior, source identity, duplicate semantics, or
-observability.
+planning-tick timing, wake-up behavior, fact observation identity,
+duplicate semantics, or observability.
 
 Suggested semantics:
 
@@ -268,8 +280,8 @@ Suggested semantics:
 - facts become visible at the next planning tick
 - consumers should not manage activation keys or clear latches manually
 
-Event identity must be explicit enough for repeat behavior to be deterministic:
-use framework-generated occurrence identity, caller-supplied ids, or an explicit
+Fact identity must be explicit enough for repeat behavior to be deterministic:
+use framework-generated fact observation identity, caller-supplied ids, or an explicit
 "always fire" mode.
 
 ## Blackboard And Ingress Boundary
@@ -288,10 +300,11 @@ Planning conditions are separate booleans, normally supplied by `@Condition`.
 They are not ordinary blackboard objects and should not be reused as event
 activation latches.
 
-External async facts should enter through a sanctioned process-local ingress
-API. The local POC called this `BlackboardIngress`; upstream should treat the
-name and exact shape as open. Ingress queues publication safely and drains at
+Selected external async facts should enter through a sanctioned process-local
+ingress API. The local POC called this `BlackboardIngress`; upstream should treat
+the name and exact shape as open. Ingress queues publication safely and drains at
 planning ticks, where the facts become ordinary blackboard facts for planning.
+Ingress is not a replacement for application-owned state modules.
 
 ## Next Layer: Fact Derivation
 
@@ -473,20 +486,20 @@ Preferred:
 ```java
 .withEvolution(evolution -> evolution
     .onFact(StorageNeeded.class)
-        .handleWith(StorageCompleted.class)
+        .handleWithGoal(storageCompletedGoal)
         .resumable()
 )
 ```
 
-The core runtime goal carries the source identity that fired the rule for
-dedupe, consume-on-completion, and rearm. It does not need a payload-binding API
-in the first slice; handlers should re-sense current state or read normal
-objective/context facts.
+The core runtime goal is tied to the fact observation and rule-local
+activation that fired the rule for dedupe, consume-on-completion, and rearm. It
+does not need a payload-binding API in the first slice; handlers should re-sense
+current state or read normal objective/context facts.
 
 Avoid making normal capabilities return `GoalRequest` by default. That mixes
 business capability logic with orchestration.
 
-Handlers selected by `.onFact(...).handleWith(...)` must be goal producers in
+Handlers selected by `.onFact(...).handleWithGoal(...)` must be goal producers in
 the active scope, for example by producing the goal's satisfied-by type and, in
 annotation style, using `@AchievesGoal` where appropriate. Standing level
 reactions should usually remain plain value-selected actions under `NIRVANA`;
@@ -539,8 +552,8 @@ Recommended default:
 - when the source event retracts, stop planning new work toward the runtime goal
 - do not interrupt an active action by default
 - interrupt only when explicitly configured to cancel on retraction
-- for the internal-events-only phase, a successful `resumable()` runtime goal
-  consumes or retracts the source identity that created it for that rule
+- for the internal-facts-only phase, a successful `resumable()` runtime goal
+  consumes the rule-local activation that created it
 
 This cannot be left to consumer-side `none()` facts or manual clear calls.
 
@@ -664,7 +677,7 @@ These may still exist internally, but should not be the happy path:
 - consumer-authored edge detection
 - TTL as normal consumer-facing lifecycle
 - forcing consumers to choose level/occurrence trigger taxonomy before they can
-  express simple `.onFact(...).handleWith(...)` policies
+  express simple `.onFact(...).handleWithGoal(...)` policies
 - normal actions returning `GoalRequest` for common state transitions
 
 The public model should be facts and runtime goals, not latches.
@@ -731,7 +744,7 @@ EvolvingInvocation
   composes reusable capabilities
 
 Fact ingress
-  brings external state/events into the process
+  brings selected external facts into the process
 
 Optional fact derivations
   maintain current domain facts before planning as a next layer

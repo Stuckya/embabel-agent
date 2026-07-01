@@ -42,6 +42,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
+import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -198,6 +199,23 @@ abstract class AbstractAgentProcess(
         val receipt: IngressReceipt,
     )
 
+    private data class FactObservation(
+        val id: String,
+        val fact: Any,
+    )
+
+    private enum class RuleActivationStatus {
+        ACTIVE,
+        CONSUMED,
+    }
+
+    private data class RuleActivationRecord(
+        val id: String,
+        val ruleId: String,
+        val observationId: String,
+        val status: RuleActivationStatus,
+    )
+
     private val pendingIngressLock = Any()
 
     private val pendingIngress = mutableListOf<PendingBlackboardIngress>()
@@ -209,6 +227,14 @@ abstract class AbstractAgentProcess(
     private val activeActivationKeys = ConcurrentHashMap.newKeySet<String>()
 
     private val seenActivationOccurrences = ConcurrentHashMap.newKeySet<String>()
+
+    private val factObservations = IdentityHashMap<Any, FactObservation>()
+
+    private val ruleActivationRecords = mutableMapOf<String, RuleActivationRecord>()
+
+    private val ruleActivationRecordIdsByAgendaEntryId = mutableMapOf<String, String>()
+
+    private var nextFactObservationId = 0L
 
     override val ingress: BlackboardIngress = object : BlackboardIngress {
 
@@ -392,20 +418,53 @@ abstract class AbstractAgentProcess(
             blackboard.objects
                 .filter { rule.eventType.isInstance(it) }
                 .forEach {
-                    activateAgendaEntry(
-                        entry = rule.withGoal(goal).toAgendaEntry(it),
+                    val observation = observeFact(it)
+                    val activationRecordId = ruleActivationRecordId(rule, observation)
+                    if (ruleActivationRecords.containsKey(activationRecordId)) {
+                        return@forEach
+                    }
+                    val entry = rule.withGoal(goal).toAgendaEntry(
+                        sourceFact = it,
+                        activationId = observation.id,
+                    )
+                    val response = activateAgendaEntry(
+                        entry = entry,
                         sourceFact = it,
                         rememberActivation = false,
                     )
+                    if (response.approved) {
+                        ruleActivationRecords[activationRecordId] = RuleActivationRecord(
+                            id = activationRecordId,
+                            ruleId = rule.id,
+                            observationId = observation.id,
+                            status = RuleActivationStatus.ACTIVE,
+                        )
+                        ruleActivationRecordIdsByAgendaEntryId[entry.id] = activationRecordId
+                    }
                 }
         }
     }
 
+    private fun observeFact(fact: Any): FactObservation =
+        factObservations[fact] ?: FactObservation(
+            id = "fact-${++nextFactObservationId}",
+            fact = fact,
+        ).also { factObservations[fact] = it }
+
+    private fun ruleActivationRecordId(
+        rule: RuntimeGoalRule,
+        observation: FactObservation,
+    ): String = "${rule.id}:${observation.id}"
+
     private fun canonicalRuntimeGoal(rule: RuntimeGoalRule): Goal {
         rule.goal?.let { return it }
-        return agent.goals.filter { it.outputType?.name == rule.runtimeAction.name }.singleOrNull()
+        val runtimeAction = rule.runtimeAction
             ?: throw IllegalArgumentException(
-                "Evolution policy runtime action ${rule.runtimeAction.name} " +
+                "Evolution policy runtime rule ${rule.id} does not declare a goal or runtime action"
+            )
+        return agent.goals.filter { it.outputType?.name == runtimeAction.name }.singleOrNull()
+            ?: throw IllegalArgumentException(
+                "Evolution policy runtime action ${runtimeAction.name} " +
                         "is not uniquely satisfied by a goal in agent ${agent.name}"
             )
     }
@@ -481,10 +540,23 @@ abstract class AbstractAgentProcess(
             basePlanningSystem()
         } else {
             ConditionPlanningSystem(
-                actions = agent.actions.toSet(),
+                actions = actionsForAgendaEntries(entries),
                 goals = activeGoals,
             )
         }
+    }
+
+    private fun actionsForAgendaEntries(entries: List<AgendaEntry>): Set<Action> {
+        if (entries.any { it.goal != NIRVANA }) {
+            return agent.actions.toSet()
+        }
+        val completedOutputTypes = completedAgendaGoals.mapNotNull { it.outputType?.name }.toSet()
+        if (completedOutputTypes.isEmpty()) {
+            return agent.actions.toSet()
+        }
+        return agent.actions
+            .filterNot { action -> action.outputs.any { it.type in completedOutputTypes } }
+            .toSet()
     }
 
     private fun activeAgendaEntriesForPlanning(): List<AgendaEntry> {
@@ -493,7 +565,7 @@ abstract class AbstractAgentProcess(
             return entries
         }
         val worldState = worldStateDeterminer.determineWorldState()
-        // Prefer satisfied runtime-goal cleanup for one tick; utility work can resume after sources and outputs are hidden.
+        // Prefer satisfied runtime-goal cleanup for one tick; utility work can resume after outputs are hidden.
         return if (entries.any { it.goal != NIRVANA && AgendaPlanningGoal(it).isAchievable(worldState) }) {
             entries.filterNot { it.goal == NIRVANA }
         } else {
@@ -654,7 +726,10 @@ abstract class AbstractAgentProcess(
 
             AgendaCompletionMode.RESUMABLE -> {
                 consumeGoalOutputs(agendaEntry.goal)
-                agendaEntry.source?.let { blackboard.hide(it) }
+                val consumedRuleActivation = consumeRuleActivation(agendaEntry)
+                if (!consumedRuleActivation) {
+                    agendaEntry.source?.let { blackboard.hide(it) }
+                }
                 _goalAgenda = _goalAgenda.withoutEntry(agendaEntry.id)
                 completedAgendaGoals += agendaEntry.goal
                 _outcome = ProcessOutcome(
@@ -665,6 +740,13 @@ abstract class AbstractAgentProcess(
                 AgentProcessStatusCode.RUNNING
             }
         }
+    }
+
+    private fun consumeRuleActivation(agendaEntry: AgendaEntry): Boolean {
+        val activationRecordId = ruleActivationRecordIdsByAgendaEntryId.remove(agendaEntry.id) ?: return false
+        val record = ruleActivationRecords[activationRecordId] ?: return false
+        ruleActivationRecords[activationRecordId] = record.copy(status = RuleActivationStatus.CONSUMED)
+        return true
     }
 
     private fun consumeGoalOutputs(goal: Goal) {

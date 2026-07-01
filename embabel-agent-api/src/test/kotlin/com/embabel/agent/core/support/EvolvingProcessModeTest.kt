@@ -232,7 +232,6 @@ val ActivationConditionCollisionAgent = agent(
 val RuntimeFactEvolutionAgent = agent("RuntimeFactEvolutionAgent", description = "Tests runtime fact policy") {
     transformation<CollectionTick, AdditionalStorageNeeded>(
         name = "notice-storage-needed",
-        canRerun = true,
         value = { 1.0 },
     ) {
         AdditionalStorageNeeded(it.input.zone)
@@ -400,7 +399,7 @@ class EvolvingProcessModeTest {
     }
 
     @Test
-    fun `runtime fact policy activates resumable runtime goal and consumes handled source`() {
+    fun `runtime fact policy activates resumable runtime goal and consumes activation record`() {
         val blackboard = InMemoryBlackboard()
         blackboard += CollectionTick("zone-a")
         val storageGoal = RuntimeFactEvolutionAgent.goals.single { it.name == "storage-completed" }
@@ -418,10 +417,10 @@ class EvolvingProcessModeTest {
                                 completionMode = AgendaCompletionMode.TERMINAL,
                             )
                         ),
-                        policy = EvolutionPolicy.EMPTY.onEvent(
-                            eventType = AdditionalStorageNeeded::class.java,
-                            runtimeAction = StorageCompleted::class.java,
-                        ),
+                        policy = EvolutionPolicy.EMPTY
+                            .onFact(AdditionalStorageNeeded::class.java)
+                            .handleWithGoal(storageGoal)
+                            .resumable(),
                     )
                 ),
             blackboard = blackboard,
@@ -437,9 +436,12 @@ class EvolvingProcessModeTest {
         assertEquals(listOf(StorageCompleted("zone-a")), agentProcess.objects.filterIsInstance<StorageCompleted>())
 
         agentProcess.tick()
-        assertEquals(emptyList<AdditionalStorageNeeded>(), agentProcess.objects.filterIsInstance<AdditionalStorageNeeded>())
+        assertEquals(listOf(AdditionalStorageNeeded("zone-a")), agentProcess.objects.filterIsInstance<AdditionalStorageNeeded>())
         assertEquals(emptyList<StorageCompleted>(), agentProcess.objects.filterIsInstance<StorageCompleted>())
         assertEquals(listOf("collect-loop"), agentProcess.goalAgenda.entries.map { it.id })
+
+        agentProcess.tick()
+        assertEquals(1, agentProcess.history.count { it.actionName == "store-collected-items" })
 
         agentProcess.addObject(AdditionalStorageNeeded("zone-a"))
         agentProcess.tick()

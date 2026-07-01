@@ -204,10 +204,14 @@ data class EvolvingInvocation @JvmOverloads constructor(
                             "with goal ${it.name}, which is not in the active AgentScope"
                 )
         }
-        val matchingGoals = scope.goals.filter { it.outputType?.name == rule.runtimeAction.name }
+        val runtimeAction = rule.runtimeAction
+            ?: throw IllegalArgumentException(
+                "$source references runtime rule ${rule.id}, which does not declare a goal or runtime action"
+            )
+        val matchingGoals = scope.goals.filter { it.outputType?.name == runtimeAction.name }
         return matchingGoals.singleOrNull()
             ?: throw IllegalArgumentException(
-                "$source references runtime action ${rule.runtimeAction.name}, " +
+                "$source references runtime action ${runtimeAction.name}, " +
                         "which is not uniquely satisfied by a goal in the active AgentScope"
             )
     }

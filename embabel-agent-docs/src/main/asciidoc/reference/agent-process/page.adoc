@@ -142,7 +142,7 @@ See <<reference.tools__tool-call-context>> for how tools receive this context.
 ==== EvolutionOptions
 
 `ProcessOptions` can also carry `EvolutionOptions`, an experimental overlay for
-evolving a process agenda at process seams.
+evolving a process agenda at planning ticks.
 The agenda is projected into the effective planning system for the process; it
 does not mutate the agent's declared goals.
 The current POC evolves agenda entries over the `AgentScope` created for the
@@ -188,7 +188,7 @@ handled by the scoped goal that produces `StorageCompleted`.
 The target is canonicalized against the active scope before the process starts,
 so a caller cannot smuggle altered goal metadata through a lookalike runtime
 goal.
-When a matching fact is visible at a process seam, the policy proposes a
+When a matching fact is visible at a planning tick, the policy proposes a
 runtime agenda entry for the process.
 The normal planner then arbitrates that runtime goal against any other active
 work.
@@ -242,24 +242,31 @@ wake blocked processes, and hide drained
 facts after a TTL.
 Those knobs are intentionally treated as throwaway POC detail.
 For upstream design, the useful contract is a sanctioned process-local fact
-ingress seam, likely exposed as `process.ingress().publish(fact)` or possibly
-as a friendlier facts facade.
+ingress seam for selected external facts, likely exposed as
+`process.ingress().publish(fact)` or possibly as a friendlier facts facade.
 The blackboard remains process-local working memory for an `AgentProcess`, not
 a mutable world-state database, pub/sub bus, or agenda latch system.
 Action inputs are resolved from the blackboard, action outputs are appended to
 it automatically, and planning conditions are separate booleans normally
 provided by `@Condition`.
+Consumer applications still own high-frequency or reversible domain state such
+as sensor snapshots, tray contents, or inventory. Embabel should consume that
+state through action inputs and `@Condition`; ingress is not a replacement for
+application-owned state modules.
+Normal Embabel planning handles the main loop from current state. Evolving
+runtime goals are for side work or newly discovered objectives that need
+process-local lifecycle: track, retry, complete, consume, and resume.
 Blackboard objects are ordered and append-only; hiding an object removes it from
 future planning and API visibility without deleting process history.
 If a mutable level is modeled as a blackboard fact, the consumer owns that
 fact's lifecycle unless explicit ingress lifecycle options are configured. When
 the level is no longer true, hide or replace the visible fact, for example with
 `Blackboard.hide(...)`, `IngressMode.LATEST`, coalescing, TTL, or a configured
-level trigger. The framework automatically hides source facts for
-policy-created `onEvent` occurrences on `RESUMABLE` completion; it does not
-infer that an arbitrary level fact should retract just because a reaction ran.
+level trigger. Policy-created runtime goals consume an internal rule-local
+activation record on `RESUMABLE` completion; they do not infer that an arbitrary
+level fact should retract just because a reaction ran.
 Ingress publish is safe for external callers; blackboard writes happen when the
-process drains ingress at a process seam.
+process drains ingress at a planning tick.
 The ingress concept is distinct from `ReplanRequestedException`:
 `ReplanRequestedException` is initiated by an action or tool loop that is already
 running inside the process, while ingress is external async fact publication into
@@ -267,11 +274,11 @@ a running process.
 Ingress is not a replacement for replanning; it covers the opposite direction of
 state change.
 Do not bless direct blackboard mutation as the external-ingress happy path:
-`blackboard.addObject(...)` has no wake-up, source identity, duplicate
-semantics, process-seam timing, or observability contract.
-For external world state, prefer explicit ingress semantics over permanent
+`blackboard.addObject(...)` has no wake-up, fact observation identity,
+duplicate semantics, planning-tick timing, or observability contract.
+For selected external facts, prefer explicit ingress semantics over permanent
 append-only boolean facts, then let the same `EvolutionPolicy` runtime-goal
-engine handle selected facts.
+engine handle selected work-item facts.
 Activation keys are not written as blackboard planning conditions.
 
 Agenda completion is controlled by `AgendaCompletionMode`.
@@ -280,10 +287,11 @@ Agenda completion is controlled by `AgendaCompletionMode`.
 satisfied. If the underlying goal is satisfied before the predicate is true, the
 process waits instead of repeatedly replanning the same already-satisfied goal.
 `RESUMABLE` removes the satisfied entry, consumes visible blackboard outputs
-that satisfy the entry goal, hides the source fact for policy-created entries,
-and lets the process re-arbitrate. This prevents a later reactivation from
-being instantly satisfied by stale output from the previous activation and
-prevents the same source fact from repeatedly firing the same runtime goal.
+that satisfy the entry goal, consumes policy-created rule activation records,
+and lets the process re-arbitrate. Catalog-created entries still hide their
+explicit source fact. This prevents a later reactivation from being instantly
+satisfied by stale output from the previous activation and prevents the same
+fact observation from repeatedly firing the same runtime goal.
 `KEEP_ALIVE` and `RECURRING` are intentionally not part of this POC surface.
 `AgendaCompletionPredicate` overlaps with Embabel's existing `Condition`
 composition model.
@@ -343,7 +351,10 @@ ObjectiveAuthor objectiveAuthor = request -> {
         List.of(),
         List.of(new JavaSampleAvailable(collectSamplesUntil.zone())),
         completeWhenStored,
-        EvolutionPolicy.EMPTY.onEvent(JavaSampleAvailable.class, JavaSampleStored.class)
+        EvolutionPolicy.EMPTY
+            .onFact(JavaSampleAvailable.class)
+            .handleWith(JavaSampleStored.class)
+            .resumable()
     );
 };
 ----

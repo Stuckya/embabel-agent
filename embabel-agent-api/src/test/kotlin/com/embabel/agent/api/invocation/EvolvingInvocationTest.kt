@@ -151,10 +151,10 @@ class EvolvingInvocationTest {
             val collectSamplesUntil = request.objectiveAs<CollectSamplesUntil>()
             ObjectivePlan(
                 id = "policy-collect-zone-a",
-                evolutionPolicy = EvolutionPolicy.EMPTY.onEvent(
-                    eventType = SampleAvailable::class.java,
-                    runtimeAction = SampleStored::class.java,
-                ),
+                evolutionPolicy = EvolutionPolicy.EMPTY
+                    .onFact(SampleAvailable::class.java)
+                    .handleWith(SampleStored::class.java)
+                    .resumable(),
                 initialFacts = listOf(SampleAvailable(collectSamplesUntil.zone)),
                 completionPolicy = CompletionPolicy { process, _ ->
                     if (process.objects.any { it is SampleStored }) {
@@ -394,10 +394,10 @@ class EvolvingInvocationTest {
     fun `direct evolution policy is rejected when runtime action is outside active scope`() {
         val agentPlatform = dummyAgentPlatform()
         val evolution = EvolutionOptions(
-            policy = EvolutionPolicy.EMPTY.onEvent(
-                eventType = SampleAvailable::class.java,
-                runtimeAction = OutOfScopeResult::class.java,
-            ),
+            policy = EvolutionPolicy.EMPTY
+                .onFact(SampleAvailable::class.java)
+                .handleWith(OutOfScopeResult::class.java)
+                .resumable(),
         )
 
         val thrown = assertThrows(IllegalArgumentException::class.java) {
@@ -415,10 +415,10 @@ class EvolvingInvocationTest {
     fun `direct evolution policy allows high value runtime action without framework priority convention`() {
         val agentPlatform = dummyAgentPlatform()
         val evolution = EvolutionOptions(
-            policy = EvolutionPolicy.EMPTY.onEvent(
-                eventType = SampleAvailable::class.java,
-                runtimeAction = PrioritySampleStored::class.java,
-            ),
+            policy = EvolutionPolicy.EMPTY
+                .onFact(SampleAvailable::class.java)
+                .handleWith(PrioritySampleStored::class.java)
+                .resumable(),
         )
 
         val process = EvolvingInvocation.on(agentPlatform)

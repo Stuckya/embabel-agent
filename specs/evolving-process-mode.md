@@ -43,16 +43,16 @@ scope.
 
 ## Problem Statement
 
-Embabel can compose a plan at process start, but event-driven domains need a
-running process to adapt its goals as external events and facts change without
-turning the runtime loop over to an LLM or forcing each agent to manually
-orchestrate other agents.
+Embabel can compose a plan at process start, but long-lived domains need a
+running process to remember and complete selected follow-up work as facts appear
+without turning the runtime loop over to an LLM or forcing each agent to
+manually orchestrate other agents.
 
 For example, a consumer objective like "Collect samples in Zone A until 500
 samples are stored" must react while running:
 
-- workspace becomes full -> storage actions become achievable or valuable
-  through conditions
+- workspace becomes full -> application state changes and storage actions become
+  achievable or valuable through conditions
 - session reaches storage -> deposit samples
 - workspace becomes empty -> return to the collection zone
 - nearby item appears -> collect it
@@ -73,7 +73,7 @@ Without a runtime seam, reusable agents are forced into awkward shapes:
 The missing seam is:
 
 ```text
-event/fact -> approved runtime objective -> planner-visible goal -> deterministic action
+selected fact -> approved runtime objective -> planner-visible goal -> deterministic action
 ```
 
 Evolving Process Mode provides that seam so purpose-built capabilities such as
@@ -246,9 +246,16 @@ model as the execution substrate.
 
 A consumer should be able to express a long-running objective such as "Collect
 samples in Zone A until 500 samples are stored" over scoped navigation,
-collection, storage, and hazard-response capabilities. Runtime facts about
-workspace state, location, hazards, nearby items, and progress enter through
-ingress; approved runtime objectives become planner-visible agenda goals.
+collection, storage, and hazard-response capabilities. Current state such as
+workspace contents, location, hazards, nearby items, and progress remains owned
+by the consumer application and is exposed through action inputs and
+`@Condition`. Selected facts that represent process-local work items can enter
+through ingress; approved runtime objectives become planner-visible agenda goals.
+
+Normal Embabel planning handles the main loop from current state. Evolving Mode
+is for side work or newly discovered objectives that should be tracked until
+handled, such as a calibration request, a scheduled maintenance task, or a hazard
+incident that should complete as `HazardHandled`.
 
 The important target is composition without manual orchestration:
 the collection capability should not need to directly call storage or
@@ -267,7 +274,7 @@ Runtime Contract still applies: proposals are typed, validated, approved, and
 then executed through normal planner action selection.
 
 This preserves the useful part of Open mode without making nondeterministic,
-expensive LLM orchestration the response to every external state change.
+expensive LLM orchestration the response to every state update or work item.
 
 ## Implemented POC Surface
 
@@ -335,17 +342,17 @@ appended, and planning conditions are separate booleans normally supplied by
 Blackboard objects are ordered and append-only. The latest visible object of a
 type is the default match; named binding is available when type alone is
 ambiguous. Hiding removes an object from future planning and API visibility
-without deleting process history. External async facts should therefore enter
-through a sanctioned process-local ingress seam and drain at planning ticks rather
-than mutating the blackboard directly from consumer application threads.
+without deleting process history. Selected external async facts should therefore
+enter through a sanctioned process-local ingress seam and drain at planning ticks
+rather than mutating the blackboard directly from consumer application threads.
 
 If a mutable level is modeled as a blackboard fact, the consumer owns that
 fact's lifecycle unless explicit ingress lifecycle options are configured. When
 the level is no longer true, hide or replace the visible fact, for example with
 `Blackboard.hide(...)`, `IngressMode.LATEST`, coalescing, TTL, or a configured
-level trigger. The framework automatically hides source facts for
-policy-created `onFact` occurrences on `RESUMABLE` completion; it does not
-infer that an arbitrary level fact should retract just because a reaction ran.
+level trigger. Policy-created runtime goals consume their internal rule-local
+activation on `RESUMABLE` completion; they do not infer that an arbitrary level
+fact should retract just because a reaction ran.
 
 `IngressOptions` describes one publish operation:
 
@@ -357,9 +364,10 @@ infer that an arbitrary level fact should retract just because a reaction ran.
 
 `ActivationTrigger` is a local POC primitive for low-level ingress-to-agenda
 latches. It is not the desired upstream happy path. A future
-`.onFact(...).handleWith(...)` style policy API should sit above any typed
+`.onFact(...).handleWithGoal(...)` style policy API should sit above any typed
 trigger/latch mechanics, so consumers publish domain facts and the framework
-owns dedupe, source identity, and rearm behavior.
+owns fact observation identity, rule-local activation, and rearm
+behavior.
 `ActivationTrigger.level(K, Fact.class)` can be used with
 `BlackboardIngress.update(trigger, active, supplier)` for explicit low-level
 tests: `false -> true` publishes a fact and activates matching entries,
@@ -388,13 +396,15 @@ separate Evolving-ingress wake mode in the simplified POC.
 
 `BlackboardIngress` is distinct from `ReplanRequestedException`.
 `ReplanRequestedException` is initiated by an action or tool loop that is already
-running inside the process. Ingress is external async fact publication into a
-running process. It is not reinventing replanning; it covers the opposite
+running inside the process. Ingress is selected external async fact publication
+into a running process. It is not reinventing replanning; it covers the opposite
 direction of state change.
 
 Consumer dogfooding found that append-only blackboard facts are a poor fit for
 mutable world-state booleans unless hiding, coalescing, or TTL semantics are
-explicit. Prefer one of these patterns:
+explicit. Prefer application-owned state modules plus `@Condition` or action
+inputs for high-frequency or reversible current state. Use the POC ingress
+lifecycle options only when the fact should become process-visible:
 
 - use `EvolutionPolicy` for facts that should activate process-local runtime
   goals
@@ -596,10 +606,10 @@ Agenda goals use their entry's `AgendaCompletionMode`:
 - `TERMINAL` sets a completed outcome and completes the process.
 - `RESUMABLE` removes the selected agenda entry, records the underlying goal as
   completed for base-goal suppression, consumes visible blackboard outputs that
-  satisfy the entry goal, hides the source fact for policy-created entries, sets
+  satisfy the entry goal, consumes policy-created rule activation records, sets
   a continue outcome, and re-runs arbitration. This prevents a reactivated entry
   from being immediately satisfied by stale output from its previous activation
-  and prevents one handled source fact from repeatedly firing the same rule.
+  and prevents the same fact observation from repeatedly firing the same rule.
 - `COMPOSITE_TERMINAL` completes only when `completionPredicate` returns true.
   If the wrapped child goal is achieved before the composite predicate is true,
   the process moves to `WAITING`.
@@ -670,13 +680,15 @@ with upstream-friendly APIs.
 
 Keep as conceptual runtime substrate:
 
-- sanctioned process-local fact ingress: the right seam for external facts
-  entering a running process. The local POC name is `BlackboardIngress`, but
+- sanctioned process-local fact ingress: the right seam for selected external
+  facts entering a running process. The local POC name is `BlackboardIngress`, but
   upstream should treat naming and shape as open. Likely public spellings are
   `process.ingress().publish(...)` as the conservative seam-oriented option or
   `process.facts().publish(...)` as a friendlier facade if Embabel wants to
   introduce first-class `Facts` vocabulary. Do not bless direct
-  `blackboard.add(...)` as the happy path for external ingress.
+  `blackboard.add(...)` as the happy path for external ingress. Ingress should
+  not replace application-owned state modules for high-frequency or reversible
+  current state.
 - `ProcessCancellationToken`: needed for cooperative blocking actions
 - `GoalAgenda` and `AgendaEntry`: the runtime mechanism underneath
   `EvolvingInvocation`
@@ -697,10 +709,10 @@ mutation.
 
 Revisit after more consumer dogfood and framework-level acceptance coverage:
 
-- `ActivationTrigger` and `activationKey`: these are useful low-level POC
-  primitives, but objective handlers, `ObjectiveAuthor`, and `EvolutionPolicy`
-  should own higher-level fact-to-runtime-goal mapping. A future upstream API
-  should hide trigger/latch taxonomy from normal consumers.
+- `ActivationTrigger` and `activationKey`: these are low-level POC primitives.
+  Objective handlers, `ObjectiveAuthor`, and `EvolutionPolicy` should own
+  higher-level fact-to-runtime-goal mapping. A future upstream API should hide
+  trigger/latch taxonomy from normal consumers.
 - `AgendaEntryApprover`: duplicates `GoalChoiceApprover`'s approval protocol
   shape, although its request payload is agenda-specific. Prefer a shared
   approval response/protocol abstraction over directly reusing

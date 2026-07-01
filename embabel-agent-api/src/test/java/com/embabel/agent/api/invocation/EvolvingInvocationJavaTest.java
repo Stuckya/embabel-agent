@@ -102,7 +102,10 @@ class EvolvingInvocationJavaTest {
                 List.of(),
                 List.of(new JavaSampleAvailable(collectSamplesUntil.zone())),
                 completeWhenStored,
-                EvolutionPolicy.EMPTY.onEvent(JavaSampleAvailable.class, JavaSampleStored.class)
+                EvolutionPolicy.EMPTY
+                    .onFact(JavaSampleAvailable.class)
+                    .handleWith(JavaSampleStored.class)
+                    .resumable()
             );
         };
 
