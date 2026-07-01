@@ -1,5 +1,14 @@
 # Evolving Process Mode
 
+> **Status (2026-07-01):** superseded as proposal text by
+> `evolving-mode-github-issue-draft.md`, which is canonical. Known deltas in the
+> issue: cooperative interruption is a proposed rule semantic
+> (`interruptCurrentAction()`, Sub-Issue 4), not an availability concern;
+> activation keys, `clearActivationKey`, and triggers are internal substrate —
+> fact-observation identity with rule-local activations is the public contract;
+> addressable processes use `createProcess(...)` + `start(...)`, not `run(...)`;
+> the epic carries six work streams. This file remains the design record.
+
 ## Overview
 
 Embabel already supports invocation-time agent and goal selection through Autonomy

@@ -33,10 +33,12 @@ This is a short reply to the latest discussion question before opening the issue
 >   -> declared action
 > ```
 >
-> I see the incremental path as:
+> I see the first increments as:
 >
 > 1. internally produced facts drive runtime goals
 > 2. selected externally published facts drive the same runtime-goal engine
 > 3. observability keeps each wake-up attached to the existing process/session
+>
+> Cooperative interruption of a running action, open re-authoring, and process-local scope expansion follow once the core engine is proven; the issue will carry a sub-issue per stream.
 >
 > Pub/sub fan-out is not required for my current use case. I only need to publish selected facts to one known running process.

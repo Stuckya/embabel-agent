@@ -1,5 +1,11 @@
 # Evolving Mode Event-Driven Handoff
 
+> **Status (2026-07-01):** this handoff served its purpose;
+> `evolving-mode-github-issue-draft.md` is canonical. Notable deltas in the
+> issue: interruption is a proposed rule semantic (`interruptCurrentAction()`,
+> Sub-Issue 4) rather than "a later extension"; six work streams; goal targets
+> spelled `GoalTarget.output(...)` / `GoalTarget.named(...)`.
+
 Draft handoff for the `codex/evolving-mode` work. This document records the
 desired public shape after local dogfooding, while keeping the example domain
 generic.
