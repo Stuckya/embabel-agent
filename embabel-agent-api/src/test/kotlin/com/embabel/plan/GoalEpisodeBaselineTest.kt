@@ -22,8 +22,13 @@ import com.embabel.agent.api.annotation.Condition
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
+import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.ProcessOptions
+import com.embabel.agent.core.hitl.AbstractAwaitable
+import com.embabel.agent.core.hitl.AwaitableResponse
+import com.embabel.agent.core.hitl.ResponseImpact
+import com.embabel.agent.core.hitl.waitFor
 import com.embabel.agent.core.last
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
@@ -32,6 +37,7 @@ import com.embabel.agent.spi.support.DefaultPlannerFactory
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServices
 import org.junit.jupiter.api.Test
 import java.time.Instant
+import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 
@@ -40,6 +46,27 @@ data class MissionReport(val samples: Int)
 data class CalibrationRequested(val id: String)
 data class CalibrationCompleted(val id: String)
 data class CalibrationArchived(val id: String)
+
+data class CalibrationRequestResponse(
+    override val id: String = UUID.randomUUID().toString(),
+    override val awaitableId: String,
+    val calId: String,
+    override val timestamp: Instant = Instant.now(),
+) : AwaitableResponse {
+    override fun persistent(): Boolean = false
+}
+
+class CalibrationRequestAwaitable : AbstractAwaitable<CalibrationRequested, CalibrationRequestResponse>(
+    CalibrationRequested("placeholder")
+) {
+    override fun onResponse(
+        response: CalibrationRequestResponse,
+        agentProcess: AgentProcess,
+    ): ResponseImpact {
+        agentProcess.addObject(CalibrationRequested(response.calId))
+        return ResponseImpact.UPDATED
+    }
+}
 
 /**
  * Explores baseline goal-episode behavior on main, discussed in issue #1756,
@@ -60,6 +87,9 @@ data class CalibrationArchived(val id: String)
  *    episode. Correctness rides on value tuning and two hide calls in the right places.
  * 8. GOAP: a STUCK process resumes via addObject + run() — the manual wake loop works
  *    today; what's missing is the platform owning it.
+ * 9. GOAP: an awaiting action (waitFor promising the occurrence type) parks the process
+ *    WAITING instead of STUCK, and onResponse + run() resumes it into the goal —
+ *    solicited waiting exists today; the resume is still driver-owned.
  */
 class GoalEpisodeBaselineTest {
 
@@ -354,5 +384,41 @@ class GoalEpisodeBaselineTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, resumed.status)
         assertEquals("cal-late", resumed.last<CalibrationCompleted>()?.id, "Manual wake: addObject + run() works today")
+    }
+
+    @Agent(description = "Pure GOAP that awaits a calibration request via waitFor")
+    inner class GoapAwaitingAgent {
+
+        // The promise pattern: declares it produces the request so A* routes
+        // through it, but execution parks WAITING instead of manufacturing
+        @Action
+        fun awaitCalibrationRequest(tally: SampleTally, context: ActionContext): CalibrationRequested =
+            waitFor(CalibrationRequestAwaitable())
+
+        @Action(value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested): CalibrationCompleted =
+            CalibrationCompleted(request.id)
+    }
+
+    @Test
+    fun `pure GOAP with an awaiting action parks WAITING instead of STUCK and resumes on response`() {
+        val waiting = run(GoapAwaitingAgent(), "goap-awaitable", PlannerType.GOAP)
+
+        // Contrast with the STUCK test: same fact-gated goal, but an awaiting
+        // action on the path turns "no plan" into solicited waiting
+        assertEquals(AgentProcessStatusCode.WAITING, waiting.status)
+
+        // Resume as the WaitForMvcIntegrationTest controller does: onResponse then run()
+        val awaitable = waiting.last<CalibrationRequestAwaitable>()
+        assertNotNull(awaitable, "Awaitable should be stored on the blackboard")
+        awaitable.onResponse(
+            CalibrationRequestResponse(awaitableId = awaitable.id, calId = "cal-async"),
+            waiting,
+        )
+        val resumed = waiting.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, resumed.status)
+        assertEquals("cal-async", resumed.last<CalibrationCompleted>()?.id)
     }
 }
