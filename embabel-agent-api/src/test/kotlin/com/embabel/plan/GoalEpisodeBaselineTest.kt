@@ -39,6 +39,7 @@ data class SampleTally(val count: Int)
 data class MissionReport(val samples: Int)
 data class CalibrationRequested(val id: String)
 data class CalibrationCompleted(val id: String)
+data class CalibrationArchived(val id: String)
 
 /**
  * Explores baseline goal-episode behavior on main, discussed in issue #1756,
@@ -54,6 +55,11 @@ data class CalibrationCompleted(val id: String)
  * 6. GOAP: with the request as a declared action output, A* manufactures the occurrence
  *    on demand and completes — the contrast that shows why occurrence facts are added
  *    off the type chain in the other tests.
+ * 7. HYBRID: consume/rearm can be hand-rolled today — the action hides its trigger, a
+ *    janitor action hides the satisfying output, and a second occurrence runs the
+ *    episode. Correctness rides on value tuning and two hide calls in the right places.
+ * 8. GOAP: a STUCK process resumes via addObject + run() — the manual wake loop works
+ *    today; what's missing is the platform owning it.
  */
 class GoalEpisodeBaselineTest {
 
@@ -286,5 +292,67 @@ class GoalEpisodeBaselineTest {
         // even with canRerun = true on the calibrate action
         assertEquals("cal-2", result.last<CalibrationRequested>()?.id, "Second request is on the BB")
         assertEquals("cal-1", result.last<CalibrationCompleted>()?.id, "But only the first was ever handled")
+    }
+
+    @Agent(description = "HYBRID with hand-rolled consume/rearm via hide and a janitor action")
+    inner class HandRolledLifecycleAgent {
+
+        @Action(canRerun = true, value = 0.2)
+        fun collect(tally: SampleTally, context: ActionContext): SampleTally {
+            val next = SampleTally(tally.count + 1)
+            if (next.count == 2) {
+                context.addObject(CalibrationRequested("cal-1"))
+            }
+            if (next.count == 4) {
+                context.addObject(CalibrationRequested("cal-2"))
+            }
+            return next
+        }
+
+        @Condition(name = "enoughSamples")
+        fun enoughSamples(tally: SampleTally): Boolean = tally.count >= 5
+
+        @Action(pre = ["enoughSamples"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun missionComplete(tally: SampleTally): MissionReport = MissionReport(tally.count)
+
+        // Consume half 1: the action hides its own triggering input
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            context.hide(request)
+            return CalibrationCompleted(request.id)
+        }
+
+        // Consume half 2: a janitor action hides the satisfying output after the
+        // goal is achieved. Its value must win the tick or the stale output
+        // satisfies the next occurrence without work.
+        @Action(canRerun = true, value = 1.2)
+        fun archiveCalibration(done: CalibrationCompleted, context: ActionContext): CalibrationArchived {
+            context.hide(done)
+            return CalibrationArchived(done.id)
+        }
+    }
+
+    @Test
+    fun `hand-rolled consume and rearm under HYBRID - a second occurrence is handled when facts are hidden`() {
+        val result = run(HandRolledLifecycleAgent(), "hybrid-hand-rolled-lifecycle", PlannerType.HYBRID)
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(5, result.last<SampleTally>()?.count, "Mission ran to its terminal goal")
+        val archived = result.objects.filterIsInstance<CalibrationArchived>().map { it.id }
+        assertEquals(listOf("cal-1", "cal-2"), archived, "Both occurrences ran the episode")
+    }
+
+    @Test
+    fun `a STUCK process resumes when a fact arrives and run is called again`() {
+        val stuck = run(GoapEventOnlyAgent(), "goap-stuck-resume", PlannerType.GOAP)
+        assertEquals(AgentProcessStatusCode.STUCK, stuck.status)
+
+        stuck.addObject(CalibrationRequested("cal-late"))
+        val resumed = stuck.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, resumed.status)
+        assertEquals("cal-late", resumed.last<CalibrationCompleted>()?.id, "Manual wake: addObject + run() works today")
     }
 }
