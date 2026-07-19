@@ -17,7 +17,7 @@ Evolving Mode
 
 Embabel Agent already replans as actions add typed objects to the blackboard, and existing goals can become achievable during a running process. What's missing is an explicit goal lifecycle for work that should complete without ending the process and become eligible again for a later occurrence.
 
-I've been using two terms:
+I've coined 2 terms:
 
 - **Deterministic Evolving**: a runtime fact drives a known declared goal episode to completion without ending the process, and a later fact can run it again. The connection is typed and known ahead of time.
 - **Open Evolving**: not every fact-to-goal connection can be wired ahead of time. An `ObjectiveAuthor` can propose a validated policy revision when the predefined policy cannot handle what the process discovers.
@@ -63,7 +63,7 @@ As discussed in #1725, I've split this into work streams. They do not have to be
 4. Cooperative interruption of the running action
 5. Open Evolving: `ObjectiveAuthor` re-authoring at a planning tick
 6. Process-local scope expansion
-7. Recurring goal episodes: native standing work under pure GOAP
+7. Recurring goal episodes for native pure-GOAP standing work; event-driven waiting remains separate infrastructure shared with ingress
 8. Example application
 
 ### Motivating Example
@@ -270,11 +270,10 @@ Maintainer input would be helpful on these decisions.
 - **Declared capability** - immutable `@Agent` and `@EmbabelComponent` actions, conditions, and goals.
 - **Consumer application** - the application using Embabel, configuring invocation, providing scoped capabilities, owning domain state modules, and publishing selected external facts.
 - **Request fact** - typed domain object on the blackboard that represents one occurrence of follow-up work. Not a new public `Fact` API.
-- **Goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request/output lifecycle is consumed.
+- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request/output lifecycle is consumed. Work stream 7 explores recurring episodes for pure-GOAP standing work.
 - **Runtime goal** - reserved here for a process-local objective proposed later by Open Evolving or scope expansion. Deterministic phase 1 reuses declared goals rather than adding a second goal set.
 - **Deterministic Evolving** - predeclared episode lifecycle for known request types and known declared goals.
 - **Open Evolving** - an `ObjectiveAuthor` authors or revises the objective policy when predefined episode policy and scope cannot handle the situation. It proposes goal references as typed data, never executable code. Proposed goals use the same scope validation and may opt into the same nonterminal lifecycle.
-- **Episode** - one bounded plan-execute-complete cycle toward a declared goal selected for nonterminal lifecycle. Work stream 7 explores recurring episodes for pure GOAP standing work.
 - **Planning tick** - the boundary where the process plans: after an action completes, when a wake re-drives a parked process, or when the consumer's driver ticks. Ingress drains, newly visible requests may make declared goals plannable, and `@Condition` state is re-read. A tick replans from current state; the first implementation has no plan cache.
 - **Fact occurrence** - the exact request object added to the blackboard. Phase 1 consumes that occurrence through existing identity-based `Blackboard.hide` behavior.
 - **Application-owned state module** - consumer-owned state such as sensor snapshots, tray contents, inventory, or connection/session state. Embabel should consume this through action inputs, `@Condition`, scoped capabilities, and selected occurrence facts, not own the whole state model.
@@ -526,7 +525,7 @@ Ingress is the outside-the-stack path. An external publisher cannot throw into a
 
 Emit one process event for every publication attempt, following the existing `ReplanRequestedEvent` precedent. A proposed `FactIngressPublicationEvent` should include the process id, publication id, fact type, accepted or rejected result, reason where applicable, and timestamp. Draining an accepted fact should still emit the existing `ObjectAddedEvent`.
 
-Phase 3 can add turn and episode tracing. Phase 2 only needs enough information to explain whether a publication was accepted, rejected, queued, drained, and used to wake the process.
+Phase 3 can add wake/run-cycle and episode tracing. Phase 2 only needs enough information to explain whether a publication was accepted, rejected, queued, drained, and used to wake the process.
 
 ### Spring Integration Follow-Up
 
@@ -579,13 +578,15 @@ Evolving Mode phase 3: observability for ingress wake-ups and goal episodes
 
 Extend phase 2's publication event with observability for long-lived evolving processes that enter `WAITING` and wake again.
 
-The observability model should reuse Embabel's existing session and turn machinery (and its idle/active duration metrics). An ingress wake-up should be a new unit of work on the existing process/session, not a fresh disconnected process.
+The observability model should build on Embabel's existing process identity, `AgentProcessEvent` and `AgentProcessWaitingEvent`, `AgentObservationContext`, and observability metrics. The metrics already distinguish wall-clock process duration, which includes waiting, from active duration calculated from action history.
+
+Embabel does not currently expose a public session/turn abstraction for repeated wake cycles. This work should establish a wake/run-cycle convention while keeping every cycle under the same process id.
 
 Requirements:
 
-- a wake-up continues the existing process and reuses its stable session id
-- each wake-up has a clean turn boundary
-- turn boundaries close cleanly on success, error, no-op wake-up, cancellation, or exhaustion
+- a wake-up continues the existing process and reuses its stable process id
+- each wake-up and resulting run can be correlated as one wake/run cycle
+- wake/run cycles close cleanly on success, error, no-op wake-up, cancellation, or exhaustion
 - ingress facts record source/correlation metadata where available
 - episodes have lifecycle events
 
@@ -594,7 +595,7 @@ Suggested event shape:
 ```text
 GoalEpisodeLifecycleEvent =
   process id
-  turn id
+  wake/run cycle id, if adopted
   episode target
   request type/id where available
   candidate declared goal names/output type
@@ -616,10 +617,10 @@ Useful lifecycle transitions:
 
 Acceptance criteria:
 
-- a process woken by ingress appears under the existing process/session
-- the wake-up is represented as a distinct turn/unit of work
+- a process woken by ingress keeps the same process id
+- the publication, wake-up, and resulting run are observable as one correlated cycle
 - episode lifecycle events are observable
-- per-turn runtime state is cleaned up at turn end, not only at process termination
+- per-cycle runtime state is cleaned up when the wake/run cycle ends, not only at process termination
 - plain 1-to-1 ingress does not require a pub/sub tracing model
 
 Out of scope:
@@ -788,13 +789,13 @@ Utility/Hybrid covers continuous standing work today through value-selected acti
 
 Mechanism:
 
-- `.rearmOnCompletion()` marks a declared goal as recurring rather than request-driven. The spelling is illustrative.
+- `.recurring(target)` marks a declared goal as recurring and implies rearm on completion. The spelling is illustrative.
 - On completion, the satisfying output is hidden before the next episode so the goal is not already satisfied.
 - A declared terminal goal or optional completion policy decides when recurrence stops.
 - Consuming the satisfying outputs keeps the next episode from being pre-satisfied by the previous episode's output.
 - A blocked recurring episode follows existing plan-not-found behavior unless the separate ingress/wake work defines a parked state.
 - Interrupted episodes replan. No suspended plan stack is restored.
-- Request-driven phase-1 episodes compose at planning boundaries; after one completes, the recurring goal can be planned again from current state.
+- Request-driven phase-1 episodes compose at planning ticks; after one completes, the recurring goal can be planned again from current state.
 
 Two blackboard consequences follow. A satisfying output hidden after each episode cannot double as the persistent cumulative-progress record; keep cumulative progress in consumer-owned state or a distinct blackboard type. Intermediate outputs still follow existing blackboard and action-repeatability semantics.
 
@@ -805,7 +806,6 @@ Suggested API shape:
 ```java
 ProcessOptions.DEFAULT.withEpisodes(EpisodePolicy
     .recurring(GoalTarget.output(SampleBatchStored.class))
-        .rearmOnCompletion()
     .episode(GoalTarget.output(SensorCalibrationCompleted.class))
         .consumeOnCompletion(SensorCalibrationRequested.class))
 ```
