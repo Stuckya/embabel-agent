@@ -51,6 +51,9 @@ data class CalibrationCompleted(val id: String)
  * 4. GOAP: with a declared standing path, a mid-run side episode AND the mission can both
  *    complete — the process ends only when the best-value plan is empty (value arithmetic).
  * 5. GOAP: a goal never rearms — a second occurrence of the same fact type is ignored.
+ * 6. GOAP: with the request as a declared action output, A* manufactures the occurrence
+ *    on demand and completes — the contrast that shows why occurrence facts are added
+ *    off the type chain in the other tests.
  */
 class GoalEpisodeBaselineTest {
 
@@ -244,6 +247,32 @@ class GoalEpisodeBaselineTest {
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested): CalibrationCompleted =
             CalibrationCompleted(request.id)
+    }
+
+    @Agent(description = "Pure GOAP where the calibration request is on the type chain")
+    inner class GoapOnChainAgent {
+
+        // The request is a declared action output: A* can now plan through it
+        @Action(value = 0.2)
+        fun raiseCalibrationRequest(tally: SampleTally): CalibrationRequested =
+            CalibrationRequested("cal-chained")
+
+        @Action(value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested): CalibrationCompleted =
+            CalibrationCompleted(request.id)
+    }
+
+    @Test
+    fun `pure GOAP with the request on the type chain - the planner manufactures the occurrence on demand`() {
+        val result = run(GoapOnChainAgent(), "goap-on-chain", PlannerType.GOAP)
+
+        // Contrast with the STUCK test: same goal, but because the request is a
+        // declared output, A* treats it as producible on demand and routes through
+        // it. This is why occurrence facts are added off-chain in the other tests:
+        // an observation is not something the planner should be able to manufacture.
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals("cal-chained", result.last<CalibrationCompleted>()?.id)
     }
 
     @Test
