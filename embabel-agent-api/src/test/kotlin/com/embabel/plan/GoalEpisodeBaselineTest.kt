@@ -46,6 +46,8 @@ data class MissionReport(val samples: Int)
 data class CalibrationRequested(val id: String)
 data class CalibrationCompleted(val id: String)
 data class CalibrationArchived(val id: String)
+data class CalibrationKit(val id: String)
+data class ExecutedStep(val name: String)
 
 data class CalibrationRequestResponse(
     override val id: String = UUID.randomUUID().toString(),
@@ -90,6 +92,8 @@ class CalibrationRequestAwaitable : AbstractAwaitable<CalibrationRequested, Cali
  * 9. GOAP: an awaiting action (waitFor promising the occurrence type) parks the process
  *    WAITING instead of STUCK, and onResponse + run() resumes it into the goal —
  *    solicited waiting exists today; the resume is still driver-owned.
+ * 10. GOAP: a two-step episode is not an atomic block — per-tick replanning lets
+ *     standing work interleave between the episode's steps when values favor it.
  */
 class GoalEpisodeBaselineTest {
 
@@ -384,6 +388,60 @@ class GoalEpisodeBaselineTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, resumed.status)
         assertEquals("cal-late", resumed.last<CalibrationCompleted>()?.id, "Manual wake: addObject + run() works today")
+    }
+
+    @Agent(description = "Pure GOAP where a two-step episode interleaves with standing work")
+    inner class GoapInterleaveAgent {
+
+        // Values arranged so the mission plan outranks the calibration
+        // remainder mid-episode: prep runs, then collects, then calibrate
+        @Action(canRerun = true, value = 0.2, post = ["enoughSamples"])
+        fun collect(tally: SampleTally, context: ActionContext): SampleTally {
+            context.addObject(ExecutedStep("collect"))
+            val next = SampleTally(tally.count + 1)
+            if (next.count == 2) {
+                context.addObject(CalibrationRequested("cal-1"))
+            }
+            return next
+        }
+
+        @Condition(name = "enoughSamples")
+        fun enoughSamples(tally: SampleTally): Boolean = tally.count >= 5
+
+        @Action(pre = ["enoughSamples"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun missionComplete(tally: SampleTally, context: ActionContext): MissionReport {
+            context.addObject(ExecutedStep("missionComplete"))
+            return MissionReport(tally.count)
+        }
+
+        @Action(value = 0.9)
+        fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
+            context.addObject(ExecutedStep("prepKit"))
+            return CalibrationKit(request.id)
+        }
+
+        @Action(value = 0.55)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate"))
+            return CalibrationCompleted(kit.id)
+        }
+    }
+
+    @Test
+    fun `episode steps are not an atomic block - standing work interleaves between them`() {
+        val result = run(GoapInterleaveAgent(), "goap-interleave", PlannerType.GOAP)
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        val prepAt = steps.indexOf("prepKit")
+        val calibrateAt = steps.indexOf("calibrate")
+        val collectsBetween = steps.subList(prepAt + 1, calibrateAt).count { it == "collect" }
+        assertEquals(
+            true, collectsBetween > 0,
+            "Expected standing collects between the episode's two steps, got: $steps"
+        )
     }
 
     @Agent(description = "Pure GOAP that awaits a calibration request via waitFor")
