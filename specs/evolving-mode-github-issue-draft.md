@@ -154,6 +154,37 @@ Because episodes live in `ProcessOptions`, they also compose with Autonomy/Open 
 
 `EpisodePolicy` does not teach the planner how to discover or pursue the goal. The existing planner already does that. It identifies goal completions that are nonterminal episodes and owns their consume/rearm lifecycle. Ordinary terminal goals retain today's behavior. Selection remains with existing conditions and plan values.
 
+### Phase 1 API Surface
+
+The complete deterministic phase-1 surface, gathered in one place. Spellings are placeholders (see Open Questions); the shape is the contract.
+
+```java
+// The substrate is data. The fluent EpisodePolicy.episode(...) chain is sugar over it.
+record Episode(
+    GoalTarget target,               // one or more candidate declared goals
+    Class<?> consumes,               // the request occurrence this episode consumes
+    boolean interruptsCurrentAction  // always false until phase 4
+) {}
+
+record EpisodePolicy(List<Episode> episodes) {}
+
+// The single new entry point, following the existing ProcessOptions wither pattern
+ProcessOptions withEpisodes(EpisodePolicy episodes);
+
+// Target references, canonicalized against the active scope at process creation
+GoalTarget.output(Class<?> satisfiedByType)  // all scoped declared goals satisfied by that type
+GoalTarget.named(String goalName)            // exactly one declared goal by stable identity
+```
+
+Surface rules, gathered from the sections below:
+
+- `consumeOnCompletion(Request.class)` is required when the candidate goal path has more than one possible input. A bare `episode(target)` may infer the consumed request only when validation finds exactly one candidate input; otherwise configuration fails fast.
+- Nonterminal completion and consumption are one contract, never two switches.
+- An empty policy preserves today's behavior exactly.
+- Recognition point: `SimpleAgentProcess.handleProcessCompletion(...)`, already shared by simple and concurrent processes.
+
+Not phase 1: `ingress()` (phase 2, Sub-Issue 2), the interruption flag's behavior (phase 4), `withObjectiveAuthor(...)` (phase 5), `recurring(...)` (work stream 7).
+
 ### Runtime Semantics
 
 The existing type, condition, binding, goal, and planner model remains authoritative. A request object can make one or more declared goals plannable today. Episode policy changes what happens when a selected candidate goal is satisfied; it does not maintain a second goal set or add a planner overlay for deterministic phase 1.
