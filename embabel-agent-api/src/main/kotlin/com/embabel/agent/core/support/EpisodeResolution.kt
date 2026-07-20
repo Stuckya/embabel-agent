@@ -187,8 +187,10 @@ internal object EpisodeResolution {
     /**
      * Analyze the condition graph the planner searches: from the goal's
      * preconditions to the actions whose effects satisfy them, then those
-     * actions' preconditions, transitively. Action effects already encode the
-     * planner's assignability rules (subtype and supertype outputs), so chain
+     * actions' preconditions, transitively — a static regression over the
+     * goal's relevant conditions, the backward analogue of the planner's
+     * forward search. Action effects already encode the planner's
+     * assignability rules (subtype and supertype outputs), so chain
      * membership here matches what the planner can actually route. An
      * input-binding condition no scoped action's effects satisfy is an
      * off-chain input: an observation the planner cannot manufacture. Named
