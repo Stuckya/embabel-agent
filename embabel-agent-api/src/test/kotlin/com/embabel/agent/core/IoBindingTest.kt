@@ -106,4 +106,15 @@ class IoBindingTest {
         assertEquals("myObject", binding.name)
         assertTrue(binding.type.endsWith("CustomTestClass"))
     }
+
+    @Test
+    fun `resolveJvmType does not run static initializers`() {
+        // Metadata resolution must reference classes, never initialize them:
+        // a static initializer with side effects would fire at scan time
+        val binding = IoBinding("com.embabel.agent.core.ExplodingStaticInit")
+
+        val resolved = binding.resolveJvmType()
+
+        assertEquals("com.embabel.agent.core.ExplodingStaticInit", resolved?.className)
+    }
 }

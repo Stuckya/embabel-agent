@@ -25,6 +25,7 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.api.event.AgentProcessEvent
 import com.embabel.agent.api.event.AgentProcessFinishedEvent
+import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.AgenticEventListener
 import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.core.Agent as CoreAgent
@@ -1539,25 +1540,25 @@ class GoalEpisodePhase1Test {
                 events.add(event)
             }
         }
-        val blackboard = InMemoryBlackboard()
-        blackboard.addObject(CalibrationRequested("cal-1"))
-        val reader = AgentMetadataReader()
-        val agent = reader.createAgentMetadata(GoapEpisodeOnlyAgent()) as CoreAgent
-        val result = SimpleAgentProcess(
+        // withListener must reach process events: ProcessContext composes
+        // processOptions.listeners, and the process publishes through it
+        val result = run(
+            GoapEpisodeOnlyAgent(),
             "phase1-episode-events",
-            null,
-            agent,
-            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
-            blackboard,
-            dummyPlatformServices(eventListener = listener),
-            DefaultPlannerFactory,
-            Instant.now(),
-        ).run()
+            ProcessOptions.DEFAULT
+                .withEpisodes(calibrationEpisode())
+                .withListener(listener),
+            CalibrationRequested("cal-1"),
+        )
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        val goalAchieved = events.count { it is GoalAchievedEvent }
+        val goalEvents = events.filterIsInstance<GoalAchievedEvent>()
         val finished = events.count { it is AgentProcessFinishedEvent }
-        assertEquals(1, goalAchieved, "One episode, one GoalAchievedEvent")
+        assertEquals(1, goalEvents.size, "One episode, one goal event")
+        assertTrue(
+            goalEvents.single() is EpisodeCompletedEvent,
+            "Episode completions are distinguishable by type, matching the platform's event idiom",
+        )
         assertEquals(0, finished, "A nonterminal completion must not emit a process-finished event")
     }
 

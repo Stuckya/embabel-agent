@@ -17,6 +17,7 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.api.common.PlatformServices
 import com.embabel.agent.api.event.AgentProcessPlanFormulatedEvent
+import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ReplanRequestedEvent
 import com.embabel.agent.api.tool.TerminateActionException
@@ -114,7 +115,7 @@ open class SimpleAgentProcess(
             plan.goal.name,
             this.runningTime.seconds,
         )
-        platformServices.eventListener.onProcessEvent(
+        processContext.onProcessEvent(
             GoalAchievedEvent(
                 agentProcess = this,
                 worldState = worldState,
@@ -144,8 +145,8 @@ open class SimpleAgentProcess(
             this.id,
             plan.goal.name,
         )
-        platformServices.eventListener.onProcessEvent(
-            GoalAchievedEvent(
+        processContext.onProcessEvent(
+            EpisodeCompletedEvent(
                 agentProcess = this,
                 worldState = worldState,
                 goal = plan.goal,
@@ -180,7 +181,7 @@ open class SimpleAgentProcess(
      * matching the default binding the completing action received.
      */
     private fun consumeLatest(type: Class<*>): Boolean {
-        val latest = blackboard.objects.lastOrNull { type.isInstance(it) } ?: return false
+        val latest = blackboard.last(type) ?: return false
         blackboard.hide(latest)
         logger.debug("Process {} consumed {}", this.id, latest)
         return true
@@ -192,7 +193,7 @@ open class SimpleAgentProcess(
      * shortcut the next occurrence's plan.
      */
     private fun consumeAll(type: Class<*>): Int {
-        val consumed = blackboard.objects.filter { type.isInstance(it) }
+        val consumed = blackboard.objectsOfType(type)
         consumed.forEach { blackboard.hide(it) }
         if (consumed.isNotEmpty()) {
             logger.debug(
@@ -209,7 +210,7 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
-        platformServices.eventListener.onProcessEvent(
+        processContext.onProcessEvent(
             AgentProcessPlanFormulatedEvent(
                 agentProcess = this,
                 worldState = worldState,
@@ -307,7 +308,7 @@ open class SimpleAgentProcess(
             action.name,
             rpe.reason,
         )
-        platformServices.eventListener.onProcessEvent(
+        processContext.onProcessEvent(
             ReplanRequestedEvent(
                 agentProcess = this,
                 reason = rpe.reason,

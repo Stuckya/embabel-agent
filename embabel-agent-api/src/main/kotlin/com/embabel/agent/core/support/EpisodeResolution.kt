@@ -101,7 +101,7 @@ internal object EpisodeResolution {
     }
 
     private fun loadProductClass(goalName: String, typeName: String): Class<*> =
-        loadClassOrNull(typeName)
+        IoBinding(typeName).resolveJvmType()?.clazz
             ?: throw IllegalArgumentException(
                 "Episode candidate $goalName produces $typeName, which cannot be loaded: " +
                         "every product must be a consumable JVM type"
@@ -170,10 +170,8 @@ internal object EpisodeResolution {
         return matches
     }
 
-    private fun satisfiesOutputTarget(goal: Goal, target: GoalTarget.Output): Boolean {
-        val outputType = goal.outputType
-        return outputType is JvmType && target.satisfiedByType.isAssignableFrom(outputType.clazz)
-    }
+    private fun satisfiesOutputTarget(goal: Goal, target: GoalTarget.Output): Boolean =
+        goal.outputType?.isAssignableTo(target.satisfiedByType) == true
 
     private fun requireSingleOwner(
         goalOwner: MutableMap<String, Class<*>>,
@@ -385,21 +383,12 @@ internal object EpisodeResolution {
         }
         val binding = requiredOnEveryPath.single()
         requireDefaultBinding(episode, binding)
-        val typeName = IoBinding(binding).type
-        return loadClassOrNull(typeName)
+        return IoBinding(binding).resolveJvmType()?.clazz
             ?: throw IllegalArgumentException(
                 "Cannot infer the consumed request for episode target ${episode.target}: " +
-                        "cannot load inferred input type $typeName. Specify consumeOnCompletion explicitly"
+                        "cannot load inferred input type ${IoBinding(binding).type}. " +
+                        "Specify consumeOnCompletion explicitly"
             )
     }
-
-    private fun loadClassOrNull(typeName: String): Class<*>? =
-        try {
-            Class.forName(typeName, false, Thread.currentThread().contextClassLoader)
-        } catch (_: ClassNotFoundException) {
-            null
-        } catch (e: LinkageError) {
-            throw IllegalArgumentException("Type $typeName is present but unloadable", e)
-        }
 
 }

@@ -62,7 +62,7 @@ data class JvmType @JsonCreator constructor(
         if (className == "void") {
             Void.TYPE
         } else
-            Class.forName(className, true, Thread.currentThread().getContextClassLoader())
+            Class.forName(className, false, Thread.currentThread().getContextClassLoader())
     }
 
     @get:JsonIgnore

@@ -101,11 +101,23 @@ class StateTransitionEvent(
     val isSameType: Boolean get() = previousState != null && previousState.javaClass == newState.javaClass
 }
 
-class GoalAchievedEvent(
+open class GoalAchievedEvent(
     agentProcess: AgentProcess,
     val worldState: WorldState,
     val goal: Goal,
 ) : AbstractAgentProcessEvent(agentProcess)
+
+/**
+ * A nonterminal goal achievement: an episode goal completed, its request and
+ * products were consumed, and the process continues. Emitted in place of the
+ * plain [GoalAchievedEvent] so listeners can distinguish episodic completions;
+ * listeners matching on [GoalAchievedEvent] still receive it.
+ */
+class EpisodeCompletedEvent(
+    agentProcess: AgentProcess,
+    worldState: WorldState,
+    goal: Goal,
+) : GoalAchievedEvent(agentProcess, worldState, goal)
 
 class ActionExecutionStartEvent(
     agentProcess: AgentProcess,
