@@ -19,6 +19,7 @@ import com.embabel.agent.api.annotation.AchievesGoal
 import com.embabel.agent.api.annotation.Action
 import com.embabel.agent.api.annotation.Agent
 import com.embabel.agent.api.annotation.Condition
+import com.embabel.agent.api.annotation.RequireNameMatch
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
@@ -54,6 +55,12 @@ interface SensorKit {
 }
 
 data class SpecificSensorKit(override val id: String) : SensorKit
+
+interface RequestBase {
+    val id: String
+}
+
+data class SpecialRequest(override val id: String) : RequestBase
 
 /**
  * Phase-1 episode lifecycle for issue #1756, driving the contract test-first:
@@ -97,6 +104,19 @@ data class SpecificSensorKit(override val id: String) : SensorKit
  * 19. A non-rerunnable intermediate makes the whole episode one-shot, exactly
  *     like a non-rerunnable completing action (pin).
  * 20. A named target matching duplicate goal identities fails fast.
+ * 21. The consumed request must be required on every candidate's completion
+ *     path: candidates driven by different request types are rejected.
+ * 22. A goal reachable through paths with different drivers cannot consume a
+ *     request that only some paths observe.
+ * 23. Explicit consumption must match the off-chain binding type exactly:
+ *     consuming a subtype of what the action accepts is rejected.
+ * 24. A request arriving under a named binding is rejected in phase 1:
+ *     consumption follows default-binding semantics only.
+ * 25. An output target resolving distinct goals that share a name fails fast
+ *     instead of silently collapsing them.
+ * 26. A visible chain product is planning bait, not an unexecuted-path
+ *     casualty: the planner may route through it and consumption follows the
+ *     completed plan (pin).
  */
 class GoalEpisodePhase1Test {
 
@@ -302,6 +322,55 @@ class GoalEpisodePhase1Test {
             context.addObject(ExecutedStep("fullCal:${request.id}"))
             return FullCalibration(request.id)
         }
+    }
+
+    @Agent(description = "Candidate goals driven by different request types")
+    inner class SplitCandidateAgent {
+
+        @Action(value = 0.9)
+        @AchievesGoal(description = "Quick calibration", value = 1.0)
+        fun quickCal(request: CalibrationRequested): QuickCalibration =
+            QuickCalibration(request.id)
+
+        @Action(value = 0.3)
+        @AchievesGoal(description = "Full calibration", value = 0.4)
+        fun fullCal(zone: ZoneInfo): FullCalibration =
+            FullCalibration(zone.name)
+    }
+
+    @Agent(description = "One goal reachable through two paths with different drivers")
+    inner class OrPathAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepFromRequest(request: CalibrationRequested): CalibrationKit =
+            CalibrationKit(request.id)
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepFromZone(zone: ZoneInfo): CalibrationKit =
+            CalibrationKit(zone.name)
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: CalibrationKit): CalibrationCompleted =
+            CalibrationCompleted(kit.id)
+    }
+
+    @Agent(description = "Request accepted through a supertype binding")
+    inner class SupertypeRequestAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: RequestBase): CalibrationCompleted =
+            CalibrationCompleted(request.id)
+    }
+
+    @Agent(description = "Request arriving under a named binding")
+    inner class NamedBindingAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(@RequireNameMatch("special") request: CalibrationRequested): CalibrationCompleted =
+            CalibrationCompleted(request.id)
     }
 
     @Agent(description = "Two distinct goals driven by the same request type")
@@ -812,6 +881,126 @@ class GoalEpisodePhase1Test {
             )
         }
         assertTrue("2 declared goals" in exception.message!!, "Error states the ambiguity: ${exception.message}")
+    }
+
+    @Test
+    fun `candidates driven by different request types cannot share one episode`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                SplitCandidateAgent(),
+                "phase1-split-candidates",
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationOutcome::class.java))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+            )
+        }
+        assertTrue("CalibrationRequested" in exception.message!!, "Error names the request: ${exception.message}")
+    }
+
+    @Test
+    fun `a consumed request observed by only some paths to the goal is rejected`() {
+        // prepFromZone can manufacture the kit without any request, so completion
+        // could not pair the request with the work that actually ran
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                OrPathAgent(),
+                "phase1-or-paths",
+                ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            )
+        }
+        assertTrue("CalibrationRequested" in exception.message!!, "Error names the request: ${exception.message}")
+    }
+
+    @Test
+    fun `explicit consumption must match the off-chain binding type exactly`() {
+        // The action accepts RequestBase; the planner may bind any implementation,
+        // so consuming only SpecialRequest could leave the real driver visible
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                SupertypeRequestAgent(),
+                "phase1-subtype-consumes",
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                        .consumeOnCompletion(SpecialRequest::class.java)
+                ),
+            )
+        }
+        assertTrue("SpecialRequest" in exception.message!!, "Error names the consumed type: ${exception.message}")
+    }
+
+    @Test
+    fun `a request arriving under a named binding is rejected`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                NamedBindingAgent(),
+                "phase1-named-binding",
+                ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            )
+        }
+        assertTrue("special" in exception.message!!, "Error names the binding: ${exception.message}")
+    }
+
+    @Test
+    fun `an output target resolving distinct goals sharing a name fails fast`() {
+        val agent = com.embabel.agent.core.Agent(
+            name = "dup-output-agent",
+            provider = "test",
+            description = "distinct goals sharing a name",
+            actions = emptyList(),
+            goals = setOf(
+                com.embabel.agent.core.Goal(
+                    name = "dupGoal",
+                    description = "first",
+                    satisfiedBy = CalibrationCompleted::class.java,
+                ),
+                com.embabel.agent.core.Goal(
+                    name = "dupGoal",
+                    description = "second",
+                    satisfiedBy = CalibrationCompleted::class.java,
+                ),
+            ),
+        )
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "phase1-dup-output-names",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue("dupGoal" in exception.message!!, "Error names the collision: ${exception.message}")
+    }
+
+    @Test
+    fun `a visible chain product is planning bait - consumption follows the completed plan`() {
+        // The decoy kit is not an unexecuted-path casualty: the planner routes
+        // through it, the goal completes off it, and consumption follows the plan
+        val process = create(
+            RepeatableTwoStepAgent(),
+            "phase1-product-bait",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+            CalibrationKit("decoy"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:decoy"), steps, "The planner used the visible kit; prep was unnecessary")
+        assertNull(result.last<CalibrationKit>(), "The kit that satisfied the plan is consumed")
+        assertNull(result.last<CalibrationRequested>(), "The configured request is the consumed occurrence")
     }
 
     @Test
