@@ -130,6 +130,8 @@ interface Blackboard : Bindable, MayHaveLastResult, HasInfoString {
     /**
      * Hide this object. Does not remove it from the blackboard
      * but will prevent it being retrieved.
+     * Hiding is identity-based: only this exact instance is hidden,
+     * and a distinct but equal object remains visible.
      */
     fun hide(what: Any)
 

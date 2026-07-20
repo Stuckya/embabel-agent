@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.awt.Point
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * Abstract test class for testing Blackboard implementations.
@@ -316,6 +317,50 @@ abstract class AbstractBlackboardTest {
                     DataDictionary.fromClasses("test", PersonWithReverseTool::class.java)
                 )
             )
+        }
+
+        @Test
+        fun `hiding one instance leaves a distinct but equal instance visible`() {
+            val bb = createBlackboard()
+            val first = PersonWithReverseTool("John")
+            val second = PersonWithReverseTool("John")
+            bb += first
+            bb += second
+
+            bb.hide(first)
+
+            // Hiding is identity-based per the hide contract ("hide this object"):
+            // an equal but distinct object is a different fact and stays visible
+            assertEquals(1, bb.objects.size)
+            assertTrue(bb.objects.single() === second, "Only the exact hidden instance disappears")
+        }
+
+        @Test
+        fun `an equal object added after hiding remains visible`() {
+            val bb = createBlackboard()
+            val first = PersonWithReverseTool("John")
+            bb += first
+            bb.hide(first)
+
+            val second = PersonWithReverseTool("John")
+            bb += second
+
+            assertEquals(1, bb.objects.size)
+            assertTrue(bb.objects.single() === second, "A later equal object is a new fact, not the hidden one")
+        }
+
+        @Test
+        fun `hiding one instance does not hide an equal object bound under another key`() {
+            val bb = createBlackboard()
+            val first = PersonWithReverseTool("John")
+            val second = PersonWithReverseTool("John")
+            bb["a"] = first
+            bb["b"] = second
+
+            bb.hide(first)
+
+            assertNull(bb["a"])
+            assertTrue(bb["b"] === second, "Named access loses only the exact hidden instance")
         }
 
         @Test

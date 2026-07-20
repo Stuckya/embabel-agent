@@ -55,7 +55,7 @@ sealed interface GoalTarget {
  * runtime request occurrence. Completing an episode goal does not complete
  * the process. On completion the request and the completed candidate's chain
  * products (the satisfying output and any intermediates) are hidden through
- * existing equality-based [Blackboard.hide], so a later occurrence replans
+ * existing identity-based [Blackboard.hide], so a later occurrence replans
  * the chain fresh. Product cleanup is conservative static analysis over the
  * candidate's possible producer paths; standing state an action maintains for
  * itself survives.

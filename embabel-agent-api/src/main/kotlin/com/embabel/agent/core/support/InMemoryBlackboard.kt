@@ -32,7 +32,11 @@ class InMemoryBlackboard(
 
     private val _map: MutableMap<String, Any> = ConcurrentHashMap()
     private val _entries: MutableList<Any> = Collections.synchronizedList(mutableListOf())
-    private val hiddens: MutableSet<Any> = Collections.synchronizedSet(mutableSetOf())
+
+    // Identity-based, honoring the hide contract: hiding an object hides
+    // exactly that instance, never distinct-but-equal objects
+    private val hiddens: MutableSet<Any> =
+        Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap()))
     private val protectedKeys: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     override fun spawn(): Blackboard {
@@ -70,7 +74,9 @@ class InMemoryBlackboard(
 
     override val objects: List<Any>
         get() = synchronized(_entries) {
-            (_entries - hiddens).toList() // Return a snapshot to avoid concurrent modification
+            // Filter rather than minus: minus would rebuild an equality set
+            // and defeat identity-based hiding. Snapshot avoids concurrent modification
+            _entries.filter { it !in hiddens }
         }
 
     override fun get(name: String): Any? {

@@ -104,9 +104,8 @@ data class RunningTally(override val count: Int) : Tally
  *     occurrence tracking, completion could pair the wrong request.
  * 17. Consumption is scoped to the completed candidate's chain: another
  *     candidate's output type visible on the blackboard survives.
- * 18. Distinct-but-equal request occurrences coalesce: Blackboard.hide is
- *     equality-based on main, so one completion consumes every equal
- *     occurrence (pin; occurrence identity is the consumer's responsibility).
+ * 18. Distinct-but-equal request occurrences are separate occurrences under
+ *     identity-based hiding: each is handled and consumed exactly once.
  * 19. A non-rerunnable intermediate makes the whole episode one-shot, exactly
  *     like a non-rerunnable completing action (pin).
  * 20. A named target matching duplicate goal identities fails fast.
@@ -129,6 +128,9 @@ data class RunningTally(override val count: Int) : Tally
  * 28. A self-refining producer makes the request optional on some path, so the
  *     episode is rejected by every-path validation (pin: the too-broad
  *     self-maintenance hazard cannot be configured).
+ * 29. Equal satisfying outputs across sequential episodes: an output type that
+ *     carries no occurrence identity must not prevent the next episode from
+ *     completing after its equal predecessor was consumed.
  */
 class GoalEpisodePhase1Test {
 
@@ -424,6 +426,17 @@ class GoalEpisodePhase1Test {
         fun calibrate(request: CalibrationRequested, tally: Tally, context: ActionContext): CalibrationCompleted {
             context.addObject(ExecutedStep("calibrate:${request.id}"))
             return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Calibration whose output carries no occurrence identity")
+    inner class ConstantOutputAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            return CalibrationCompleted("done")
         }
     }
 
@@ -856,13 +869,9 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
-    fun `distinct but equal request occurrences coalesce - hide is equality-based on main`() {
-        // Blackboard.hide stores hidden objects in an equality Set, so consuming
-        // one occurrence hides every equal one: the second request is silently
-        // dropped, not looped on. Occurrence identity is therefore the consumer's
-        // responsibility in phase 1 - give requests distinguishing state (an id,
-        // a timestamp). Changing hide to identity semantics is a platform
-        // question, tracked upstream.
+    fun `distinct but equal request occurrences are separate occurrences - each handled once`() {
+        // Identity-based hiding: consuming an occurrence hides exactly that
+        // object, so an equal but distinct occurrence remains a live request
         val process = create(
             GoapEpisodeOnlyAgent(),
             "phase1-equal-occurrences",
@@ -875,8 +884,11 @@ class GoalEpisodePhase1Test {
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
         val calibrated = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertEquals(listOf("calibrate:cal-same"), calibrated, "One completion consumed both equal occurrences")
-        assertNull(result.last<CalibrationRequested>(), "No equal occurrence remains visible")
+        assertEquals(
+            listOf("calibrate:cal-same", "calibrate:cal-same"), calibrated,
+            "Two occurrences, two episodes",
+        )
+        assertNull(result.last<CalibrationRequested>(), "Both occurrences consumed")
     }
 
     @Test
@@ -1077,6 +1089,30 @@ class GoalEpisodePhase1Test {
         // If consumption hid the latest tally, collection would roll back one
         // step after the episode and need an extra collect to reach the mission
         assertEquals(5, collects, "The accumulator must not roll back at episode completion")
+    }
+
+    @Test
+    fun `equal satisfying outputs across sequential episodes do not block the next completion`() {
+        // The output deliberately carries no occurrence identity: consuming
+        // episode 1's CalibrationCompleted("done") must not make episode 2's
+        // equal output invisible at the moment it is produced
+        val process = create(
+            ConstantOutputAgent(),
+            "phase1-equal-outputs",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status)
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val rearmed = parked.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, rearmed.status, "The second episode completes and parks")
+        val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-1", "calibrate:cal-2"), steps, "Each occurrence ran exactly once")
+        assertNull(rearmed.last<CalibrationRequested>(), "cal-2 was consumed by a real completion")
     }
 
     @Test
