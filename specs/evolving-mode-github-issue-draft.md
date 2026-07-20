@@ -178,7 +178,7 @@ GoalTarget.named(String goalName)            // exactly one declared goal by sta
 
 Surface rules, gathered from the sections below:
 
-- `consumeOnCompletion(Request.class)` is required when the candidate goal path has more than one possible input. A bare `episode(target)` may infer the consumed request only when validation finds exactly one candidate input; otherwise configuration fails fast.
+- `consumeOnCompletion(Request.class)` is the documented default. A bare `episode(target)` may infer the consumed request only when the goal path has exactly one off-chain input — an input type no scoped action produces; otherwise configuration fails fast. Inference cannot decide whether a single off-chain input is an occurrence or a standing fact, so the explicit form stays preferred.
 - Nonterminal completion and consumption are one contract, never two switches.
 - An empty policy preserves today's behavior exactly.
 - Recognition point: `SimpleAgentProcess.handleProcessCompletion(...)`, already shared by simple and concurrent processes.
@@ -189,7 +189,7 @@ Not phase 1: `ingress()` (phase 2, Sub-Issue 2), the interruption flag's behavio
 
 The existing type, condition, binding, goal, and planner model remains authoritative. A request object can make one or more declared goals plannable today. Episode policy changes what happens when a selected candidate goal is satisfied; it does not maintain a second goal set or add a planner overlay for deterministic phase 1.
 
-An episode is one bounded plan-execute-complete cycle. It is not an atomic block: per-tick replanning can interleave standing work between its steps when values favor it (baseline test 10). On completion of an episode goal, the exact triggering fact occurrence and the satisfying output are hidden through the existing blackboard API. Nothing is deleted; the blackboard remains append-only. Hiding makes the goal unsatisfied again so a later occurrence plans real work.
+An episode is one bounded plan-execute-complete cycle. It is not an atomic block: per-tick replanning can interleave standing work between its steps when values favor it (baseline test 10). On completion of an episode goal, the exact triggering fact occurrence and every product the episode's chain manufactured — the satisfying output and any intermediates, found by walking the goal's producing actions — are hidden through the existing blackboard API. Nothing is deleted; the blackboard remains append-only. Hiding makes the goal unsatisfied and its chain unreplannable from leftovers, so a later occurrence plans the entire chain fresh. A self-maintained fact — a type some action both consumes and produces, such as a tally the action increments — is never an episode product and survives completion.
 
 The lifecycle is per occurrence and the declared goal is reusable. Completing an episode never completes the process. Ordinary declared goals keep today's behavior and may complete the process.
 
@@ -197,7 +197,7 @@ Nonterminal completion and consumption are one contract. They should not be sepa
 
 `GoalTarget.output(T)` may identify several declared candidate goals satisfied by `T`; normal conditions, heuristics, and plan values choose among them. The first completion finishes the episode. A target with no scoped producer fails fast. The exact target representation remains an API-design question.
 
-The phase-1 implementation should not introduce keyed goal-instance satisfaction. Domains needing key-specific behavior should use existing types, conditions, bindings, and action inputs. Whether episode rearm requires existing `canRerun = true` declarations or framework-managed activation-scoped execution state remains open for the phase-1 design.
+The phase-1 implementation should not introduce keyed goal-instance satisfaction. Domains needing key-specific behavior should use existing types, conditions, bindings, and action inputs. Episode rearm rides the existing `canRerun` contract: the framework does not reset execution state, and an episode whose completing action declares `canRerun = false` is deliberately one-shot.
 
 ### Blackboard Model
 
@@ -239,11 +239,11 @@ For urgent external facts, a later phase may add `.terminateCurrentAction()`: re
 
 ### Episode Matching and Rearm Semantics
 
-The phase-1 contract is deliberately concrete. `consumeOnCompletion(Request.class)` identifies the request consumed by the episode. When a candidate goal completes, the framework hides the exact request object and the satisfying output. A later distinct request object can run the same episode again.
+The phase-1 contract is deliberately concrete. `consumeOnCompletion(Request.class)` identifies the request consumed by the episode. When a candidate goal completes, the framework hides the exact request object and the chain's products: the satisfying output and any intermediates manufactured on the goal path. A later distinct request object therefore replans the same episode from scratch — a stale intermediate cannot shortcut it. Consumption follows the plannability boundary: what the chain manufactured is consumed, while everything the path merely read — other off-chain inputs and self-maintained facts — survives. A resource that should outlive episodes is therefore an off-chain input, not a declared product. When several occurrences are visible at completion, the latest visible one is consumed, matching the default binding the completing action received.
 
 The first implementation should reject configurations where one request type ambiguously owns several independent episode definitions. One episode target may still resolve to several declared candidate goals; they are alternative ways to complete the same episode, not fan-out.
 
-The framework may need internal bookkeeping to associate a request occurrence with an episode completion, but that machinery is not a consumer-facing fact or activation API. The observable contract is consume once, do not complete the process, and allow a later occurrence to run again.
+Consumption is resolved statically at process creation and applied by identity at completion; there is no per-occurrence tracking and no consumer-facing activation API. The observable contract is consume once, do not complete the process, and allow a later occurrence to run again.
 
 ### Completion And Waiting
 
@@ -286,8 +286,6 @@ Maintainer input would be helpful on these decisions.
 - **Reuse existing planners, or a new planning mode?** Deterministic phase 1 changes goal-completion lifecycle, not planner search or goal discovery. Open Evolving and scope expansion may change process-local policy or scope later, but GOAP/Utility/Hybrid remain the execution planners.
 - **Which method name spellings should ship?** `EpisodePolicy`, `withEpisodes`, `episode`, `consumeOnCompletion`, and `ingress()` are illustrative. Phase 1 should follow the existing immutable `ProcessOptions` wither pattern; the exact type and method names remain open.
 - **How should candidate targets be represented in the final API?** The examples use an illustrative `GoalTarget.output(SensorCalibrationCompleted.class)` shape. All scoped declared goals satisfied by that output type become candidates for one episode; existing conditions and planner selection choose among them. `GoalTarget.named("sensorCalibrationCompleted")` selects one declared goal explicitly. Either form is canonicalized against the active scope; the exact target type and spelling remain open.
-- **How should repeatable actions behave across episodes?** The baseline proves `canRerun = true` plus hiding works. Phase 1 must decide whether that remains an explicit consumer responsibility, whether episode completion resets execution state, or whether invalid configurations fail validation.
-- **How should overlapping requests for one episode behave?** The first implementation needs a deterministic default, such as queue one at a time or reject while an occurrence is active. Equal payloads are not implicit deduplication.
 - **Can `withObjectiveAuthor(...)` and an explicit episode policy be supplied together and merged into one validated `ObjectivePolicy`, or is supplying both rejected?**
 
 ### Additional Context
@@ -301,12 +299,13 @@ Maintainer input would be helpful on these decisions.
 - **Declared capability** - immutable `@Agent` and `@EmbabelComponent` actions, conditions, and goals.
 - **Consumer application** - the application using Embabel, configuring invocation, providing scoped capabilities, owning domain state modules, and publishing selected external facts.
 - **Request fact** - typed domain object on the blackboard that represents one occurrence of follow-up work. Not a new public `Fact` API.
-- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request/output lifecycle is consumed. An episode is not an atomic block: per-tick replanning can interleave standing work between its steps (baseline test 10). Work stream 7 explores recurring episodes for pure-GOAP standing work.
+- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request and chain products are consumed. An episode is not an atomic block: per-tick replanning can interleave standing work between its steps (baseline test 10). Work stream 7 explores recurring episodes for pure-GOAP standing work.
 - **Runtime goal** - reserved here for a process-local objective proposed later by Open Evolving or scope expansion. Deterministic phase 1 reuses declared goals rather than adding a second goal set.
 - **Deterministic Evolving** - predeclared episode lifecycle for known request types and known declared goals.
 - **Open Evolving** - an `ObjectiveAuthor` authors or revises the objective policy when predefined episode policy and scope cannot handle the situation. It proposes goal references as typed data, never executable code. Proposed goals use the same scope validation and may opt into the same nonterminal lifecycle.
 - **Planning tick** - the boundary where the process plans: after an action completes, when a wake re-drives a parked process, or when the consumer's driver ticks. Ingress drains, newly visible requests may make declared goals plannable, and `@Condition` state is re-read. A tick replans from current state; the first implementation has no plan cache.
 - **Fact occurrence** - the exact request object added to the blackboard. Phase 1 consumes that occurrence through existing identity-based `Blackboard.hide` behavior.
+- **Off-chain input** - an input type no scoped action produces: seeded at process creation, observed mid-run through `ActionContext`, or arriving through phase-2 ingress. The planner cannot manufacture it, and episode completion never consumes it — except the configured request occurrence, which is itself off-chain. Unrelated to `@State`, which groups action availability.
 - **Application-owned state module** - consumer-owned state such as sensor snapshots, tray contents, inventory, or connection/session state. Embabel should consume this through action inputs, `@Condition`, scoped capabilities, and selected occurrence facts, not own the whole state model.
 
 </details>
@@ -343,7 +342,7 @@ Maintainer input would be helpful on these decisions.
 - Authored policies MUST reference declared goals with typed targets. Authoring MUST NOT introduce executable code, and per-instance declared goals (one goal per concrete target) SHOULD NOT be required where a generic goal plus typed target works.
 - Memoryless ongoing state SHOULD remain in `@Condition` or action inputs. It is not an episode merely because it changes while the process runs.
 - Episode candidates MUST be declared goal producers in the active scope, for example by producing the goal's satisfied-by type and using `@AchievesGoal` where appropriate.
-- Episode completion MUST hide the exact configured request occurrence and satisfying output before the process returns to ordinary selection.
+- Episode completion MUST hide the exact configured request occurrence and the products manufactured on the episode's goal path — satisfying output and intermediates — before the process returns to ordinary selection. Self-maintained facts and other off-chain inputs MUST survive.
 - Normal action completion reaches the next planning tick through ordinary execution; action/tool-initiated early replanning reuses `ReplanRequestedException`; selected external facts use ingress and wake from phase 2. Declared actions from the scoped capabilities remain the only executable steps.
 
 ### Non-Goals
@@ -378,7 +377,7 @@ Occurrence requests should normally be observations added through `ActionContext
 Phase 1 adds three lifecycle guarantees:
 
 1. satisfying an episode goal does not complete the process;
-2. the exact request occurrence and satisfying output are hidden through `Blackboard.hide`;
+2. the exact request occurrence and the goal path's products — satisfying output and intermediates — are hidden through `Blackboard.hide`;
 3. a later request can run the same declared goal episode again.
 
 Ordinary declared goals retain existing goal-completes-process behavior. GOAP, Utility, and Hybrid retain their existing planning and selection behavior.
@@ -406,9 +405,9 @@ nonterminal consume-on-completion behavior
 
 An output target resolves matching scoped goal candidates; a named target resolves one stable declared goal identity. Existing conditions and planner selection choose among candidates. No candidate is a configuration error, while a candidate that is temporarily blocked remains an ordinary planner concern.
 
-The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values.
+The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values — and a multi-step path additionally owes one hide per intermediate, or a leftover intermediate re-satisfies the goal without a new request. The `evolving-mode-phase-1` branch carries a reference implementation driven by a 14-test suite exercising these criteria.
 
-The implementation may associate the selected request object with the goal episode internally. Consumers should not manage activation ids or lifecycle-only blackboard records. Phase 1 need not prescribe a new public fact-observation model if identity-based blackboard hiding is sufficient.
+Identity-based blackboard hiding is sufficient: consumption resolves statically at process creation and applies by identity at completion, with no per-occurrence tracking. Consumers never manage activation ids or lifecycle-only blackboard records.
 
 Action failure does not complete the episode. Existing failure and replanning behavior remains in force; retry limits and backoff are separate concerns.
 
@@ -435,7 +434,7 @@ ProcessOptions.DEFAULT.withEpisodes(EpisodePolicy
 
 The API names are illustrative. Episode configuration must identify a canonical declared goal target and the request occurrence whose lifecycle it owns.
 
-`consumeOnCompletion(Request.class)` is required when the candidate goal path has more than one possible input. A bare `episode(target)` may infer the consumed request only when scope validation finds exactly one unambiguous candidate input. Otherwise configuration fails fast. The type system cannot decide that a state input such as `CurrentLocation` is safe to consume.
+`consumeOnCompletion(Request.class)` is the documented default. A bare `episode(target)` may infer the consumed request only when scope validation finds exactly one off-chain input — an input type no scoped action produces. Otherwise configuration fails fast. Inputs manufactured on the chain are excluded automatically; the type system still cannot decide that a single off-chain input such as `CurrentLocation` is an occurrence rather than a standing fact, which is why the explicit form stays preferred.
 
 Acceptance criteria:
 
@@ -449,15 +448,17 @@ Acceptance criteria:
 - a target with a scoped producer is not rejected merely because it is currently blocked by missing facts or preconditions
 - an output target can resolve several candidate goals; existing conditions and planning choose among them
 - completing a candidate episode goal does not complete the process
-- completion hides the exact triggering request and satisfying output through `Blackboard.hide`
+- completion hides the exact triggering request and the goal path's products — satisfying output and intermediates — through `Blackboard.hide`
+- a repeatable multi-step episode replans its full chain for a later occurrence; a stale intermediate cannot shortcut it
+- self-maintained facts and other off-chain inputs survive episode completion
 - a later distinct request makes the episode eligible again and is not pre-satisfied by the earlier output
 - ordinary declared goals retain existing goal-completes-process behavior
 - empty episode policy preserves ordinary goal completion and all other current behavior
 - nonterminal completion and request/output consumption cannot be configured as independent behaviors
-- consumption is inferred only for one unambiguous candidate input; multi-input paths require explicit `consumeOnCompletion`
+- consumption is inferred only when the goal path has exactly one off-chain input; anything else requires explicit `consumeOnCompletion`
 - no phase-1 behavior depends on `CompletionPolicy`, external ingress, automatic wake, or process-local goal projection
-- repeatable-action behavior is explicitly decided and tested rather than silently relying on undocumented `hasRun` cleanup
-- overlapping request occurrences for one episode follow a documented deterministic default
+- episode rerun rides existing `canRerun`, decided and tested: the framework does not reset execution state, and a non-rerunnable completing action makes the episode one-shot
+- overlapping request occurrences are consumed latest-visible-first, matching the default binding handed to the completing action
 - base GOAP, Utility, and Hybrid planners remain the execution planners
 
 Out of scope:
@@ -647,7 +648,7 @@ Useful lifecycle transitions:
 - request occurrence observed
 - candidate goal selected
 - episode goal completed
-- request and satisfying output consumed
+- request and chain products consumed
 - episode rearmed for a later request
 - episode action or plan failed
 - plan selected after a request became visible
@@ -695,7 +696,7 @@ Semantics:
 - does not kill threads
 - does not bypass normal planning: the planner reselects when the interrupted action yields, and ordinary goal and value selection decides what runs next
 - non-cooperative actions are not forcibly stopped. An action that never observes its token simply runs to completion
-- episode completion keeps its phase-1 meaning: the triggering request and satisfying output are hidden, and the process returns to normal planner selection
+- episode completion keeps its phase-1 meaning: the triggering request and chain products are hidden, and the process returns to normal planner selection
 - repeated urgent requests must not continually cancel the action handling that same episode
 
 Embabel already has action-scoped graceful termination machinery in `AgentProcess.terminateAction` / `TerminationScope.ACTION`. This work defines how urgent episode requests use it and how a stable cooperative cancellation signal is exposed to ordinary blocking action code.
@@ -834,7 +835,7 @@ Mechanism:
 - Interrupted episodes replan. No suspended plan stack is restored.
 - Request-driven phase-1 episodes compose at planning ticks; after one completes, the recurring goal can be planned again from current state.
 
-Two blackboard consequences follow. A satisfying output hidden after each episode cannot double as the persistent cumulative-progress record; keep cumulative progress in consumer-owned state or a distinct blackboard type. Intermediate outputs still follow existing blackboard and action-repeatability semantics.
+Two blackboard consequences follow. A satisfying output hidden after each episode cannot double as the persistent cumulative-progress record; keep cumulative progress in consumer-owned state or a distinct blackboard type. Intermediates manufactured on the goal path follow phase 1's chain consumption, so a stale intermediate cannot pre-satisfy the next episode; self-maintained facts survive as usual.
 
 With a recurring goal there is always a standing goal to plan toward, so pure GOAP needs no `NIRVANA`. Utility/Hybrid remains the value-selected alternative.
 
