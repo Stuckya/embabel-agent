@@ -23,7 +23,6 @@ import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.Episode
 import com.embabel.agent.core.EpisodePolicy
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
@@ -74,31 +73,30 @@ data class SpecificSensorKit(override val id: String) : SensorKit
  *    one off-chain input, across a multi-step path.
  * 8. Inference fails fast when the path has more than one off-chain input.
  * 9. Two episodes consuming the same request type fail fast.
- * 10. interruptsCurrentAction is rejected in phase 1.
- * 11. Overlapping occurrences follow the documented default: the latest visible
+ * 10. Overlapping occurrences follow the documented default: the latest visible
  *     occurrence is consumed first, matching default binding.
- * 12. Episode rerun rides existing canRerun: a non-rerunnable completing action
+ * 11. Episode rerun rides existing canRerun: a non-rerunnable completing action
  *     does not re-fire for a second occurrence.
- * 13. A repeatable multi-step episode reruns the whole chain fresh: intermediates
+ * 12. A repeatable multi-step episode reruns the whole chain fresh: intermediates
  *     manufactured on the episode path are consumed at completion, so a stale
  *     intermediate cannot shortcut the next occurrence's plan.
- * 14. Consumption never touches standing state: a self-maintained accumulator
+ * 13. Consumption never touches standing state: a self-maintained accumulator
  *     feeding the chain survives episode completion.
- * 15. Chain analysis matches the planner's assignability rules: a producer
+ * 14. Chain analysis matches the planner's assignability rules: a producer
  *     returning a subtype satisfies a supertype consumer, so inference and
  *     consumption must traverse it (two tests: inference, consumption).
- * 16. An explicit consume type that is not an off-chain input of the episode's
+ * 15. An explicit consume type that is not an off-chain input of the episode's
  *     chain fails fast instead of silently consuming nothing.
- * 17. Two episodes resolving to the same declared goal fail fast: without
+ * 16. Two episodes resolving to the same declared goal fail fast: without
  *     occurrence tracking, completion could pair the wrong request.
- * 18. Consumption is scoped to the completed candidate's chain: another
+ * 17. Consumption is scoped to the completed candidate's chain: another
  *     candidate's output type visible on the blackboard survives.
- * 19. Distinct-but-equal request occurrences coalesce: Blackboard.hide is
+ * 18. Distinct-but-equal request occurrences coalesce: Blackboard.hide is
  *     equality-based on main, so one completion consumes every equal
  *     occurrence (pin; occurrence identity is the consumer's responsibility).
- * 20. A non-rerunnable intermediate makes the whole episode one-shot, exactly
+ * 19. A non-rerunnable intermediate makes the whole episode one-shot, exactly
  *     like a non-rerunnable completing action (pin).
- * 21. A named target matching duplicate goal identities fails fast.
+ * 20. A named target matching duplicate goal identities fails fast.
  */
 class GoalEpisodePhase1Test {
 
@@ -561,28 +559,6 @@ class GoalEpisodePhase1Test {
         }
         assertTrue("CalibrationRequested" in exception.message!!)
         assertTrue("only one episode" in exception.message!!, "The duplicate rule is what fired: ${exception.message}")
-    }
-
-    @Test
-    fun `interruptsCurrentAction is rejected in phase 1`() {
-        val exception = assertThrows<IllegalArgumentException> {
-            create(
-                GoapEpisodeOnlyAgent(),
-                "phase1-no-interruption",
-                ProcessOptions.DEFAULT.withEpisodes(
-                    EpisodePolicy(
-                        listOf(
-                            Episode(
-                                target = GoalTarget.output(CalibrationCompleted::class.java),
-                                consumes = CalibrationRequested::class.java,
-                                interruptsCurrentAction = true,
-                            )
-                        )
-                    )
-                ),
-            )
-        }
-        assertTrue("interruptsCurrentAction" in exception.message!!)
     }
 
     @Test

@@ -61,13 +61,10 @@ sealed interface GoalTarget {
  * @param consumes the request type consumed when the episode completes.
  * Null means infer it at process creation, which is only permitted when the
  * goal path has exactly one input type no scoped action produces.
- * @param interruptsCurrentAction reserved for cooperative interruption.
- * Must be false: rejected until that phase lands.
  */
 data class Episode(
     val target: GoalTarget,
     val consumes: Class<*>? = null,
-    val interruptsCurrentAction: Boolean = false,
 )
 
 /**

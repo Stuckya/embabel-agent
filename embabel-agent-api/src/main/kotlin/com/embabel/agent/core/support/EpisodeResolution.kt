@@ -74,9 +74,6 @@ internal object EpisodeResolution {
     }
 
     private fun resolveEpisode(episode: Episode, agent: Agent): ResolvedEpisode {
-        require(!episode.interruptsCurrentAction) {
-            "interruptsCurrentAction is not yet supported: cooperative interruption is a later phase"
-        }
         val candidates = candidatesFor(episode, agent)
         require(candidates.isNotEmpty()) {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
