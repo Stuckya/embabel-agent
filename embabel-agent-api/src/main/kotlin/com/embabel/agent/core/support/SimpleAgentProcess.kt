@@ -151,8 +151,16 @@ open class SimpleAgentProcess(
                 goal = plan.goal,
             )
         )
-        consumeLatest(episode.consumes)
-        episode.productsFor(plan.goal.name).forEach { consumeLatest(it) }
+        val consumedRequest = consumeLatest(episode.consumes)
+        val consumedProducts = episode.productsFor(plan.goal.name).map { consumeLatest(it) }
+        if (!consumedRequest && consumedProducts.none { it }) {
+            logger.warn(
+                "Process {} episode goal {} completed but nothing was consumed; " +
+                        "a stale or seeded product may be satisfying the goal",
+                this.id,
+                plan.goal.name,
+            )
+        }
         setStatus(AgentProcessStatusCode.RUNNING)
     }
 
@@ -160,9 +168,10 @@ open class SimpleAgentProcess(
      * Hides the latest visible instance of the given type, if any,
      * matching the default binding the completing action received.
      */
-    private fun consumeLatest(type: Class<*>) {
-        blackboard.objects.lastOrNull { type.isInstance(it) }
-            ?.let { blackboard.hide(it) }
+    private fun consumeLatest(type: Class<*>): Boolean {
+        val latest = blackboard.objects.lastOrNull { type.isInstance(it) } ?: return false
+        blackboard.hide(latest)
+        return true
     }
 
     protected fun sendProcessRunningEvent(

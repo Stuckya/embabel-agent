@@ -77,9 +77,13 @@ internal object EpisodeResolution {
         val candidates = candidatesFor(episode, agent)
         require(candidates.isNotEmpty()) {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
-                    "Available goals: ${agent.goals.joinToString { it.name }}"
+                    "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
         }
+        candidates.forEach { requireConsumableOutput(episode, it, agent) }
         val chains = candidates.associate { it.name to analyzeGoalChain(it, agent) }
+        check(chains.size == candidates.size) {
+            "Candidate goal names must be unique before chain analysis"
+        }
         val requiredOnEveryPath = chains.values
             .map { it.requiredOffChainBindings }
             .reduce { a, b -> a intersect b }
@@ -107,7 +111,36 @@ internal object EpisodeResolution {
     private fun outputCandidates(episode: Episode, target: GoalTarget.Output, agent: Agent): List<Goal> {
         val matches = agent.goals.filter { satisfiesOutputTarget(it, target) }
         requireDistinctNames(episode, matches)
+        requireNamesUniqueInScope(matches, agent)
         return matches
+    }
+
+    /**
+     * Completion recognition matches by goal name, so a candidate must not
+     * share its name with any other scoped goal: an ordinary goal's completion
+     * could otherwise be mistaken for the episode and consume its request.
+     */
+    private fun requireNamesUniqueInScope(candidates: List<Goal>, agent: Agent) {
+        candidates.forEach { candidate ->
+            require(agent.goals.count { it.name == candidate.name } == 1) {
+                "Episode candidate ${candidate.name} shares its name with another scoped goal; " +
+                        "goal names must be unique in scope to participate in an episode"
+            }
+        }
+    }
+
+    /**
+     * A satisfying output must be a per-occurrence product. An output that is
+     * standing state would survive consumption and keep the goal satisfied
+     * forever, so the episode could never rearm.
+     */
+    private fun requireConsumableOutput(episode: Episode, goal: Goal, agent: Agent) {
+        val outputTypeName = (goal.outputType as? JvmType)?.className ?: return
+        require(!isSelfMaintained(outputTypeName, agent)) {
+            "Episode candidate ${goal.name} is satisfied by $outputTypeName, which is standing state " +
+                    "an action maintains for itself: a satisfying output must be a per-occurrence " +
+                    "product. Return a distinct completion type"
+        }
     }
 
     private fun requireDistinctNames(episode: Episode, candidates: List<Goal>) {

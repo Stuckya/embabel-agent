@@ -35,6 +35,11 @@ sealed interface GoalTarget {
      * Exactly one declared goal, referenced by stable name.
      */
     data class Named(val goalName: String) : GoalTarget {
+
+        init {
+            require(goalName.isNotBlank()) { "A named goal target requires a goal name" }
+        }
+
         override fun toString(): String = "named($goalName)"
     }
 
@@ -96,6 +101,9 @@ data class EpisodePolicy(
     fun consumeOnCompletion(requestType: Class<*>): EpisodePolicy {
         require(episodes.isNotEmpty()) {
             "consumeOnCompletion requires an episode: call episode(target) first"
+        }
+        require(episodes.last().consumes == null) {
+            "consumeOnCompletion is already set for the episode targeting ${episodes.last().target}"
         }
         return this.copy(
             episodes = episodes.dropLast(1) + episodes.last().copy(consumes = requestType)

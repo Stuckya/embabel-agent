@@ -131,6 +131,20 @@ data class RunningTally(override val count: Int) : Tally
  * 29. Equal satisfying outputs across sequential episodes: an output type that
  *     carries no occurrence identity must not prevent the next episode from
  *     completing after its equal predecessor was consumed.
+ * 30. A goal whose satisfying output is standing state is rejected: an output
+ *     that survives consumption would keep the goal satisfied forever.
+ * 31. A candidate goal sharing its name with another scoped goal is rejected:
+ *     completion matches by name, so the collision could consume the episode's
+ *     request for an ordinary goal's completion.
+ * 32. consumeOnCompletion without an episode fails fast (pin).
+ * 33. consumeOnCompletion twice on one episode fails fast instead of silently
+ *     overwriting the first request type.
+ * 34. A blank named target fails at construction, not at resolution.
+ * 35. A candidate goal without a JVM output type is rejected (pin: its
+ *     required-input set is empty, so the every-path rule already fires).
+ * 36. A seeded output does not pre-satisfy a reader-built episode goal (pin):
+ *     hasRun in goal preconditions demands real work, and identity-based
+ *     consumption takes the fresh output, not the decoy.
  */
 class GoalEpisodePhase1Test {
 
@@ -426,6 +440,17 @@ class GoalEpisodePhase1Test {
         fun calibrate(request: CalibrationRequested, tally: Tally, context: ActionContext): CalibrationCompleted {
             context.addObject(ExecutedStep("calibrate:${request.id}"))
             return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Goal action whose satisfying output evolves its own standing state")
+    inner class SelfMaintainedOutputAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration recorded", value = 1.0)
+        fun recordCalibration(request: CalibrationRequested, tally: Tally, context: ActionContext): RunningTally {
+            context.addObject(ExecutedStep("record:${request.id}"))
+            return RunningTally(tally.count + 1)
         }
     }
 
@@ -1113,6 +1138,152 @@ class GoalEpisodePhase1Test {
         val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("calibrate:cal-1", "calibrate:cal-2"), steps, "Each occurrence ran exactly once")
         assertNull(rearmed.last<CalibrationRequested>(), "cal-2 was consumed by a real completion")
+    }
+
+    @Test
+    fun `a goal whose satisfying output is standing state is rejected`() {
+        // The output survives consumption as standing state, so the goal could
+        // never become unsatisfied: completion would loop on an empty plan
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                SelfMaintainedOutputAgent(),
+                "phase1-self-maintained-output",
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(RunningTally::class.java))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                RunningTally(0),
+            )
+        }
+        assertTrue("RunningTally" in exception.message!!, "Error names the standing type: ${exception.message}")
+    }
+
+    @Test
+    fun `a candidate goal sharing its name with another scoped goal is rejected`() {
+        val agent = com.embabel.agent.core.Agent(
+            name = "shared-name-agent",
+            provider = "test",
+            description = "candidate and ordinary goal share a name",
+            actions = emptyList(),
+            goals = setOf(
+                com.embabel.agent.core.Goal(
+                    name = "sharedGoal",
+                    description = "episode candidate",
+                    satisfiedBy = CalibrationCompleted::class.java,
+                ),
+                com.embabel.agent.core.Goal(
+                    name = "sharedGoal",
+                    description = "ordinary goal outside the target",
+                    satisfiedBy = MissionReport::class.java,
+                ),
+            ),
+        )
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "phase1-shared-goal-name",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue(
+            "shares its name" in exception.message!!,
+            "The name collision is what fired, not a later rule: ${exception.message}",
+        )
+    }
+
+    @Test
+    fun `consumeOnCompletion without an episode fails fast`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            EpisodePolicy.NONE.consumeOnCompletion(CalibrationRequested::class.java)
+        }
+        assertTrue("episode" in exception.message!!)
+    }
+
+    @Test
+    fun `consumeOnCompletion twice on one episode fails fast`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            EpisodePolicy
+                .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                .consumeOnCompletion(CalibrationRequested::class.java)
+                .consumeOnCompletion(ZoneInfo::class.java)
+        }
+        assertTrue("already" in exception.message!!, "The overwrite is rejected, not silent: ${exception.message}")
+    }
+
+    @Test
+    fun `a blank named target fails at construction`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            GoalTarget.named("  ")
+        }
+        assertTrue("name" in exception.message!!)
+    }
+
+    @Test
+    fun `a candidate goal without a JVM output type is rejected`() {
+        // Nothing could ever be consumed for this goal, so a completed episode
+        // would stay satisfied and loop
+        val agent = com.embabel.agent.core.Agent(
+            name = "no-output-agent",
+            provider = "test",
+            description = "goal with no output type",
+            actions = emptyList(),
+            goals = setOf(
+                com.embabel.agent.core.Goal(
+                    name = "noOutputGoal",
+                    description = "condition-gated only",
+                ),
+            ),
+        )
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "phase1-no-output-type",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.named("noOutputGoal"))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue("noOutputGoal" in exception.message!!, "Error names the goal: ${exception.message}")
+    }
+
+    @Test
+    fun `a seeded output does not pre-satisfy a reader-built episode goal`() {
+        // Reader-built goals include hasRun of the achieving action in their
+        // preconditions, so a seeded output cannot complete the episode without
+        // real work. The episode runs, consumes its own fresh output by
+        // identity, and the stale decoy merely lingers
+        val process = create(
+            GoapEpisodeOnlyAgent(),
+            "phase1-pre-satisfied",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationCompleted("stale"),
+            CalibrationRequested("cal-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-1"), steps, "Real work ran despite the seeded output")
+        assertNull(result.last<CalibrationRequested>(), "The request was consumed by a real completion")
+        assertEquals("stale", result.last<CalibrationCompleted>()?.id, "The fresh output was consumed; the decoy lingers")
     }
 
     @Test
