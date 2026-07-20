@@ -27,6 +27,7 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
+import com.embabel.agent.core.JvmType
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
 import com.embabel.agent.spi.PlannerFactory
@@ -64,6 +65,13 @@ open class SimpleAgentProcess(
     override val planner: Planner<*, *, *> = plannerFactory.createPlanner(processOptions, worldStateDeterminer)
 
     /**
+     * Episode policy resolved against the process scope.
+     * Resolution validates the policy, so invalid configuration fails here at construction.
+     */
+    private val resolvedEpisodes: List<ResolvedEpisode> =
+        EpisodeResolution.resolve(processOptions.episodes, agent)
+
+    /**
      * Actions to exclude from the next planning cycle.
      * Used to prevent infinite loops when an action requests replan but
      * would be the only applicable action again.
@@ -96,6 +104,11 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
+        val episode = resolvedEpisodes.firstOrNull { it.matches(plan.goal.name) }
+        if (episode != null) {
+            completeEpisode(episode, plan, worldState)
+            return
+        }
         logger.debug(
             "✅ Process {} completed, achieving goal {} in {} seconds",
             this.id,
@@ -111,6 +124,40 @@ open class SimpleAgentProcess(
         )
         logger.debug("Final blackboard: {}", blackboard.infoString())
         setStatus(AgentProcessStatusCode.COMPLETED)
+    }
+
+    /**
+     * Completes a goal episode without completing the process: consumes the
+     * request occurrence and the satisfying output by hiding them, then keeps
+     * the process running so ordinary selection resumes at the next planning tick.
+     * The latest visible occurrence is consumed, matching the default binding
+     * the completing action received.
+     */
+    private fun completeEpisode(
+        episode: ResolvedEpisode,
+        plan: Plan,
+        worldState: WorldState,
+    ) {
+        logger.debug(
+            "🔁 Process {} completed episode goal {}; consuming and continuing",
+            this.id,
+            plan.goal.name,
+        )
+        platformServices.eventListener.onProcessEvent(
+            GoalAchievedEvent(
+                agentProcess = this,
+                worldState = worldState,
+                goal = plan.goal,
+            )
+        )
+        blackboard.objects.lastOrNull { episode.consumes.isInstance(it) }
+            ?.let { blackboard.hide(it) }
+        val outputClass = (episode.goalsByName[plan.goal.name]?.outputType as? JvmType)?.clazz
+        if (outputClass != null) {
+            blackboard.objects.lastOrNull { outputClass.isInstance(it) }
+                ?.let { blackboard.hide(it) }
+        }
+        setStatus(AgentProcessStatusCode.RUNNING)
     }
 
     protected fun sendProcessRunningEvent(

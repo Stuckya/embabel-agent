@@ -213,6 +213,10 @@ constructor(
  * @param toolCallContext out-of-band metadata (e.g., auth tokens, tenant IDs) passed to tools
  * at call time. This context is propagated to all tools, including MCP tools where it bridges
  * to Spring AI's ToolContext and ultimately to MCP's McpMeta.
+ * @param episodes episode policy for this process. Declared goals matched by the policy
+ * become repeatable nonterminal episodes: completing one consumes its request occurrence
+ * and satisfying output rather than completing the process. Empty preserves
+ * ordinary goal completion behavior.
  */
 data class ProcessOptions @JvmOverloads constructor(
     val contextId: ContextId? = null,
@@ -231,6 +235,7 @@ data class ProcessOptions @JvmOverloads constructor(
     val outputChannel: OutputChannel = DevNullOutputChannel,
     val plannerType: PlannerType = PlannerType.GOAP,
     val toolCallContext: ToolCallContext = ToolCallContext.EMPTY,
+    val episodes: EpisodePolicy = EpisodePolicy.NONE,
 ) {
 
     /**
@@ -301,6 +306,9 @@ data class ProcessOptions @JvmOverloads constructor(
      */
     fun withToolCallContext(context: Map<String, Any>): ProcessOptions =
         this.copy(toolCallContext = ToolCallContext.of(context))
+
+    fun withEpisodes(episodes: EpisodePolicy): ProcessOptions =
+        this.copy(episodes = episodes)
 
     companion object {
 
