@@ -21,6 +21,7 @@ import com.embabel.agent.core.Episode
 import com.embabel.agent.core.EpisodePolicy
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalTarget
+import com.embabel.agent.core.IoBinding
 import com.embabel.agent.core.JvmType
 import com.embabel.plan.common.condition.ConditionDetermination
 import com.embabel.plan.common.condition.EffectSpec
@@ -66,15 +67,9 @@ internal object EpisodeResolution {
                     duplicated.joinToString { it.name }
         }
         val goalOwner = mutableMapOf<String, Class<*>>()
-        resolved.forEach { episode ->
-            episode.goalsByName.keys.forEach { goalName ->
-                val prior = goalOwner.putIfAbsent(goalName, episode.consumes)
-                require(prior == null) {
-                    "Episodes consuming ${prior?.name} and ${episode.consumes.name} both resolve to " +
-                            "declared goal $goalName; each declared goal may belong to only one episode"
-                }
-            }
-        }
+        resolved
+            .flatMap { episode -> episode.goalsByName.keys.map { it to episode.consumes } }
+            .forEach { (goalName, consumes) -> requireSingleOwner(goalOwner, goalName, consumes) }
         return resolved
     }
 
@@ -82,19 +77,7 @@ internal object EpisodeResolution {
         require(!episode.interruptsCurrentAction) {
             "interruptsCurrentAction is not yet supported: cooperative interruption is a later phase"
         }
-        val candidates = when (val target = episode.target) {
-            is GoalTarget.Named -> agent.goals.filter { it.name == target.goalName }.also { matches ->
-                require(matches.size <= 1) {
-                    "Episode target ${episode.target} resolves to ${matches.size} declared goals; " +
-                            "a named target must identify exactly one"
-                }
-            }
-
-            is GoalTarget.Output -> agent.goals.filter { goal ->
-                val outputType = goal.outputType
-                outputType is JvmType && target.satisfiedByType.isAssignableFrom(outputType.clazz)
-            }
-        }
+        val candidates = candidatesFor(episode, agent)
         require(candidates.isNotEmpty()) {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }}"
@@ -114,6 +97,38 @@ internal object EpisodeResolution {
                     .mapNotNull { loadClassOrNull(it) }
             },
         )
+    }
+
+    private fun candidatesFor(episode: Episode, agent: Agent): List<Goal> =
+        when (val target = episode.target) {
+            is GoalTarget.Named -> namedCandidates(episode, target, agent)
+            is GoalTarget.Output -> agent.goals.filter { satisfiesOutputTarget(it, target) }
+        }
+
+    private fun namedCandidates(episode: Episode, target: GoalTarget.Named, agent: Agent): List<Goal> {
+        val matches = agent.goals.filter { it.name == target.goalName }
+        require(matches.size <= 1) {
+            "Episode target ${episode.target} resolves to ${matches.size} declared goals; " +
+                    "a named target must identify exactly one"
+        }
+        return matches
+    }
+
+    private fun satisfiesOutputTarget(goal: Goal, target: GoalTarget.Output): Boolean {
+        val outputType = goal.outputType
+        return outputType is JvmType && target.satisfiedByType.isAssignableFrom(outputType.clazz)
+    }
+
+    private fun requireSingleOwner(
+        goalOwner: MutableMap<String, Class<*>>,
+        goalName: String,
+        consumes: Class<*>,
+    ) {
+        val prior = goalOwner.putIfAbsent(goalName, consumes)
+        require(prior == null) {
+            "Episodes consuming ${prior?.name} and ${consumes.name} both resolve to " +
+                    "declared goal $goalName; each declared goal may belong to only one episode"
+        }
     }
 
     private data class GoalChain(
@@ -141,25 +156,31 @@ internal object EpisodeResolution {
         while (toWalk.isNotEmpty()) {
             val condition = toWalk.removeFirst()
             if (!visited.add(condition)) continue
-            val producers = agent.actions.filter {
-                it.effects[condition] == ConditionDetermination.TRUE
-            }
+            val producers = agent.actions.filter { producesCondition(it, condition) }
             if (producers.isEmpty()) {
-                if (":" in condition) {
-                    offChainInputTypes.add(condition.substringAfterLast(":"))
-                }
-            } else {
-                producers.forEach { producer ->
-                    if (chainActions.add(producer)) {
-                        toWalk.addAll(requiredConditions(producer.preconditions))
-                    }
-                }
+                inputBindingType(condition)?.let { offChainInputTypes.add(it) }
+                continue
             }
+            producers
+                .filter { chainActions.add(it) }
+                .forEach { toWalk.addAll(requiredConditions(it.preconditions)) }
         }
         return GoalChain(
             offChainInputTypes = offChainInputTypes,
             productTypes = chainActions.flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } },
         )
+    }
+
+    private fun producesCondition(action: Action, condition: String): Boolean =
+        action.effects[condition] == ConditionDetermination.TRUE
+
+    /**
+     * The type of an input-binding condition, or null for a named condition.
+     * Parsing delegates to [IoBinding] so the binding format has one owner.
+     */
+    private fun inputBindingType(condition: String): String? {
+        if (":" !in condition) return null
+        return IoBinding(condition).type
     }
 
     private fun requiredConditions(spec: EffectSpec): List<String> =
@@ -201,14 +222,14 @@ internal object EpisodeResolution {
      * and requires explicit consumeOnCompletion.
      */
     private fun inferConsumes(episode: Episode, offChainInputTypes: Set<String>): Class<*> {
+        require(offChainInputTypes.isNotEmpty()) {
+            "Cannot infer the consumed request for episode target ${episode.target}: " +
+                    "the goal path has no off-chain input. Specify consumeOnCompletion explicitly"
+        }
         require(offChainInputTypes.size == 1) {
-            if (offChainInputTypes.isEmpty())
-                "Cannot infer the consumed request for episode target ${episode.target}: " +
-                        "the goal path has no off-chain input. Specify consumeOnCompletion explicitly"
-            else
-                "Cannot infer the consumed request for episode target ${episode.target}: " +
-                        "the goal path has multiple off-chain inputs: ${offChainInputTypes.joinToString()}. " +
-                        "Specify consumeOnCompletion explicitly"
+            "Cannot infer the consumed request for episode target ${episode.target}: " +
+                    "the goal path has multiple off-chain inputs: ${offChainInputTypes.joinToString()}. " +
+                    "Specify consumeOnCompletion explicitly"
         }
         val typeName = offChainInputTypes.single()
         return loadClassOrNull(typeName)

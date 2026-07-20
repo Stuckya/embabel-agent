@@ -151,13 +151,18 @@ open class SimpleAgentProcess(
                 goal = plan.goal,
             )
         )
-        blackboard.objects.lastOrNull { episode.consumes.isInstance(it) }
-            ?.let { blackboard.hide(it) }
-        episode.productsFor(plan.goal.name).forEach { productType ->
-            blackboard.objects.lastOrNull { productType.isInstance(it) }
-                ?.let { blackboard.hide(it) }
-        }
+        consumeLatest(episode.consumes)
+        episode.productsFor(plan.goal.name).forEach { consumeLatest(it) }
         setStatus(AgentProcessStatusCode.RUNNING)
+    }
+
+    /**
+     * Hides the latest visible instance of the given type, if any,
+     * matching the default binding the completing action received.
+     */
+    private fun consumeLatest(type: Class<*>) {
+        blackboard.objects.lastOrNull { type.isInstance(it) }
+            ?.let { blackboard.hide(it) }
     }
 
     protected fun sendProcessRunningEvent(
