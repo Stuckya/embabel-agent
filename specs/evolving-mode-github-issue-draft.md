@@ -53,7 +53,7 @@ The more emergent reading of the README arrives later through Open Evolving: val
 
 A `@Condition` remains the right model for current truth. Evolving episodes are for selected facts that represent a unit of follow-up work to handle once. The framework should own that completion and rearm bookkeeping rather than require lifecycle-only actions, manual blackboard hiding, and value tuning in each consumer application.
 
-In AIMA terms (3e, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for hand-tuned search guidance: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Heuristics estimate cost within plan search; preferences between competing goals remain utility values. Deriving search guidance from the condition graph is a future issue beyond this epic.
+In the terms of Russell and Norvig's *Artificial Intelligence: A Modern Approach* (AIMA, 3rd edition, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for hand-tuned search guidance: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Heuristics estimate cost within plan search; preferences between competing goals remain utility values. Deriving search guidance from the condition graph is a future issue beyond this epic.
 
 ### Proposed Work Streams
 
@@ -65,7 +65,7 @@ As discussed in #1725, I've split this into work streams. They do not have to be
 4. Cooperative interruption of the running action
 5. Open Evolving: `ObjectiveAuthor` re-authoring at a planning tick
 6. Process-local scope expansion
-7. Recurring goal episodes for native pure-GOAP standing work — maintenance goals, in AIMA's sense; event-driven waiting ships with ingress (2)
+7. Recurring goal episodes for native pure-GOAP standing work. AIMA calls these maintenance goals. Event-driven waiting ships with ingress (2)
 8. Example application
 
 ### Motivating Example
@@ -257,10 +257,7 @@ Waiting itself already exists. An action can call the existing `waitFor(awaitabl
 
 ### Objective Author Relationship
 
-I see two useful evolving shapes:
-
-- **Deterministic Evolving** — existing invocation paths receive an episode policy through `ProcessOptions`. The policy identifies known declared goals whose completion should be nonterminal and repeatable for configured request types.
-- **Open Evolving** — a later `ProcessOptions.withObjectiveAuthor(...)` may use Open-style deliberation to author an `ObjectivePolicy`. An optional `EvolvingInvocation` can provide fluent sugar over the same option. It is the generic re-authoring mechanism for what no predefined rule covers: an unknown blocker, no viable plan, or unresolved runtime facts at a planning tick. It should not require predeclared per-type hooks like `.onUnhandledFact(X.class)`. That would just be Deterministic Evolving with extra steps.
+The two shapes from the intro map to two process options. Deterministic Evolving is `ProcessOptions.withEpisodes(...)`. Open Evolving is a later `ProcessOptions.withObjectiveAuthor(...)`: Open-style deliberation authors an `ObjectivePolicy`, and an optional `EvolvingInvocation` can provide fluent sugar over the same option. Open Evolving covers what no predefined rule can. An unknown blocker. No viable plan. Unresolved runtime facts at a planning tick. It should not require predeclared per-type hooks like `.onUnhandledFact(X.class)`. That would just be Deterministic Evolving with extra steps.
 
 This should follow Open mode's discipline: LLM-backed authoring can rank or select among declared scoped goals and propose objective-specific policy, but execution only uses validated scope objects.
 
@@ -284,7 +281,6 @@ The `ObjectiveAuthor` should not need to remember universal safety and recovery 
 
 Maintainer input would be helpful on these decisions.
 
-- **Does the immutable-declared interpretation match the README's intent?**
 - **Which method name spellings should ship?** `EpisodePolicy`, `withEpisodes`, `episode`, `consumeOnCompletion`, `GoalTarget.output(...)`, `GoalTarget.named(...)`, and `ingress()` are illustrative. Their semantics are settled and tested; the type and method names are the open part, following the existing immutable `ProcessOptions` wither pattern.
 - **How do `withObjectiveAuthor(...)` and an explicit episode policy combine?** Policy Sources assumes they merge into one validated `ObjectivePolicy` at launch. The open part is phase-5 conflict handling when both bind the same request type or goal.
 
