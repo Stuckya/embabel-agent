@@ -53,7 +53,7 @@ The more emergent reading of the README arrives later through Open Evolving: val
 
 A `@Condition` remains the right model for current truth. Evolving episodes are for selected facts that represent a unit of follow-up work to handle once. The framework should own that completion and rearm bookkeeping rather than require lifecycle-only actions, manual blackboard hiding, and value tuning in each consumer application.
 
-In AIMA terms (3e, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for value tuning: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Deriving planner guidance from the condition graph is a future issue beyond this epic.
+In AIMA terms (3e, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for hand-tuned search guidance: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Heuristics estimate cost within plan search; preferences between competing goals remain utility values. Deriving search guidance from the condition graph is a future issue beyond this epic.
 
 ### Proposed Work Streams
 
@@ -183,6 +183,7 @@ Surface rules, gathered from the sections below:
 - Nonterminal completion and consumption are one contract, never two switches.
 - An empty policy preserves today's behavior exactly.
 - Recognition point: `SimpleAgentProcess.handleProcessCompletion(...)`, already shared by simple and concurrent processes.
+- Completion emits `EpisodeCompletedEvent`, a `GoalAchievedEvent` subtype following the platform's event-hierarchy idiom: existing listeners keep matching, new ones distinguish episodic from terminal achievement by type.
 
 Not phase 1: `ingress()` (phase 2, Sub-Issue 2), an `interruptsCurrentAction` episode field (phase 4 adds it), `withObjectiveAuthor(...)` (phase 5), `recurring(...)` (work stream 7).
 
@@ -252,7 +253,7 @@ Episode goals are the nonterminal exception. Ordinary declared goals retain exis
 
 An optional `CompletionPolicy` may later provide invocation-level ergonomics for objectives that do not map cleanly to one declared terminal goal. It is not required for the phase-1 episode lifecycle.
 
-Waiting itself already exists. An action can call the existing `waitFor(awaitable)`: it declares the awaited type as its return type so the planner can route through it, the process parks `WAITING` with the awaitable on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it. The baseline tests show both halves: a `STUCK` GOAP process resumes manually after `addObject` and `run()`, and a `waitFor` action parks `WAITING` instead of `STUCK` and resumes straight into the goal. What is missing is only the wake — the resume is driver-owned today. That contract ships with external ingress (phase 2). Waiting permits externally driven episodes; it does not make pure GOAP execute standing work on its own (that is work stream 7).
+Waiting itself already exists. An action can call the existing `waitFor(awaitable)`: it declares the awaited type as its return type so the planner can route through it, the process parks `WAITING` with the awaitable on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it. The baseline tests show both halves: a `STUCK` GOAP process resumes manually after `addObject` and `run()`, and a `waitFor` action parks `WAITING` instead of `STUCK` and resumes straight into the goal. What is missing is only the wake — the resume is driver-owned today. The platform's existing `StuckHandler` covers the other half of recovery: an agent-supplied hook that fires at the moment a process becomes stuck and may repair state and replan. It is stuck-time and pull-based, so it cannot wake a long-parked process when a fact arrives later; that publication-time half is what ships with external ingress (phase 2). Waiting permits externally driven episodes; it does not make pure GOAP execute standing work on its own (that is work stream 7).
 
 ### Objective Author Relationship
 
@@ -323,6 +324,7 @@ Maintainer input would be helpful on these decisions.
 | The run discovers an unknown blocker or has no viable plan. | Open Evolving: `ObjectiveAuthor` re-authoring at a validated planning tick | `ZoneAccessBlocked(missingRequirement = Permit("P-42"))` -> propose runtime goal `PermitObtained` with a typed target |
 | A reaction should fire off the latest result, no lifecycle needed. | `@Action(trigger = X.class)` | A notification action firing when `X` was just produced |
 | The process must wait for a solicited external response. | Existing `waitFor` / `Awaitable` | An action promising `SensorCalibrationRequested` parks `WAITING` until the response arrives |
+| The process should try to repair itself the moment it becomes stuck. | Existing `StuckHandler` on the agent | A handler seeding a missing fact and replanning |
 | Work needs explicit phases scoping which actions are available. | `@State`; composes with episodes | Calibration actions available, storage actions not, while calibration is in flight |
 | The only reason is "an event happened." | Usually not enough for Evolving | Project current truth into application state, then expose it through `@Condition` or action inputs |
 
@@ -454,6 +456,7 @@ Acceptance criteria:
 - self-maintained facts and other off-chain inputs survive episode completion
 - a later distinct request makes the episode eligible again and is not pre-satisfied by the earlier output
 - ordinary declared goals retain existing goal-completes-process behavior
+- episode completion emits `EpisodeCompletedEvent` and never a process-finished event; terminal completion emits both
 - empty episode policy preserves ordinary goal completion and all other current behavior
 - nonterminal completion and request/output consumption cannot be configured as independent behaviors
 - consumption is inferred only when the goal path has exactly one off-chain input; anything else requires explicit `consumeOnCompletion`
@@ -540,7 +543,7 @@ Publication to an eligible parked process should schedule a platform-owned re-ru
 
 Waking is not a publish side-effect. `publish` enqueues and returns a receipt; the platform maintains the invariant that an eligible parked process with undrained publications is scheduled to reach a planning tick. Several accepted publications may satisfy the invariant with one wake while preserving FIFO drain order.
 
-The delivery and resume mechanics already exist in the `Awaitable` machinery: `waitFor` parks a process `WAITING` with the awaitable stored on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it — today that resume is driver-owned (the wiki's REST MVC pattern; baseline test 9). This sub-issue moves that resume into the platform rather than defining a second scheduler or another process status. A publication whose type matches a pending typed-fact awaitable resolves it: ingress is effectively an `AwaitableResponse` without a form.
+The delivery and resume mechanics already exist in the `Awaitable` machinery: `waitFor` parks a process `WAITING` with the awaitable stored on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it — today that resume is driver-owned (the wiki's REST MVC pattern; baseline test 9). The recovery shape exists too: `StuckHandler` already repairs state and replans through `REPLAN` and `run()`, but it fires only at the moment a process becomes stuck. This sub-issue therefore proposes a when, not a new recovery mechanism: the platform re-drives the existing resume path when a publication arrives for a parked process, rather than defining a second scheduler or another process status. A publication whose type matches a pending typed-fact awaitable resolves it: ingress is effectively an `AwaitableResponse` without a form.
 
 Core sugar worth shipping alongside the handle: `awaitFact(SensorCalibrationRequested.class)` — a canned typed-fact awaitable joining the existing `confirm()` / `fromForm()` family in `wait.kt`, replacing the custom `Awaitable`/`AwaitableResponse` boilerplate the baseline test needed.
 
@@ -653,7 +656,7 @@ Useful lifecycle transitions:
 - episode configuration accepted or rejected during scope validation
 - request occurrence observed
 - candidate goal selected
-- episode goal completed
+- episode goal completed (phase 1 already emits `EpisodeCompletedEvent`, a `GoalAchievedEvent` subtype, so episodic and terminal achievement are distinguishable by type)
 - request and chain products consumed
 - episode rearmed for a later request
 - episode action or plan failed
@@ -835,7 +838,8 @@ Mechanism:
 
 - `.recurring(target)` marks a declared goal as recurring and implies rearm on completion. The spelling is illustrative.
 - On completion, the satisfying output is hidden before the next episode so the goal is not already satisfied.
-- A declared terminal goal or optional completion policy decides when recurrence stops.
+- Rearm rides the existing `canRerun` contract, exactly as in phase 1: every action the next episode needs must be rerunnable.
+- A declared terminal goal or optional completion policy decides when recurrence stops. Stopping must not ride relative goal values: the recurring path is gated by the inverse of the terminal condition, or the completion policy is checked before rearm, so a satisfied stop condition makes recurrence unavailable rather than merely out-valued.
 - Consuming the satisfying outputs keeps the next episode from being pre-satisfied by the previous episode's output.
 - A blocked recurring episode follows existing plan-not-found behavior unless phase 2's ingress/wake defines a parked state.
 - Interrupted episodes replan. No suspended plan stack is restored.
