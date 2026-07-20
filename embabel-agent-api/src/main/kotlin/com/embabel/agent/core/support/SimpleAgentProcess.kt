@@ -153,7 +153,7 @@ open class SimpleAgentProcess(
         )
         blackboard.objects.lastOrNull { episode.consumes.isInstance(it) }
             ?.let { blackboard.hide(it) }
-        episode.consumedProducts.forEach { productType ->
+        episode.productsFor(plan.goal.name).forEach { productType ->
             blackboard.objects.lastOrNull { productType.isInstance(it) }
                 ?.let { blackboard.hide(it) }
         }

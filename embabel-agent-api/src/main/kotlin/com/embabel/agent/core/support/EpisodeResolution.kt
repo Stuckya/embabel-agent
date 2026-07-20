@@ -15,32 +15,38 @@
  */
 package com.embabel.agent.core.support
 
+import com.embabel.agent.core.Action
 import com.embabel.agent.core.Agent
 import com.embabel.agent.core.Episode
 import com.embabel.agent.core.EpisodePolicy
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.JvmType
+import com.embabel.plan.common.condition.ConditionDetermination
+import com.embabel.plan.common.condition.EffectSpec
 
 /**
  * An [Episode] resolved against the goals and actions of a process scope.
  * @param goalsByName the candidate declared goals, keyed by name
  * @param consumes the resolved request type, explicit or inferred
- * @param consumedProducts the types manufactured on the episode's goal path,
- * consumed alongside the request when the episode completes. Includes the
- * satisfying output and any intermediates, so a stale intermediate cannot
- * shortcut the next occurrence's plan. Self-maintained state (a type some
- * action both consumes and produces, such as an accumulator) is never an
- * episode product and survives completion.
+ * @param productsByGoal for each candidate goal, the types manufactured on its
+ * chain, consumed alongside the request when that candidate completes. Includes
+ * the satisfying output and any intermediates, so a stale intermediate cannot
+ * shortcut the next occurrence's plan. Consumption is scoped to the completed
+ * candidate; another candidate's products are not touched. Self-maintained
+ * facts (a type some action both consumes and produces, such as an accumulator)
+ * are never episode products and survive completion.
  */
 internal data class ResolvedEpisode(
     val episode: Episode,
     val goalsByName: Map<String, Goal>,
     val consumes: Class<*>,
-    val consumedProducts: List<Class<*>>,
+    val productsByGoal: Map<String, List<Class<*>>>,
 ) {
 
     fun matches(goalName: String): Boolean = goalName in goalsByName
+
+    fun productsFor(goalName: String): List<Class<*>> = productsByGoal[goalName] ?: emptyList()
 
 }
 
@@ -59,6 +65,16 @@ internal object EpisodeResolution {
             "Each request type may drive only one episode; consumed by multiple episodes: " +
                     duplicated.joinToString { it.name }
         }
+        val goalOwner = mutableMapOf<String, Class<*>>()
+        resolved.forEach { episode ->
+            episode.goalsByName.keys.forEach { goalName ->
+                val prior = goalOwner.putIfAbsent(goalName, episode.consumes)
+                require(prior == null) {
+                    "Episodes consuming ${prior?.name} and ${episode.consumes.name} both resolve to " +
+                            "declared goal $goalName; each declared goal may belong to only one episode"
+                }
+            }
+        }
         return resolved
     }
 
@@ -67,7 +83,13 @@ internal object EpisodeResolution {
             "interruptsCurrentAction is not yet supported: cooperative interruption is a later phase"
         }
         val candidates = when (val target = episode.target) {
-            is GoalTarget.Named -> agent.goals.filter { it.name == target.goalName }
+            is GoalTarget.Named -> agent.goals.filter { it.name == target.goalName }.also { matches ->
+                require(matches.size <= 1) {
+                    "Episode target ${episode.target} resolves to ${matches.size} declared goals; " +
+                            "a named target must identify exactly one"
+                }
+            }
+
             is GoalTarget.Output -> agent.goals.filter { goal ->
                 val outputType = goal.outputType
                 outputType is JvmType && target.satisfiedByType.isAssignableFrom(outputType.clazz)
@@ -77,51 +99,71 @@ internal object EpisodeResolution {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }}"
         }
-        val chain = analyzeChain(candidates, agent)
-        val consumes = episode.consumes ?: inferConsumes(episode, chain)
+        val chains = candidates.associate { it.name to analyzeGoalChain(it, agent) }
+        val offChainInputTypes = chains.values.flatMapTo(linkedSetOf()) { it.offChainInputTypes }
+        val consumes = episode.consumes
+            ?.also { validateExplicitConsumes(episode, it, offChainInputTypes) }
+            ?: inferConsumes(episode, offChainInputTypes)
         return ResolvedEpisode(
             episode = episode,
             goalsByName = candidates.associateBy { it.name },
             consumes = consumes,
-            consumedProducts = chain.products
-                .filterNot { isSelfMaintained(it, agent) }
-                .mapNotNull { loadClassOrNull(it) },
+            productsByGoal = chains.mapValues { (_, chain) ->
+                chain.productTypes
+                    .filterNot { isSelfMaintained(it, agent) }
+                    .mapNotNull { loadClassOrNull(it) }
+            },
         )
     }
 
-    private data class ChainAnalysis(
-        /** Input types on the goal path that no scoped action produces */
-        val offChainInputs: Set<String>,
-        /** Output types manufactured on the goal path, satisfying output included */
-        val products: Set<String>,
+    private data class GoalChain(
+        /** Input types on the goal path that no scoped action's effects can satisfy */
+        val offChainInputTypes: Set<String>,
+        /** Output types declared by the chain's actions, satisfying output included */
+        val productTypes: Set<String>,
     )
 
     /**
-     * Walk the candidate goals' producing actions transitively. Anything the
-     * walk manufactures is a product of the episode's plan chain; any input no
-     * scoped action produces is an off-chain observation.
+     * Walk the condition graph the planner searches: from the goal's
+     * preconditions to the actions whose effects satisfy them, then those
+     * actions' preconditions, transitively. Action effects already encode the
+     * planner's assignability rules (subtype and supertype outputs), so chain
+     * membership here matches what the planner can actually route. An
+     * input-binding condition no scoped action's effects satisfy is an
+     * off-chain input: an observation the planner cannot manufacture. Named
+     * conditions without producers are current truth and belong to neither set.
      */
-    private fun analyzeChain(candidates: List<Goal>, agent: Agent): ChainAnalysis {
-        val producedTypes = agent.actions.flatMap { action -> action.outputs.map { it.type } }.toSet()
-        val offChainInputs = linkedSetOf<String>()
-        val walked = linkedSetOf<String>()
-        val toWalk = ArrayDeque(candidates.mapNotNull { (it.outputType as? JvmType)?.className })
+    private fun analyzeGoalChain(goal: Goal, agent: Agent): GoalChain {
+        val offChainInputTypes = linkedSetOf<String>()
+        val chainActions = linkedSetOf<Action>()
+        val visited = mutableSetOf<String>()
+        val toWalk = ArrayDeque(requiredConditions(goal.preconditions))
         while (toWalk.isNotEmpty()) {
-            val outputType = toWalk.removeFirst()
-            if (!walked.add(outputType)) continue
-            agent.actions
-                .filter { action -> action.outputs.any { it.type == outputType } }
-                .flatMap { it.inputs }
-                .forEach { input ->
-                    if (input.type in producedTypes) {
-                        toWalk.add(input.type)
-                    } else {
-                        offChainInputs.add(input.type)
+            val condition = toWalk.removeFirst()
+            if (!visited.add(condition)) continue
+            val producers = agent.actions.filter {
+                it.effects[condition] == ConditionDetermination.TRUE
+            }
+            if (producers.isEmpty()) {
+                if (":" in condition) {
+                    offChainInputTypes.add(condition.substringAfterLast(":"))
+                }
+            } else {
+                producers.forEach { producer ->
+                    if (chainActions.add(producer)) {
+                        toWalk.addAll(requiredConditions(producer.preconditions))
                     }
                 }
+            }
         }
-        return ChainAnalysis(offChainInputs = offChainInputs, products = walked)
+        return GoalChain(
+            offChainInputTypes = offChainInputTypes,
+            productTypes = chainActions.flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } },
+        )
     }
+
+    private fun requiredConditions(spec: EffectSpec): List<String> =
+        spec.filterValues { it == ConditionDetermination.TRUE }.keys.toList()
 
     /**
      * A type an action both consumes and produces is self-maintained standing
@@ -133,23 +175,42 @@ internal object EpisodeResolution {
         }
 
     /**
+     * The consumed request must be something the goal path actually observes:
+     * an off-chain input. Consuming an unrelated type would leave the real
+     * request visible, so the episode could fire again without new work.
+     */
+    private fun validateExplicitConsumes(
+        episode: Episode,
+        explicit: Class<*>,
+        offChainInputTypes: Set<String>,
+    ) {
+        val matchesOffChainInput = offChainInputTypes
+            .mapNotNull { loadClassOrNull(it) }
+            .any { offChain -> offChain.isAssignableFrom(explicit) || explicit.isAssignableFrom(offChain) }
+        require(matchesOffChainInput) {
+            "Episode target ${episode.target} cannot consume ${explicit.name}: it is not an off-chain " +
+                    "input of the goal path. Off-chain inputs: " +
+                    offChainInputTypes.joinToString().ifEmpty { "none" }
+        }
+    }
+
+    /**
      * Infer the consumed request type as the single off-chain input on the goal
      * path. Such an input is an observation rather than a plannable product,
      * which is exactly what a request occurrence is. Anything else is ambiguous
      * and requires explicit consumeOnCompletion.
      */
-    private fun inferConsumes(episode: Episode, chain: ChainAnalysis): Class<*> {
-        val offChainInputs = chain.offChainInputs
-        require(offChainInputs.size == 1) {
-            if (offChainInputs.isEmpty())
+    private fun inferConsumes(episode: Episode, offChainInputTypes: Set<String>): Class<*> {
+        require(offChainInputTypes.size == 1) {
+            if (offChainInputTypes.isEmpty())
                 "Cannot infer the consumed request for episode target ${episode.target}: " +
                         "the goal path has no off-chain input. Specify consumeOnCompletion explicitly"
             else
                 "Cannot infer the consumed request for episode target ${episode.target}: " +
-                        "the goal path has multiple off-chain inputs: ${offChainInputs.joinToString()}. " +
+                        "the goal path has multiple off-chain inputs: ${offChainInputTypes.joinToString()}. " +
                         "Specify consumeOnCompletion explicitly"
         }
-        val typeName = offChainInputs.single()
+        val typeName = offChainInputTypes.single()
         return loadClassOrNull(typeName)
             ?: throw IllegalArgumentException(
                 "Cannot infer the consumed request for episode target ${episode.target}: " +

@@ -50,6 +50,12 @@ interface CalibrationOutcome {
 data class QuickCalibration(override val id: String) : CalibrationOutcome
 data class FullCalibration(override val id: String) : CalibrationOutcome
 
+interface SensorKit {
+    val id: String
+}
+
+data class SpecificSensorKit(override val id: String) : SensorKit
+
 /**
  * Phase-1 episode lifecycle for issue #1756, driving the contract test-first:
  * 1. HYBRID: an episode policy replaces the hand-rolled lifecycle of the baseline —
@@ -78,6 +84,21 @@ data class FullCalibration(override val id: String) : CalibrationOutcome
  *     intermediate cannot shortcut the next occurrence's plan.
  * 14. Consumption never touches standing state: a self-maintained accumulator
  *     feeding the chain survives episode completion.
+ * 15. Chain analysis matches the planner's assignability rules: a producer
+ *     returning a subtype satisfies a supertype consumer, so inference and
+ *     consumption must traverse it (two tests: inference, consumption).
+ * 16. An explicit consume type that is not an off-chain input of the episode's
+ *     chain fails fast instead of silently consuming nothing.
+ * 17. Two episodes resolving to the same declared goal fail fast: without
+ *     occurrence tracking, completion could pair the wrong request.
+ * 18. Consumption is scoped to the completed candidate's chain: another
+ *     candidate's output type visible on the blackboard survives.
+ * 19. Distinct-but-equal request occurrences coalesce: Blackboard.hide is
+ *     equality-based on main, so one completion consumes every equal
+ *     occurrence (pin; occurrence identity is the consumer's responsibility).
+ * 20. A non-rerunnable intermediate makes the whole episode one-shot, exactly
+ *     like a non-rerunnable completing action (pin).
+ * 21. A named target matching duplicate goal identities fails fast.
  */
 class GoalEpisodePhase1Test {
 
@@ -244,6 +265,76 @@ class GoalEpisodePhase1Test {
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, zone: ZoneInfo): CalibrationCompleted =
             CalibrationCompleted("${request.id}@${zone.name}")
+    }
+
+    @Agent(description = "Two-step path whose intermediate is consumed through a supertype")
+    inner class SubtypeChainAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepKit(request: CalibrationRequested, context: ActionContext): SpecificSensorKit {
+            context.addObject(ExecutedStep("prepKit:${request.id}"))
+            return SpecificSensorKit(request.id)
+        }
+
+        // The planner routes SpecificSensorKit into SensorKit via assignable effects
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: SensorKit, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${kit.id}"))
+            return CalibrationCompleted(kit.id)
+        }
+    }
+
+    @Agent(description = "Two candidate outcome goals, one gated off by a condition")
+    inner class GatedCandidateAgent {
+
+        @Condition(name = "fullEligible")
+        fun fullEligible(tally: SampleTally): Boolean = tally.count >= 100
+
+        @Action(value = 0.9)
+        @AchievesGoal(description = "Quick calibration", value = 1.0)
+        fun quickCal(request: CalibrationRequested, context: ActionContext): QuickCalibration {
+            context.addObject(ExecutedStep("quickCal:${request.id}"))
+            return QuickCalibration(request.id)
+        }
+
+        @Action(pre = ["fullEligible"], value = 0.3)
+        @AchievesGoal(description = "Full calibration", value = 0.4)
+        fun fullCal(request: CalibrationRequested, context: ActionContext): FullCalibration {
+            context.addObject(ExecutedStep("fullCal:${request.id}"))
+            return FullCalibration(request.id)
+        }
+    }
+
+    @Agent(description = "Two distinct goals driven by the same request type")
+    inner class DualRequestGoalAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested): CalibrationCompleted =
+            CalibrationCompleted(request.id)
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Calibration audited", value = 0.8)
+        fun audit(request: CalibrationRequested): CalibrationArchived =
+            CalibrationArchived(request.id)
+    }
+
+    @Agent(description = "Two-step calibration whose intermediate step is one-shot")
+    inner class OneShotIntermediateAgent {
+
+        @Action(value = 0.5)
+        fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
+            context.addObject(ExecutedStep("prepKit:${request.id}"))
+            return CalibrationKit(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${kit.id}"))
+            return CalibrationCompleted(kit.id)
+        }
     }
 
     private fun create(
@@ -454,20 +545,22 @@ class GoalEpisodePhase1Test {
 
     @Test
     fun `two episodes consuming the same request type fail fast`() {
+        // Both chains legitimately observe the request; the duplicate consume is the error
         val exception = assertThrows<IllegalArgumentException> {
             create(
-                EpisodeLifecycleAgent(),
+                DualRequestGoalAgent(),
                 "phase1-duplicate-consumes",
                 ProcessOptions.DEFAULT.withEpisodes(
                     EpisodePolicy
                         .episode(GoalTarget.output(CalibrationCompleted::class.java))
                         .consumeOnCompletion(CalibrationRequested::class.java)
-                        .episode(GoalTarget.output(MissionReport::class.java))
+                        .episode(GoalTarget.output(CalibrationArchived::class.java))
                         .consumeOnCompletion(CalibrationRequested::class.java)
                 ),
             )
         }
         assertTrue("CalibrationRequested" in exception.message!!)
+        assertTrue("only one episode" in exception.message!!, "The duplicate rule is what fired: ${exception.message}")
     }
 
     @Test
@@ -558,6 +651,191 @@ class GoalEpisodePhase1Test {
         assertEquals(listOf("calibrate:cal-1@2"), steps, "One episode ran, off the live tally")
         assertNull(result.last<CalibrationRequested>())
         assertNull(result.last<CalibrationCompleted>())
+    }
+
+    @Test
+    fun `inference traverses assignable producers - a subtype intermediate is on-chain`() {
+        // SensorKit is produced as SpecificSensorKit; the only off-chain input is the request
+        val process = create(
+            SubtypeChainAgent(),
+            "phase1-subtype-inference",
+            ProcessOptions.DEFAULT.withEpisodes(
+                EpisodePolicy.episode(GoalTarget.output(CalibrationCompleted::class.java))
+            ),
+            CalibrationRequested("cal-1"),
+        )
+
+        val result = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        assertNull(result.last<CalibrationRequested>(), "The inferred request was consumed")
+    }
+
+    @Test
+    fun `consumption traverses assignable producers - a subtype intermediate is consumed`() {
+        val process = create(
+            SubtypeChainAgent(),
+            "phase1-subtype-consumption",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status, "No stale subtype kit may keep the goal reachable")
+        assertNull(parked.last<SpecificSensorKit>(), "The kit is an episode product through its supertype")
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val rearmed = parked.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
+        val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("prepKit:cal-1", "calibrate:cal-1", "prepKit:cal-2", "calibrate:cal-2"), steps,
+            "The second occurrence replans the entire chain with a fresh kit",
+        )
+    }
+
+    @Test
+    fun `an explicit consume type that is not an off-chain input of the chain fails fast`() {
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                GoapEpisodeOnlyAgent(),
+                "phase1-unrelated-consumes",
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                        .consumeOnCompletion(ZoneInfo::class.java)
+                ),
+            )
+        }
+        assertTrue("ZoneInfo" in exception.message!!, "Error names the unrelated type: ${exception.message}")
+    }
+
+    @Test
+    fun `two episodes resolving to the same declared goal fail fast`() {
+        val goalName = "${AmbiguousInputAgent::class.java.name}.calibrate"
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                AmbiguousInputAgent(),
+                "phase1-overlapping-episodes",
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                        .episode(GoalTarget.named(goalName))
+                        .consumeOnCompletion(ZoneInfo::class.java)
+                ),
+            )
+        }
+        assertTrue("calibrate" in exception.message!!, "Error names the shared goal: ${exception.message}")
+    }
+
+    @Test
+    fun `consumption is scoped to the completed candidate - another candidates output survives`() {
+        // fullCal is gated off, so the seeded decoy cannot satisfy its goal;
+        // quickCal's completion must not sweep the other candidate's type
+        val result = run(
+            GatedCandidateAgent(),
+            "phase1-candidate-scoped-consumption",
+            ProcessOptions.DEFAULT.withEpisodes(
+                EpisodePolicy
+                    .episode(GoalTarget.output(CalibrationOutcome::class.java))
+                    .consumeOnCompletion(CalibrationRequested::class.java)
+            ),
+            SampleTally(0),
+            FullCalibration("decoy"),
+            CalibrationRequested("cal-1"),
+        )
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("quickCal:cal-1"), steps)
+        assertNull(result.last<QuickCalibration>(), "The completed candidate's output is consumed")
+        assertNotNull(result.last<FullCalibration>(), "The other candidate's type is not this completion's product")
+    }
+
+    @Test
+    fun `distinct but equal request occurrences coalesce - hide is equality-based on main`() {
+        // Blackboard.hide stores hidden objects in an equality Set, so consuming
+        // one occurrence hides every equal one: the second request is silently
+        // dropped, not looped on. Occurrence identity is therefore the consumer's
+        // responsibility in phase 1 - give requests distinguishing state (an id,
+        // a timestamp). Changing hide to identity semantics is a platform
+        // question, tracked upstream.
+        val process = create(
+            GoapEpisodeOnlyAgent(),
+            "phase1-equal-occurrences",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-same"),
+            CalibrationRequested("cal-same"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val calibrated = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-same"), calibrated, "One completion consumed both equal occurrences")
+        assertNull(result.last<CalibrationRequested>(), "No equal occurrence remains visible")
+    }
+
+    @Test
+    fun `a non-rerunnable intermediate makes the whole episode one-shot`() {
+        val process = create(
+            OneShotIntermediateAgent(),
+            "phase1-one-shot-intermediate",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status)
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val after = parked.run()
+
+        // Rerun rides canRerun for every action the next occurrence needs,
+        // not just the completing one: a one-shot intermediate gates the chain
+        assertEquals(AgentProcessStatusCode.STUCK, after.status)
+        val steps = after.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("prepKit:cal-1", "calibrate:cal-1"), steps)
+    }
+
+    @Test
+    fun `a named target matching duplicate goal identities fails fast`() {
+        val agent = com.embabel.agent.core.Agent(
+            name = "dup-goal-agent",
+            provider = "test",
+            description = "duplicate goal names",
+            actions = emptyList(),
+            goals = setOf(
+                com.embabel.agent.core.Goal(
+                    name = "dupGoal",
+                    description = "first",
+                    satisfiedBy = CalibrationCompleted::class.java,
+                ),
+                com.embabel.agent.core.Goal(
+                    name = "dupGoal",
+                    description = "second",
+                    satisfiedBy = QuickCalibration::class.java,
+                ),
+            ),
+        )
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "phase1-duplicate-names",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.named("dupGoal"))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue("2 declared goals" in exception.message!!, "Error states the ambiguity: ${exception.message}")
     }
 
     @Test
