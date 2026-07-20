@@ -63,7 +63,7 @@ As discussed in #1725, I've split this into work streams. They do not have to be
 4. Cooperative interruption of the running action
 5. Open Evolving: `ObjectiveAuthor` re-authoring at a planning tick
 6. Process-local scope expansion
-7. Recurring goal episodes for native pure-GOAP standing work; event-driven waiting remains separate infrastructure shared with ingress
+7. Recurring goal episodes for native pure-GOAP standing work; event-driven waiting ships with ingress (2)
 8. Example application
 
 ### Motivating Example
@@ -158,7 +158,7 @@ Because episodes live in `ProcessOptions`, they also compose with Autonomy/Open 
 
 The existing type, condition, binding, goal, and planner model remains authoritative. A request object can make one or more declared goals plannable today. Episode policy changes what happens when a selected candidate goal is satisfied; it does not maintain a second goal set or add a planner overlay for deterministic phase 1.
 
-An episode is one bounded plan-execute-complete cycle. On completion of an episode goal, the exact triggering fact occurrence and the satisfying output are hidden through the existing blackboard API. Nothing is deleted; the blackboard remains append-only. Hiding makes the goal unsatisfied again so a later occurrence plans real work.
+An episode is one bounded plan-execute-complete cycle. It is not an atomic block: per-tick replanning can interleave standing work between its steps when values favor it (baseline test 10). On completion of an episode goal, the exact triggering fact occurrence and the satisfying output are hidden through the existing blackboard API. Nothing is deleted; the blackboard remains append-only. Hiding makes the goal unsatisfied again so a later occurrence plans real work.
 
 The lifecycle is per occurrence and the declared goal is reusable. Completing an episode never completes the process. Ordinary declared goals keep today's behavior and may complete the process.
 
@@ -220,7 +220,7 @@ Episode goals are the nonterminal exception. Ordinary declared goals retain exis
 
 An optional `CompletionPolicy` may later provide invocation-level ergonomics for objectives that do not map cleanly to one declared terminal goal. It is not required for the phase-1 episode lifecycle.
 
-Waiting is separate infrastructure. The baseline proves that a `STUCK` GOAP process can be given a new fact and run again manually. External ingress should define how publication wakes and re-dispatches such a process, likely using the existing `WAITING` status. Waiting permits future externally driven episodes; it does not make pure GOAP execute standing work on its own.
+Waiting itself already exists. An action can call the existing `waitFor(awaitable)`: it declares the awaited type as its return type so the planner can route through it, the process parks `WAITING` with the awaitable on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it. The baseline tests show both halves: a `STUCK` GOAP process resumes manually after `addObject` and `run()`, and a `waitFor` action parks `WAITING` instead of `STUCK` and resumes straight into the goal. What is missing is only the wake — the resume is driver-owned today. That contract ships with external ingress (phase 2). Waiting permits externally driven episodes; it does not make pure GOAP execute standing work on its own (that is work stream 7).
 
 ### Objective Author Relationship
 
@@ -270,7 +270,7 @@ Maintainer input would be helpful on these decisions.
 - **Declared capability** - immutable `@Agent` and `@EmbabelComponent` actions, conditions, and goals.
 - **Consumer application** - the application using Embabel, configuring invocation, providing scoped capabilities, owning domain state modules, and publishing selected external facts.
 - **Request fact** - typed domain object on the blackboard that represents one occurrence of follow-up work. Not a new public `Fact` API.
-- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request/output lifecycle is consumed. Work stream 7 explores recurring episodes for pure-GOAP standing work.
+- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. Episode completion is nonterminal and rearms after its request/output lifecycle is consumed. An episode is not an atomic block: per-tick replanning can interleave standing work between its steps (baseline test 10). Work stream 7 explores recurring episodes for pure-GOAP standing work.
 - **Runtime goal** - reserved here for a process-local objective proposed later by Open Evolving or scope expansion. Deterministic phase 1 reuses declared goals rather than adding a second goal set.
 - **Deterministic Evolving** - predeclared episode lifecycle for known request types and known declared goals.
 - **Open Evolving** - an `ObjectiveAuthor` authors or revises the objective policy when predefined episode policy and scope cannot handle the situation. It proposes goal references as typed data, never executable code. Proposed goals use the same scope validation and may opt into the same nonterminal lifecycle.
@@ -292,6 +292,9 @@ Maintainer input would be helpful on these decisions.
 | Known follow-up work is urgent and the current action should yield. | Episode lifecycle + cooperative `terminateAction` integration | An urgent recovery request cancelling an in-flight navigation action |
 | A user asks for a broad objective before the process starts. | `ObjectiveAuthor` / `ObjectivePolicy` supplies the launch-time objective policy | "Collect samples in Zone A until 500 are stored, and run a sensor calibration check every hour" |
 | The run discovers an unknown blocker or has no viable plan. | Open Evolving: `ObjectiveAuthor` re-authoring at a validated planning tick | `ZoneAccessBlocked(missingRequirement = Permit("P-42"))` -> propose runtime goal `PermitObtained` with a typed target |
+| A reaction should fire off the latest result, no lifecycle needed. | `@Action(trigger = X.class)` | A notification action firing when `X` was just produced |
+| The process must wait for a solicited external response. | Existing `waitFor` / `Awaitable` | An action promising `SensorCalibrationRequested` parks `WAITING` until the response arrives |
+| Work needs explicit phases scoping which actions are available. | `@State`; composes with episodes | Calibration actions available, storage actions not, while calibration is in flight |
 | The only reason is "an event happened." | Usually not enough for Evolving | Project current truth into application state, then expose it through `@Condition` or action inputs |
 
 </details>
@@ -497,9 +500,11 @@ Per-process ordering is FIFO in acceptance order. Concurrent publishers receive 
 
 Publication to an eligible parked process should schedule a platform-owned re-run. A status change alone is not enough; the process must reach a planning tick without requiring the publisher to call `run()`.
 
-This depends on the standalone waiting/wake work. `WAITING` already means "waiting for user input or another external event," and `run()` can make any nonterminal process `RUNNING` today. That work should own the no-plan-to-`WAITING` transition and platform dispatch. This sub-issue should reuse it rather than define a second scheduler or another process status.
+Waking is not a publish side-effect. `publish` enqueues and returns a receipt; the platform maintains the invariant that an eligible parked process with undrained publications is scheduled to reach a planning tick. Several accepted publications may satisfy the invariant with one wake while preserving FIFO drain order.
 
-Several accepted publications may coalesce into one wake while preserving FIFO drain order.
+The delivery and resume mechanics already exist in the `Awaitable` machinery: `waitFor` parks a process `WAITING` with the awaitable stored on the blackboard, and `Awaitable.onResponse` plus `run()` resumes it — today that resume is driver-owned (the wiki's REST MVC pattern; baseline test 9). This sub-issue moves that resume into the platform rather than defining a second scheduler or another process status. A publication whose type matches a pending typed-fact awaitable resolves it: ingress is effectively an `AwaitableResponse` without a form.
+
+Core sugar worth shipping alongside the handle: `awaitFact(SensorCalibrationRequested.class)` — a canned typed-fact awaitable joining the existing `confirm()` / `fromForm()` family in `wait.kt`, replacing the custom `Awaitable`/`AwaitableResponse` boilerplate the baseline test needed.
 
 ### Fact Boundary
 
@@ -554,6 +559,7 @@ Acceptance criteria:
 - equal payloads remain distinct publications
 - publishing to `COMPLETED`, `KILLED`, or `TERMINATED` returns or throws a deterministic rejection and never binds the fact; the public failure shape is decided and tested
 - external ingress schedules a platform-owned re-run of an eligible parked process without starting a new process
+- a publication whose type matches a pending typed-fact awaitable resolves it and the resumed process consumes it through the normal `Awaitable.onResponse` path
 - several queued publications can share one wake without changing their drain order
 - an ingressed request makes the same declared episode goals plannable as an internally added request
 - ingress wake and `ReplanRequestedException` converge on normal planning without treating the exception as an external publication API
@@ -793,7 +799,7 @@ Mechanism:
 - On completion, the satisfying output is hidden before the next episode so the goal is not already satisfied.
 - A declared terminal goal or optional completion policy decides when recurrence stops.
 - Consuming the satisfying outputs keeps the next episode from being pre-satisfied by the previous episode's output.
-- A blocked recurring episode follows existing plan-not-found behavior unless the separate ingress/wake work defines a parked state.
+- A blocked recurring episode follows existing plan-not-found behavior unless phase 2's ingress/wake defines a parked state.
 - Interrupted episodes replan. No suspended plan stack is restored.
 - Request-driven phase-1 episodes compose at planning ticks; after one completes, the recurring goal can be planned again from current state.
 
