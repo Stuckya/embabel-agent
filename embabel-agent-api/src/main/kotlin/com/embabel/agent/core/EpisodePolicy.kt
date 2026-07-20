@@ -53,9 +53,10 @@ sealed interface GoalTarget {
 /**
  * One repeatable, nonterminal goal episode: a declared goal reached via a
  * runtime request occurrence. Completing an episode goal does not complete
- * the process. On completion the exact request occurrence and the satisfying
- * output are hidden through the existing blackboard API, so a later
- * occurrence plans real work again.
+ * the process. On completion the exact request occurrence and the products
+ * manufactured on the goal path (the satisfying output and any intermediates)
+ * are hidden through the existing blackboard API, so a later occurrence
+ * replans the entire chain fresh. Self-maintained standing state survives.
  * @param target the candidate declared goal(s) this episode completes
  * @param consumes the request type consumed when the episode completes.
  * Null means infer it at process creation, which is only permitted when the

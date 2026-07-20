@@ -73,6 +73,11 @@ data class FullCalibration(override val id: String) : CalibrationOutcome
  *     occurrence is consumed first, matching default binding.
  * 12. Episode rerun rides existing canRerun: a non-rerunnable completing action
  *     does not re-fire for a second occurrence.
+ * 13. A repeatable multi-step episode reruns the whole chain fresh: intermediates
+ *     manufactured on the episode path are consumed at completion, so a stale
+ *     intermediate cannot shortcut the next occurrence's plan.
+ * 14. Consumption never touches standing state: a self-maintained accumulator
+ *     feeding the chain survives episode completion.
  */
 class GoalEpisodePhase1Test {
 
@@ -176,14 +181,59 @@ class GoalEpisodePhase1Test {
             return CalibrationKit(request.id)
         }
 
-        // Not rerunnable: episode consumption hides the request and satisfying
-        // output, not intermediates. A leftover CalibrationKit would otherwise
-        // re-satisfy the path without a new request.
+        // canRerun = false keeps this episode deliberately one-shot;
+        // the repeatable variant is RepeatableTwoStepAgent
         @Action(value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
             context.addObject(ExecutedStep("calibrate:${kit.id}"))
             return CalibrationCompleted(kit.id)
+        }
+    }
+
+    @Agent(description = "Repeatable two-step calibration path with no hand-rolled cleanup")
+    inner class RepeatableTwoStepAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
+            context.addObject(ExecutedStep("prepKit:${request.id}"))
+            return CalibrationKit(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${kit.id}"))
+            return CalibrationCompleted(kit.id)
+        }
+    }
+
+    @Agent(description = "Standing accumulator feeds the calibration chain and a terminal mission goal")
+    inner class AccumulatorChainAgent {
+
+        @Action(canRerun = true, value = 0.2)
+        fun collect(tally: SampleTally, context: ActionContext): SampleTally {
+            val next = SampleTally(tally.count + 1)
+            if (next.count == 2) {
+                context.addObject(CalibrationRequested("cal-1"))
+            }
+            return next
+        }
+
+        @Condition(name = "enoughSamples")
+        fun enoughSamples(tally: SampleTally): Boolean = tally.count >= 5
+
+        @Action(pre = ["enoughSamples"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun missionComplete(tally: SampleTally): MissionReport = MissionReport(tally.count)
+
+        // The tally is on the goal path here: SampleTally is a chain input
+        // produced by a scoped action. It is standing state, not an episode product
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, tally: SampleTally, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}@${tally.count}"))
+            return CalibrationCompleted(request.id)
         }
     }
 
@@ -461,6 +511,53 @@ class GoalEpisodePhase1Test {
             "Default binding hands the action the latest occurrence; consumption must match it",
         )
         assertNull(result.last<CalibrationRequested>(), "Both occurrences consumed")
+    }
+
+    @Test
+    fun `a repeatable two-step episode reruns the whole chain fresh - intermediates are consumed`() {
+        val process = create(
+            RepeatableTwoStepAgent(),
+            "phase1-repeatable-two-step",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status, "No stale intermediate may keep the goal reachable")
+        assertNull(parked.last<CalibrationKit>(), "The kit manufactured on the episode path is consumed")
+        assertNull(parked.last<CalibrationRequested>())
+        assertNull(parked.last<CalibrationCompleted>())
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val rearmed = parked.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
+        val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("prepKit:cal-1", "calibrate:cal-1", "prepKit:cal-2", "calibrate:cal-2"), steps,
+            "The second occurrence replans the entire chain with a fresh kit",
+        )
+    }
+
+    @Test
+    fun `standing accumulator state on the chain survives episode completion`() {
+        val result = run(
+            AccumulatorChainAgent(),
+            "phase1-accumulator-survives",
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEpisodes(calibrationEpisode()),
+            SampleTally(0),
+        )
+
+        // If consumption swept SampleTally along with the chain, collection would
+        // lose its state after the episode and the mission could never complete
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(5, result.last<MissionReport>()?.samples, "Standing work continued to the terminal goal")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-1@2"), steps, "One episode ran, off the live tally")
+        assertNull(result.last<CalibrationRequested>())
+        assertNull(result.last<CalibrationCompleted>())
     }
 
     @Test

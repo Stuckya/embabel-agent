@@ -26,11 +26,18 @@ import com.embabel.agent.core.JvmType
  * An [Episode] resolved against the goals and actions of a process scope.
  * @param goalsByName the candidate declared goals, keyed by name
  * @param consumes the resolved request type, explicit or inferred
+ * @param consumedProducts the types manufactured on the episode's goal path,
+ * consumed alongside the request when the episode completes. Includes the
+ * satisfying output and any intermediates, so a stale intermediate cannot
+ * shortcut the next occurrence's plan. Self-maintained state (a type some
+ * action both consumes and produces, such as an accumulator) is never an
+ * episode product and survives completion.
  */
 internal data class ResolvedEpisode(
     val episode: Episode,
     val goalsByName: Map<String, Goal>,
     val consumes: Class<*>,
+    val consumedProducts: List<Class<*>>,
 ) {
 
     fun matches(goalName: String): Boolean = goalName in goalsByName
@@ -70,28 +77,38 @@ internal object EpisodeResolution {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }}"
         }
-        val consumes = episode.consumes ?: inferConsumes(episode, candidates, agent)
+        val chain = analyzeChain(candidates, agent)
+        val consumes = episode.consumes ?: inferConsumes(episode, chain)
         return ResolvedEpisode(
             episode = episode,
             goalsByName = candidates.associateBy { it.name },
             consumes = consumes,
+            consumedProducts = chain.products
+                .filterNot { isSelfMaintained(it, agent) }
+                .mapNotNull { loadClassOrNull(it) },
         )
     }
 
+    private data class ChainAnalysis(
+        /** Input types on the goal path that no scoped action produces */
+        val offChainInputs: Set<String>,
+        /** Output types manufactured on the goal path, satisfying output included */
+        val products: Set<String>,
+    )
+
     /**
-     * Infer the consumed request type as the single input type on the goal path
-     * that no scoped action produces. Such an off-chain input is an observation
-     * rather than a plannable product, which is exactly what a request occurrence
-     * is. Anything else is ambiguous and requires explicit consumeOnCompletion.
+     * Walk the candidate goals' producing actions transitively. Anything the
+     * walk manufactures is a product of the episode's plan chain; any input no
+     * scoped action produces is an off-chain observation.
      */
-    private fun inferConsumes(episode: Episode, candidates: List<Goal>, agent: Agent): Class<*> {
+    private fun analyzeChain(candidates: List<Goal>, agent: Agent): ChainAnalysis {
         val producedTypes = agent.actions.flatMap { action -> action.outputs.map { it.type } }.toSet()
         val offChainInputs = linkedSetOf<String>()
-        val visited = mutableSetOf<String>()
+        val walked = linkedSetOf<String>()
         val toWalk = ArrayDeque(candidates.mapNotNull { (it.outputType as? JvmType)?.className })
         while (toWalk.isNotEmpty()) {
             val outputType = toWalk.removeFirst()
-            if (!visited.add(outputType)) continue
+            if (!walked.add(outputType)) continue
             agent.actions
                 .filter { action -> action.outputs.any { it.type == outputType } }
                 .flatMap { it.inputs }
@@ -103,6 +120,26 @@ internal object EpisodeResolution {
                     }
                 }
         }
+        return ChainAnalysis(offChainInputs = offChainInputs, products = walked)
+    }
+
+    /**
+     * A type an action both consumes and produces is self-maintained standing
+     * state, such as an accumulator, never a per-occurrence episode product.
+     */
+    private fun isSelfMaintained(type: String, agent: Agent): Boolean =
+        agent.actions.any { action ->
+            action.inputs.any { it.type == type } && action.outputs.any { it.type == type }
+        }
+
+    /**
+     * Infer the consumed request type as the single off-chain input on the goal
+     * path. Such an input is an observation rather than a plannable product,
+     * which is exactly what a request occurrence is. Anything else is ambiguous
+     * and requires explicit consumeOnCompletion.
+     */
+    private fun inferConsumes(episode: Episode, chain: ChainAnalysis): Class<*> {
+        val offChainInputs = chain.offChainInputs
         require(offChainInputs.size == 1) {
             if (offChainInputs.isEmpty())
                 "Cannot infer the consumed request for episode target ${episode.target}: " +
@@ -113,15 +150,18 @@ internal object EpisodeResolution {
                         "Specify consumeOnCompletion explicitly"
         }
         val typeName = offChainInputs.single()
-        return try {
-            Class.forName(typeName, true, Thread.currentThread().contextClassLoader)
-        } catch (e: ClassNotFoundException) {
-            throw IllegalArgumentException(
+        return loadClassOrNull(typeName)
+            ?: throw IllegalArgumentException(
                 "Cannot infer the consumed request for episode target ${episode.target}: " +
-                        "cannot load inferred input type $typeName. Specify consumeOnCompletion explicitly",
-                e,
+                        "cannot load inferred input type $typeName. Specify consumeOnCompletion explicitly"
             )
-        }
     }
+
+    private fun loadClassOrNull(typeName: String): Class<*>? =
+        try {
+            Class.forName(typeName, true, Thread.currentThread().contextClassLoader)
+        } catch (_: ClassNotFoundException) {
+            null
+        }
 
 }

@@ -27,7 +27,6 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
-import com.embabel.agent.core.JvmType
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
 import com.embabel.agent.spi.PlannerFactory
@@ -128,10 +127,12 @@ open class SimpleAgentProcess(
 
     /**
      * Completes a goal episode without completing the process: consumes the
-     * request occurrence and the satisfying output by hiding them, then keeps
-     * the process running so ordinary selection resumes at the next planning tick.
-     * The latest visible occurrence is consumed, matching the default binding
-     * the completing action received.
+     * request occurrence and the chain's products (satisfying output and any
+     * intermediates manufactured on the goal path) by hiding them, then keeps
+     * the process running so ordinary selection resumes at the next planning
+     * tick. A later occurrence therefore replans the entire chain fresh.
+     * The latest visible instance of each type is consumed, matching the
+     * default binding the completing action received.
      */
     private fun completeEpisode(
         episode: ResolvedEpisode,
@@ -152,9 +153,8 @@ open class SimpleAgentProcess(
         )
         blackboard.objects.lastOrNull { episode.consumes.isInstance(it) }
             ?.let { blackboard.hide(it) }
-        val outputClass = (episode.goalsByName[plan.goal.name]?.outputType as? JvmType)?.clazz
-        if (outputClass != null) {
-            blackboard.objects.lastOrNull { outputClass.isInstance(it) }
+        episode.consumedProducts.forEach { productType ->
+            blackboard.objects.lastOrNull { productType.isInstance(it) }
                 ?.let { blackboard.hide(it) }
         }
         setStatus(AgentProcessStatusCode.RUNNING)
