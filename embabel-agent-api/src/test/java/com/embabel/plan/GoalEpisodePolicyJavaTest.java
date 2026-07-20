@@ -21,6 +21,7 @@ import com.embabel.agent.core.ProcessOptions;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Pins the Java surface of the episode API. Subsequent episodes are exposed to
@@ -43,5 +44,18 @@ public class GoalEpisodePolicyJavaTest {
 
         var options = ProcessOptions.DEFAULT.withEpisodes(policy);
         assertEquals(policy, options.getEpisodes());
+    }
+
+    @Test
+    void episodesListIsImmutableFromJava() {
+        var policy = EpisodePolicy
+                .episode(GoalTarget.output(String.class))
+                .consumeOnCompletion(Integer.class)
+                .addEpisode(GoalTarget.named("secondary"))
+                .consumeOnCompletion(Long.class);
+
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> policy.getEpisodes().add(policy.getEpisodes().get(0)));
     }
 }

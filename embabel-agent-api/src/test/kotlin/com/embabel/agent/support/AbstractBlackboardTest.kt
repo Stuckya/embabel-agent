@@ -364,6 +364,34 @@ abstract class AbstractBlackboardTest {
         }
 
         @Test
+        fun `spawn preserves hiding`() {
+            val bb = createBlackboard()
+            val john = PersonWithReverseTool("John")
+            val jane = PersonWithReverseTool("Jane")
+            bb += john
+            bb += jane
+            bb.hide(john)
+
+            val child = bb.spawn()
+
+            assertEquals(1, child.objects.size, "A consumed object must not resurrect on a child blackboard")
+            assertTrue(child.objects.single() === jane)
+        }
+
+        @Test
+        fun `expression evaluation model excludes hidden values`() {
+            val bb = createBlackboard()
+            val john = PersonWithReverseTool("John")
+            bb["person"] = john
+            bb.hide(john)
+
+            assertNull(
+                bb.expressionEvaluationModel()["person"],
+                "Hidden objects must not leak through expression evaluation",
+            )
+        }
+
+        @Test
         fun `hide does not affect aggregation - aggregations use all objects`() {
             val bb = createBlackboard()
             val userInput = UserInput("John is a man")

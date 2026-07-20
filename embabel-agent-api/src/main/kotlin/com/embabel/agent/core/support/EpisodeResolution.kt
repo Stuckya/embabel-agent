@@ -39,7 +39,6 @@ import com.embabel.plan.common.condition.EffectSpec
  * accumulator) is never an episode product and survives completion.
  */
 internal data class ResolvedEpisode(
-    val episode: Episode,
     val goalsByName: Map<String, Goal>,
     val consumes: Class<*>,
     val productsByGoal: Map<String, List<Class<*>>>,
@@ -79,7 +78,6 @@ internal object EpisodeResolution {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
         }
-        candidates.forEach { requireConsumableOutput(episode, it, agent) }
         val chains = candidates.associate { it.name to analyzeGoalChain(it, agent) }
         check(chains.size == candidates.size) {
             "Candidate goal names must be unique before chain analysis"
@@ -90,17 +88,24 @@ internal object EpisodeResolution {
         val consumes = episode.consumes
             ?.also { validateExplicitConsumes(episode, it, requiredOnEveryPath) }
             ?: inferConsumes(episode, requiredOnEveryPath)
+        candidates.forEach { requireConsumableOutput(episode, it, agent) }
         return ResolvedEpisode(
-            episode = episode,
             goalsByName = candidates.associateBy { it.name },
             consumes = consumes,
-            productsByGoal = chains.mapValues { (_, chain) ->
+            productsByGoal = chains.mapValues { (goalName, chain) ->
                 chain.productTypes
                     .filterNot { isSelfMaintained(it, agent) }
-                    .mapNotNull { loadClassOrNull(it) }
+                    .map { loadProductClass(goalName, it) }
             },
         )
     }
+
+    private fun loadProductClass(goalName: String, typeName: String): Class<*> =
+        loadClassOrNull(typeName)
+            ?: throw IllegalArgumentException(
+                "Episode candidate $goalName produces $typeName, which cannot be loaded: " +
+                        "every product must be a consumable JVM type"
+            )
 
     private fun candidatesFor(episode: Episode, agent: Agent): List<Goal> =
         when (val target = episode.target) {
@@ -132,12 +137,17 @@ internal object EpisodeResolution {
     /**
      * A satisfying output must be a per-occurrence product. An output that is
      * standing state would survive consumption and keep the goal satisfied
-     * forever, so the episode could never rearm.
+     * forever, and a non-JVM output could never be hidden at all: either way
+     * the episode could not rearm.
      */
     private fun requireConsumableOutput(episode: Episode, goal: Goal, agent: Agent) {
-        val outputTypeName = (goal.outputType as? JvmType)?.className ?: return
-        require(!isSelfMaintained(outputTypeName, agent)) {
-            "Episode candidate ${goal.name} is satisfied by $outputTypeName, which is standing state " +
+        val outputType = goal.outputType
+        require(outputType is JvmType) {
+            "Episode candidate ${goal.name} does not produce a JVM output type: " +
+                    "its instances could never be consumed, so the episode could not rearm"
+        }
+        require(!isSelfMaintained(outputType.className, agent)) {
+            "Episode candidate ${goal.name} is satisfied by ${outputType.className}, which is standing state " +
                     "an action maintains for itself: a satisfying output must be a per-occurrence " +
                     "product. Return a distinct completion type"
         }
@@ -274,17 +284,55 @@ internal object EpisodeResolution {
 
     /**
      * A chain action's product is standing state, never a per-occurrence
-     * episode product, when the action can sustain its own input: its effects
-     * satisfy one of its required input conditions by the planner's own
-     * matching rules. This covers exact accumulators (tally -> tally) and
-     * subtype accumulators (tally -> RunningTally) alike.
+     * episode product, when some producer of it can sustain the type without a
+     * fresh occurrence: either the producer's effects satisfy one of its own
+     * required inputs (an accumulator, exact or subtype), or the producer
+     * transitively requires no off-chain input at all (a multi-action cycle
+     * such as a ping-pong pair). Both checks use the planner's own matching
+     * rules.
      */
     private fun isSelfMaintained(type: String, agent: Agent): Boolean =
-        agent.actions.any { maintainsOwnInputProducing(it, type) }
+        agent.actions
+            .filter { producesType(it, type) }
+            .any { producer -> maintainsOwnInput(producer) || regenerableWithoutOffChainInput(producer, agent) }
 
-    private fun maintainsOwnInputProducing(action: Action, type: String): Boolean {
-        if (action.outputs.none { it.type == type }) return false
-        return requiredConditions(action.preconditions).any { producesCondition(action, it) }
+    private fun producesType(action: Action, type: String): Boolean =
+        action.outputs.any { it.type == type }
+
+    private fun maintainsOwnInput(action: Action): Boolean =
+        requiredConditions(action.preconditions).any { producesCondition(action, it) }
+
+    /**
+     * Can this producer run using only what the scope regenerates on its own?
+     * Any-path semantics: a producer is regenerable when some way of satisfying
+     * each of its inputs needs no off-chain occurrence. Cycles sustain
+     * themselves; named conditions are current truth; an off-chain binding is
+     * an occurrence and blocks regeneration.
+     */
+    private fun regenerableWithoutOffChainInput(action: Action, agent: Agent): Boolean =
+        requiredConditions(action.preconditions).all { canRegenerate(it, agent, mutableSetOf()) }
+
+    private fun canRegenerate(
+        condition: String,
+        agent: Agent,
+        inProgress: MutableSet<String>,
+    ): Boolean {
+        if (!inProgress.add(condition)) return true
+        val result = computeCanRegenerate(condition, agent, inProgress)
+        inProgress.remove(condition)
+        return result
+    }
+
+    private fun computeCanRegenerate(
+        condition: String,
+        agent: Agent,
+        inProgress: MutableSet<String>,
+    ): Boolean {
+        val producers = agent.actions.filter { producesCondition(it, condition) }
+        if (producers.isEmpty()) return ":" !in condition
+        return producers.any { producer ->
+            requiredConditions(producer.preconditions).all { canRegenerate(it, agent, inProgress) }
+        }
     }
 
     /**
@@ -311,7 +359,7 @@ internal object EpisodeResolution {
         val bindingName = IoBinding(bindingCondition).name
         require(bindingName == IoBinding.DEFAULT_BINDING) {
             "Episode target ${episode.target} cannot consume a request bound as '$bindingName': " +
-                    "named request bindings are not supported in phase 1"
+                    "named request bindings are not supported"
         }
     }
 
@@ -347,9 +395,11 @@ internal object EpisodeResolution {
 
     private fun loadClassOrNull(typeName: String): Class<*>? =
         try {
-            Class.forName(typeName, true, Thread.currentThread().contextClassLoader)
+            Class.forName(typeName, false, Thread.currentThread().contextClassLoader)
         } catch (_: ClassNotFoundException) {
             null
+        } catch (e: LinkageError) {
+            throw IllegalArgumentException("Type $typeName is present but unloadable", e)
         }
 
 }

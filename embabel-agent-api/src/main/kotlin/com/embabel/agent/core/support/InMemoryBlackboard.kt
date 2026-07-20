@@ -46,6 +46,9 @@ class InMemoryBlackboard(
                 _entries.addAll(this@InMemoryBlackboard._entries)
             }
             protectedKeys.addAll(this@InMemoryBlackboard.protectedKeys)
+            // Hiding travels with the facts: a consumed occurrence must not
+            // resurrect on a child blackboard
+            hiddens.addAll(this@InMemoryBlackboard.hiddens)
         }
     }
 
@@ -146,7 +149,9 @@ class InMemoryBlackboard(
     }
 
     override fun expressionEvaluationModel(): Map<String, Any> {
-        return _map.toMap()
+        // Honor hiding on this retrieval path too: conditions and prompts
+        // must not see consumed occurrences
+        return _map.filterValues { it !in hiddens }
     }
 
     override fun infoString(

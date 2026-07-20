@@ -152,16 +152,27 @@ open class SimpleAgentProcess(
             )
         )
         val consumedRequest = consumeLatest(episode.consumes)
-        val consumedProducts = episode.productsFor(plan.goal.name).map { consumeLatest(it) }
-        if (!consumedRequest && consumedProducts.none { it }) {
+        val consumedProducts = episode.productsFor(plan.goal.name).sumOf { consumeAll(it) }
+        if (!consumedRequest) {
             logger.warn(
+                "Process {} episode goal {} completed with no visible {} to consume; " +
+                        "occurrence pairing may be skewed",
+                this.id,
+                plan.goal.name,
+                episode.consumes.name,
+            )
+        }
+        if (!consumedRequest && consumedProducts == 0) {
+            logger.error(
                 "Process {} episode goal {} completed but nothing was consumed; " +
-                        "a stale or seeded product may be satisfying the goal",
+                        "failing instead of spinning on a goal that will stay satisfied",
                 this.id,
                 plan.goal.name,
             )
+            setStatus(AgentProcessStatusCode.FAILED)
+            return
         }
-        setStatus(AgentProcessStatusCode.RUNNING)
+        makeRunning()
     }
 
     /**
@@ -171,7 +182,27 @@ open class SimpleAgentProcess(
     private fun consumeLatest(type: Class<*>): Boolean {
         val latest = blackboard.objects.lastOrNull { type.isInstance(it) } ?: return false
         blackboard.hide(latest)
+        logger.debug("Process {} consumed {}", this.id, latest)
         return true
+    }
+
+    /**
+     * Hides every visible instance of an episode product type. Products are
+     * per-occurrence, and a surviving stale duplicate could otherwise
+     * shortcut the next occurrence's plan.
+     */
+    private fun consumeAll(type: Class<*>): Int {
+        val consumed = blackboard.objects.filter { type.isInstance(it) }
+        consumed.forEach { blackboard.hide(it) }
+        if (consumed.isNotEmpty()) {
+            logger.debug(
+                "Process {} consumed {} instance(s) of {}",
+                this.id,
+                consumed.size,
+                type.simpleName,
+            )
+        }
+        return consumed.size
     }
 
     protected fun sendProcessRunningEvent(

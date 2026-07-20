@@ -23,11 +23,21 @@ import com.embabel.agent.api.annotation.RequireNameMatch
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
+import com.embabel.agent.api.event.AgentProcessEvent
+import com.embabel.agent.api.event.AgentProcessFinishedEvent
+import com.embabel.agent.api.event.AgenticEventListener
+import com.embabel.agent.api.event.GoalAchievedEvent
+import com.embabel.agent.core.Agent as CoreAgent
+import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.DynamicType
 import com.embabel.agent.core.EpisodePolicy
+import com.embabel.agent.core.Goal
+import com.embabel.agent.core.IoBinding
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
+import com.embabel.agent.core.support.ConcurrentAgentProcess
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -67,6 +77,9 @@ interface Tally {
 }
 
 data class RunningTally(override val count: Int) : Tally
+
+data class PingTally(val count: Int)
+data class PongTally(val count: Int)
 
 /**
  * Phase-1 episode lifecycle for issue #1756, driving the contract test-first:
@@ -142,9 +155,23 @@ data class RunningTally(override val count: Int) : Tally
  * 34. A blank named target fails at construction, not at resolution.
  * 35. A candidate goal without a JVM output type is rejected (pin: its
  *     required-input set is empty, so the every-path rule already fires).
- * 36. A seeded output does not pre-satisfy a reader-built episode goal (pin):
- *     hasRun in goal preconditions demands real work, and identity-based
- *     consumption takes the fresh output, not the decoy.
+ * 36. A seeded output does not pre-satisfy a reader-built episode goal:
+ *     hasRun in goal preconditions demands real work, and completion sweeps
+ *     every visible instance of a product type.
+ * 37. A candidate goal with a dynamic (non-JVM) output type is rejected:
+ *     its instances could never be hidden, so completion would spin.
+ * 38. Standing state maintained by a two-action cycle survives consumption,
+ *     exactly like a single-action accumulator.
+ * 39. Every visible instance of a product type is consumed at completion:
+ *     a stale duplicate cannot shortcut the next occurrence's plan.
+ * 40. Two independent episodes in one process each complete and consume.
+ * 41. Episode completion emits GoalAchievedEvent but never a process-finished
+ *     event; the terminal goal emits both (pin).
+ * 42. A failing completing action leaves the request unconsumed for retry.
+ * 43. A completing action that publishes the next request livelocks until the
+ *     action budget ends it (pin: occurrence pairing rides ordering in
+ *     phase 1; publish follow-ups from a non-completing action).
+ * 44. ConcurrentAgentProcess shares the episode contract: park and rearm.
  */
 class GoalEpisodePhase1Test {
 
@@ -401,6 +428,97 @@ class GoalEpisodePhase1Test {
             CalibrationCompleted(request.id)
     }
 
+    @Agent(description = "Standing state maintained by a two-action ping-pong cycle")
+    inner class PingPongAccumulatorAgent {
+
+        // Lockstep conditions force alternation: an append-only blackboard
+        // keeps old instances visible, so availability alone cannot alternate
+        @Condition(name = "pingReady")
+        fun pingReady(p: PingTally, q: PongTally): Boolean = p.count == q.count
+
+        @Condition(name = "pongReady")
+        fun pongReady(p: PingTally, q: PongTally): Boolean = q.count == p.count + 1
+
+        @Action(pre = ["pingReady"], canRerun = true, value = 0.2)
+        fun ping(p: PingTally, context: ActionContext): PongTally {
+            context.addObject(ExecutedStep("ping"))
+            val next = p.count + 1
+            if (next == 2) {
+                context.addObject(CalibrationRequested("cal-1"))
+            }
+            return PongTally(next)
+        }
+
+        @Action(pre = ["pongReady"], canRerun = true, value = 0.2)
+        fun pong(q: PongTally, context: ActionContext): PingTally {
+            context.addObject(ExecutedStep("pong"))
+            return PingTally(q.count)
+        }
+
+        @Condition(name = "enoughSamples")
+        fun enoughSamples(p: PingTally): Boolean = p.count >= 3
+
+        @Action(pre = ["enoughSamples"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun missionComplete(p: PingTally): MissionReport = MissionReport(p.count)
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, p: PingTally, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Two independent request-driven episodes")
+    inner class TwoEpisodeAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            return CalibrationCompleted(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Zone audited", value = 0.8)
+        fun audit(zone: ZoneInfo, context: ActionContext): CalibrationArchived {
+            context.addObject(ExecutedStep("audit:${zone.name}"))
+            return CalibrationArchived(zone.name)
+        }
+    }
+
+    @Agent(description = "Completing action that publishes the next request")
+    inner class SelfRearmingAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            if (request.id == "cal-1") {
+                context.addObject(CalibrationRequested("cal-2"))
+            }
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Completing action that fails on its first attempt")
+    inner class FlakyCalibrationAgent {
+
+        var attempts = 0
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            attempts++
+            context.addObject(ExecutedStep("attempt:$attempts"))
+            if (attempts == 1) {
+                throw IllegalStateException("flaky calibration")
+            }
+            return CalibrationCompleted(request.id)
+        }
+    }
+
     @Agent(description = "Two distinct goals driven by the same request type")
     inner class DualRequestGoalAgent {
 
@@ -509,7 +627,7 @@ class GoalEpisodePhase1Test {
         seeds.forEach { blackboard.addObject(it) }
 
         val reader = AgentMetadataReader()
-        val agent = reader.createAgentMetadata(instance) as com.embabel.agent.core.Agent
+        val agent = reader.createAgentMetadata(instance) as CoreAgent
         val effectiveAgent = if (options.plannerType == PlannerType.HYBRID) {
             agent.copy(goals = agent.goals + NIRVANA)
         } else {
@@ -533,7 +651,7 @@ class GoalEpisodePhase1Test {
         processId: String,
         options: ProcessOptions,
         vararg seeds: Any,
-    ): com.embabel.agent.core.AgentProcess =
+    ): AgentProcess =
         create(instance, processId, options, *seeds).run()
 
     private fun calibrationEpisode(): EpisodePolicy =
@@ -940,18 +1058,18 @@ class GoalEpisodePhase1Test {
 
     @Test
     fun `a named target matching duplicate goal identities fails fast`() {
-        val agent = com.embabel.agent.core.Agent(
+        val agent = CoreAgent(
             name = "dup-goal-agent",
             provider = "test",
             description = "duplicate goal names",
             actions = emptyList(),
             goals = setOf(
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "dupGoal",
                     description = "first",
                     satisfiedBy = CalibrationCompleted::class.java,
                 ),
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "dupGoal",
                     description = "second",
                     satisfiedBy = QuickCalibration::class.java,
@@ -1039,18 +1157,18 @@ class GoalEpisodePhase1Test {
 
     @Test
     fun `an output target resolving distinct goals sharing a name fails fast`() {
-        val agent = com.embabel.agent.core.Agent(
+        val agent = CoreAgent(
             name = "dup-output-agent",
             provider = "test",
             description = "distinct goals sharing a name",
             actions = emptyList(),
             goals = setOf(
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "dupGoal",
                     description = "first",
                     satisfiedBy = CalibrationCompleted::class.java,
                 ),
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "dupGoal",
                     description = "second",
                     satisfiedBy = CalibrationCompleted::class.java,
@@ -1161,18 +1279,18 @@ class GoalEpisodePhase1Test {
 
     @Test
     fun `a candidate goal sharing its name with another scoped goal is rejected`() {
-        val agent = com.embabel.agent.core.Agent(
+        val agent = CoreAgent(
             name = "shared-name-agent",
             provider = "test",
             description = "candidate and ordinary goal share a name",
             actions = emptyList(),
             goals = setOf(
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "sharedGoal",
                     description = "episode candidate",
                     satisfiedBy = CalibrationCompleted::class.java,
                 ),
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "sharedGoal",
                     description = "ordinary goal outside the target",
                     satisfiedBy = MissionReport::class.java,
@@ -1232,13 +1350,13 @@ class GoalEpisodePhase1Test {
     fun `a candidate goal without a JVM output type is rejected`() {
         // Nothing could ever be consumed for this goal, so a completed episode
         // would stay satisfied and loop
-        val agent = com.embabel.agent.core.Agent(
+        val agent = CoreAgent(
             name = "no-output-agent",
             provider = "test",
             description = "goal with no output type",
             actions = emptyList(),
             goals = setOf(
-                com.embabel.agent.core.Goal(
+                Goal(
                     name = "noOutputGoal",
                     description = "condition-gated only",
                 ),
@@ -1283,7 +1401,7 @@ class GoalEpisodePhase1Test {
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("calibrate:cal-1"), steps, "Real work ran despite the seeded output")
         assertNull(result.last<CalibrationRequested>(), "The request was consumed by a real completion")
-        assertEquals("stale", result.last<CalibrationCompleted>()?.id, "The fresh output was consumed; the decoy lingers")
+        assertNull(result.last<CalibrationCompleted>(), "Every visible instance of a product type is consumed")
     }
 
     @Test
@@ -1299,6 +1417,223 @@ class GoalEpisodePhase1Test {
             )
         }
         assertTrue("every completion path" in exception.message!!, exception.message!!)
+    }
+
+    @Test
+    fun `a candidate goal with a dynamic output type is rejected`() {
+        // Instances of a dynamic type can never be hidden, so a completed
+        // episode would stay satisfied and spin
+        val agent = CoreAgent(
+            name = "dynamic-output-agent",
+            provider = "test",
+            description = "goal with dynamic output type",
+            actions = emptyList(),
+            goals = setOf(
+                Goal(
+                    name = "dynamicGoal",
+                    description = "dynamic output",
+                    inputs = setOf(IoBinding(type = CalibrationRequested::class.java)),
+                    outputType = DynamicType("sensor.Reading"),
+                ),
+            ),
+        )
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "phase1-dynamic-output",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEpisodes(
+                    EpisodePolicy
+                        .episode(GoalTarget.named("dynamicGoal"))
+                        .consumeOnCompletion(CalibrationRequested::class.java)
+                ),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue("dynamicGoal" in exception.message!!, "Error names the goal: ${exception.message}")
+    }
+
+    @Test
+    fun `standing state maintained by a two-action cycle survives consumption`() {
+        val result = run(
+            PingPongAccumulatorAgent(),
+            "phase1-ping-pong",
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEpisodes(calibrationEpisode()),
+            PingTally(0),
+            PongTally(0),
+        )
+
+        val allSteps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            AgentProcessStatusCode.COMPLETED, result.status,
+            "steps=${allSteps.take(20)} total=${allSteps.size} tally=${result.last<PingTally>()} pong=${result.last<PongTally>()}",
+        )
+        assertEquals(3, result.last<MissionReport>()?.samples)
+        val pings = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "ping" }
+        // If consumption swept the ping-pong tallies as products, the cycle
+        // would roll back after the episode and need extra pings to recover
+        assertEquals(3, pings, "The two-action accumulator must not roll back at episode completion")
+    }
+
+    @Test
+    fun `every visible instance of a product type is consumed at completion`() {
+        val process = create(
+            RepeatableTwoStepAgent(),
+            "phase1-exhaustive-products",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+            CalibrationKit("stale-A"),
+            CalibrationKit("stale-B"),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status)
+        assertNull(parked.last<CalibrationKit>(), "No stale duplicate survives to shortcut the next plan")
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val rearmed = parked.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
+        val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("calibrate:stale-B", "prepKit:cal-2", "calibrate:cal-2"), steps,
+            "The second occurrence rebuilds the chain instead of reusing the surviving stale kit",
+        )
+    }
+
+    @Test
+    fun `two independent episodes in one process each complete and consume`() {
+        val result = run(
+            TwoEpisodeAgent(),
+            "phase1-two-episodes",
+            ProcessOptions.DEFAULT.withEpisodes(
+                EpisodePolicy
+                    .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                    .consumeOnCompletion(CalibrationRequested::class.java)
+                    .episode(GoalTarget.output(CalibrationArchived::class.java))
+                    .consumeOnCompletion(ZoneInfo::class.java)
+            ),
+            CalibrationRequested("cal-1"),
+            ZoneInfo("zone-1"),
+        )
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-1", "audit:zone-1"), steps)
+        assertNull(result.last<CalibrationRequested>())
+        assertNull(result.last<ZoneInfo>())
+        assertNull(result.last<CalibrationCompleted>())
+        assertNull(result.last<CalibrationArchived>())
+    }
+
+    @Test
+    fun `episode completion emits GoalAchievedEvent but never a process-finished event`() {
+        val events = mutableListOf<Any>()
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                events.add(event)
+            }
+        }
+        val blackboard = InMemoryBlackboard()
+        blackboard.addObject(CalibrationRequested("cal-1"))
+        val reader = AgentMetadataReader()
+        val agent = reader.createAgentMetadata(GoapEpisodeOnlyAgent()) as CoreAgent
+        val result = SimpleAgentProcess(
+            "phase1-episode-events",
+            null,
+            agent,
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            blackboard,
+            dummyPlatformServices(eventListener = listener),
+            DefaultPlannerFactory,
+            Instant.now(),
+        ).run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val goalAchieved = events.count { it is GoalAchievedEvent }
+        val finished = events.count { it is AgentProcessFinishedEvent }
+        assertEquals(1, goalAchieved, "One episode, one GoalAchievedEvent")
+        assertEquals(0, finished, "A nonterminal completion must not emit a process-finished event")
+    }
+
+    @Test
+    fun `a failing completing action leaves the request unconsumed for retry`() {
+        val agent = FlakyCalibrationAgent()
+        val process = create(
+            agent,
+            "phase1-flaky-action",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        runCatching { process.run() }
+        assertNotNull(process.last<CalibrationRequested>(), "A failed attempt must not consume the request")
+
+        val retried = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, retried.status)
+        assertEquals(2, agent.attempts, "The second attempt succeeded")
+        assertNull(retried.last<CalibrationRequested>(), "The successful completion consumed the request")
+    }
+
+    @Test
+    fun `a completing action that publishes the next request livelocks`() {
+        // Documented phase-1 limitation: consumption takes the latest visible
+        // occurrence, and a request published by the completing action itself
+        // is newer than the driver. The follow-up is consumed in the driver's
+        // place, the driver re-runs and republishes, and only the action
+        // budget ends the loop. Publish follow-up requests from an action that
+        // does not complete the episode; phase-2 ingress does not have this
+        // shape because external publications are not steps of the plan.
+        val process = create(
+            SelfRearmingAgent(),
+            "phase1-self-rearming",
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            CalibrationRequested("cal-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.TERMINATED, result.status, "The action budget ends the loop")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue(
+            steps.size > 2 && steps.all { it == "calibrate:cal-1" },
+            "The driver repeats while its follow-ups are consumed in its place: took ${steps.size} steps",
+        )
+    }
+
+    @Test
+    fun `concurrent process shares the episode contract - park and rearm`() {
+        val blackboard = InMemoryBlackboard()
+        blackboard.addObject(CalibrationRequested("cal-1"))
+        val reader = AgentMetadataReader()
+        val agent = reader.createAgentMetadata(GoapEpisodeOnlyAgent()) as CoreAgent
+        val process = ConcurrentAgentProcess(
+            "phase1-concurrent-episode",
+            null,
+            agent,
+            ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+
+        val parked = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, parked.status)
+        assertNull(parked.last<CalibrationRequested>())
+
+        parked.addObject(CalibrationRequested("cal-2"))
+        val rearmed = parked.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
+        val calibrated = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("calibrate:cal-1", "calibrate:cal-2"), calibrated)
     }
 
     @Test

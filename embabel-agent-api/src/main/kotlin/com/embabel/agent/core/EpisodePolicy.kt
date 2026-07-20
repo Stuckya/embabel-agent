@@ -15,6 +15,8 @@
  */
 package com.embabel.agent.core
 
+import java.util.List.copyOf
+
 /**
  * Reference to one or more declared goals in the scope of an agent process.
  * Targets are resolved against the active scope at process creation and
@@ -63,7 +65,8 @@ sealed interface GoalTarget {
  * existing identity-based [Blackboard.hide], so a later occurrence replans
  * the chain fresh. Product cleanup is conservative static analysis over the
  * candidate's possible producer paths; standing state an action maintains for
- * itself survives.
+ * itself survives. Validation against the process scope happens at process
+ * creation.
  * @param target the candidate declared goal(s) this episode completes
  * @param consumes the request type consumed when the episode completes.
  * Must be an off-chain input required on every completion path of every
@@ -71,20 +74,31 @@ sealed interface GoalTarget {
  * Null means infer it at process creation, permitted only when exactly one
  * such off-chain input exists.
  */
-data class Episode(
+data class Episode @JvmOverloads constructor(
     val target: GoalTarget,
     val consumes: Class<*>? = null,
 )
 
 /**
  * Episode policy for an agent process. Attach via [ProcessOptions.withEpisodes].
- * An empty policy preserves ordinary goal-completes-process behavior exactly.
+ * An empty policy preserves ordinary goal completion behavior exactly.
  * Nonterminal completion and request/output consumption are one contract:
  * an episode always consumes on completion and never completes the process.
+ * Policies are immutable; the fluent methods return new policies, and
+ * validation against the process scope happens at process creation.
  */
-data class EpisodePolicy(
-    val episodes: List<Episode> = emptyList(),
+class EpisodePolicy @JvmOverloads constructor(
+    episodes: List<Episode> = emptyList(),
 ) {
+
+    val episodes: List<Episode> = copyOf(episodes)
+
+    init {
+        val duplicated = this.episodes.groupBy { it.target }.filterValues { it.size > 1 }.keys
+        require(duplicated.isEmpty()) {
+            "Each goal target may appear in only one episode: ${duplicated.joinToString()}"
+        }
+    }
 
     /**
      * Add another episode for the given target.
@@ -92,11 +106,11 @@ data class EpisodePolicy(
      */
     @JvmName("addEpisode")
     fun episode(target: GoalTarget): EpisodePolicy =
-        this.copy(episodes = episodes + Episode(target))
+        EpisodePolicy(episodes + Episode(target))
 
     /**
      * Set the request type the most recently added episode consumes on completion.
-     * Required when the episode's goal path has more than one possible input.
+     * Required when the episode's goal path has more than one off-chain input.
      */
     fun consumeOnCompletion(requestType: Class<*>): EpisodePolicy {
         require(episodes.isNotEmpty()) {
@@ -105,10 +119,15 @@ data class EpisodePolicy(
         require(episodes.last().consumes == null) {
             "consumeOnCompletion is already set for the episode targeting ${episodes.last().target}"
         }
-        return this.copy(
-            episodes = episodes.dropLast(1) + episodes.last().copy(consumes = requestType)
-        )
+        return EpisodePolicy(episodes.dropLast(1) + episodes.last().copy(consumes = requestType))
     }
+
+    override fun equals(other: Any?): Boolean =
+        other is EpisodePolicy && other.episodes == episodes
+
+    override fun hashCode(): Int = episodes.hashCode()
+
+    override fun toString(): String = "EpisodePolicy(episodes=$episodes)"
 
     companion object {
 

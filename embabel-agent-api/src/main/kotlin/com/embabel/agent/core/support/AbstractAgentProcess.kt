@@ -309,7 +309,7 @@ abstract class AbstractAgentProcess(
         addObject(value)
     }
 
-    private fun makeRunning(): Boolean {
+    protected fun makeRunning(): Boolean {
         val currentStatus = _status.get()
         return when (currentStatus) {
             AgentProcessStatusCode.COMPLETED,
