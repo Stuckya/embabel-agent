@@ -161,9 +161,8 @@ The complete deterministic phase-1 surface, gathered in one place. Spellings are
 ```java
 // The substrate is data. The fluent EpisodePolicy.episode(...) chain is sugar over it.
 record Episode(
-    GoalTarget target,               // one or more candidate declared goals
-    Class<?> consumes,               // the request occurrence this episode consumes
-    boolean interruptsCurrentAction  // always false until phase 4
+    GoalTarget target,   // one or more candidate declared goals
+    Class<?> consumes    // the request occurrence this episode consumes
 ) {}
 
 record EpisodePolicy(List<Episode> episodes) {}
@@ -183,7 +182,7 @@ Surface rules, gathered from the sections below:
 - An empty policy preserves today's behavior exactly.
 - Recognition point: `SimpleAgentProcess.handleProcessCompletion(...)`, already shared by simple and concurrent processes.
 
-Not phase 1: `ingress()` (phase 2, Sub-Issue 2), the interruption flag's behavior (phase 4), `withObjectiveAuthor(...)` (phase 5), `recurring(...)` (work stream 7).
+Not phase 1: `ingress()` (phase 2, Sub-Issue 2), an `interruptsCurrentAction` episode field (phase 4 adds it), `withObjectiveAuthor(...)` (phase 5), `recurring(...)` (work stream 7).
 
 ### Runtime Semantics
 
@@ -390,13 +389,12 @@ The first implementation can remain process data. Illustrative Java records are 
 ```java
 record Episode(
     GoalTarget target,
-    Class<?> consumes,
-    boolean interruptsCurrentAction) {}
+    Class<?> consumes) {}
 
 record EpisodePolicy(List<Episode> episodes) {}
 ```
 
-Phase 1 uses `target` and `consumes`; cooperative interruption adds the third field in Phase 4. `SimpleAgentProcess.handleProcessCompletion(...)` is the existing shared recognition point used by simple and concurrent processes. It can read the policy before applying ordinary goal-completes-process behavior.
+Cooperative interruption adds an `interruptsCurrentAction` field in Phase 4; phase 1 carries no dormant surface for it. `SimpleAgentProcess.handleProcessCompletion(...)` is the existing shared recognition point used by simple and concurrent processes. It can read the policy before applying ordinary goal-completes-process behavior.
 
 Episode configuration needs only:
 
@@ -408,7 +406,7 @@ nonterminal consume-on-completion behavior
 
 An output target resolves matching scoped goal candidates; a named target resolves one stable declared goal identity. Existing conditions and planner selection choose among candidates. No candidate is a configuration error, while a candidate that is temporarily blocked remains an ordinary planner concern.
 
-The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values — and a multi-step path additionally owes one hide per intermediate, or a leftover intermediate re-satisfies the goal without a new request. The `evolving-mode-phase-1` branch carries a reference implementation driven by a 22-test suite exercising these criteria, including regressions from an adversarial review pass.
+The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values — and a multi-step path additionally owes one hide per intermediate, or a leftover intermediate re-satisfies the goal without a new request. The `evolving-mode-phase-1` branch carries a reference implementation driven by a 21-test suite exercising these criteria, including regressions from an adversarial review pass.
 
 Identity-based blackboard hiding is sufficient: consumption resolves statically at process creation and applies by identity at completion, with no per-occurrence tracking. Consumers never manage activation ids or lifecycle-only blackboard records.
 
