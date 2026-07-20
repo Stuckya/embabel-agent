@@ -53,14 +53,18 @@ sealed interface GoalTarget {
 /**
  * One repeatable, nonterminal goal episode: a declared goal reached via a
  * runtime request occurrence. Completing an episode goal does not complete
- * the process. On completion the exact request occurrence and the products
- * manufactured on the goal path (the satisfying output and any intermediates)
- * are hidden through the existing blackboard API, so a later occurrence
- * replans the entire chain fresh. Self-maintained standing state survives.
+ * the process. On completion the request and the completed candidate's chain
+ * products (the satisfying output and any intermediates) are hidden through
+ * existing equality-based [Blackboard.hide], so a later occurrence replans
+ * the chain fresh. Product cleanup is conservative static analysis over the
+ * candidate's possible producer paths; standing state an action maintains for
+ * itself survives.
  * @param target the candidate declared goal(s) this episode completes
  * @param consumes the request type consumed when the episode completes.
- * Null means infer it at process creation, which is only permitted when the
- * goal path has exactly one input type no scoped action produces.
+ * Must be an off-chain input required on every completion path of every
+ * candidate, match that binding's type exactly, and use the default binding.
+ * Null means infer it at process creation, permitted only when exactly one
+ * such off-chain input exists.
  */
 data class Episode(
     val target: GoalTarget,

@@ -62,6 +62,12 @@ interface RequestBase {
 
 data class SpecialRequest(override val id: String) : RequestBase
 
+interface Tally {
+    val count: Int
+}
+
+data class RunningTally(override val count: Int) : Tally
+
 /**
  * Phase-1 episode lifecycle for issue #1756, driving the contract test-first:
  * 1. HYBRID: an episode policy replaces the hand-rolled lifecycle of the baseline —
@@ -117,6 +123,12 @@ data class SpecialRequest(override val id: String) : RequestBase
  * 26. A visible chain product is planning bait, not an unexecuted-path
  *     casualty: the planner may route through it and consumption follows the
  *     completed plan (pin).
+ * 27. Self-maintenance follows planner semantics: an accumulator whose action
+ *     returns a subtype of its input is standing state and survives
+ *     consumption, exactly like the exact-type accumulator.
+ * 28. A self-refining producer makes the request optional on some path, so the
+ *     episode is rejected by every-path validation (pin: the too-broad
+ *     self-maintenance hazard cannot be configured).
  */
 class GoalEpisodePhase1Test {
 
@@ -385,6 +397,51 @@ class GoalEpisodePhase1Test {
         @AchievesGoal(description = "Calibration audited", value = 0.8)
         fun audit(request: CalibrationRequested): CalibrationArchived =
             CalibrationArchived(request.id)
+    }
+
+    @Agent(description = "Standing accumulator whose action returns a subtype of its input")
+    inner class SubtypeAccumulatorAgent {
+
+        @Action(canRerun = true, value = 0.2)
+        fun collect(tally: Tally, context: ActionContext): RunningTally {
+            context.addObject(ExecutedStep("collect"))
+            val next = RunningTally(tally.count + 1)
+            if (next.count == 2) {
+                context.addObject(CalibrationRequested("cal-1"))
+            }
+            return next
+        }
+
+        @Condition(name = "enoughSamples")
+        fun enoughSamples(tally: Tally): Boolean = tally.count >= 5
+
+        @Action(pre = ["enoughSamples"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun missionComplete(tally: Tally): MissionReport = MissionReport(tally.count)
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, tally: Tally, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Calibration chain with a self-refining kit producer")
+    inner class RefiningChainAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepKit(request: CalibrationRequested): CalibrationKit =
+            CalibrationKit(request.id)
+
+        @Action(canRerun = true, value = 0.5)
+        fun refineKit(kit: CalibrationKit): CalibrationKit =
+            CalibrationKit("${kit.id}-refined")
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(kit: CalibrationKit): CalibrationCompleted =
+            CalibrationCompleted(kit.id)
     }
 
     @Agent(description = "Two-step calibration whose intermediate step is one-shot")
@@ -1001,6 +1058,40 @@ class GoalEpisodePhase1Test {
         assertEquals(listOf("calibrate:decoy"), steps, "The planner used the visible kit; prep was unnecessary")
         assertNull(result.last<CalibrationKit>(), "The kit that satisfied the plan is consumed")
         assertNull(result.last<CalibrationRequested>(), "The configured request is the consumed occurrence")
+    }
+
+    @Test
+    fun `a subtype-returning accumulator is standing state and survives consumption`() {
+        val result = run(
+            SubtypeAccumulatorAgent(),
+            "phase1-subtype-accumulator",
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEpisodes(calibrationEpisode()),
+            RunningTally(0),
+        )
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(5, result.last<MissionReport>()?.samples)
+        val collects = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "collect" }
+        // If consumption hid the latest tally, collection would roll back one
+        // step after the episode and need an extra collect to reach the mission
+        assertEquals(5, collects, "The accumulator must not roll back at episode completion")
+    }
+
+    @Test
+    fun `a self-refining producer makes the request optional and the episode is rejected`() {
+        // refineKit can sustain the kit without a fresh request, so the request
+        // is not required on every completion path; the runaway this would
+        // allow at completion is unconfigurable
+        val exception = assertThrows<IllegalArgumentException> {
+            create(
+                RefiningChainAgent(),
+                "phase1-self-refining",
+                ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
+            )
+        }
+        assertTrue("every completion path" in exception.message!!, exception.message!!)
     }
 
     @Test

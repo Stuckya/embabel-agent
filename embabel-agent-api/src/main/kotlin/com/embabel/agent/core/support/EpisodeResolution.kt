@@ -34,9 +34,9 @@ import com.embabel.plan.common.condition.EffectSpec
  * chain, consumed alongside the request when that candidate completes. Includes
  * the satisfying output and any intermediates, so a stale intermediate cannot
  * shortcut the next occurrence's plan. Consumption is scoped to the completed
- * candidate; another candidate's products are not touched. Self-maintained
- * facts (a type some action both consumes and produces, such as an accumulator)
- * are never episode products and survive completion.
+ * candidate; another candidate's products are not touched. Standing state an
+ * action maintains for itself (its effects satisfy its own input, as with an
+ * accumulator) is never an episode product and survives completion.
  */
 internal data class ResolvedEpisode(
     val episode: Episode,
@@ -238,13 +238,19 @@ internal object EpisodeResolution {
         spec.filterValues { it == ConditionDetermination.TRUE }.keys.toList()
 
     /**
-     * A type an action both consumes and produces is self-maintained standing
-     * state, such as an accumulator, never a per-occurrence episode product.
+     * A chain action's product is standing state, never a per-occurrence
+     * episode product, when the action can sustain its own input: its effects
+     * satisfy one of its required input conditions by the planner's own
+     * matching rules. This covers exact accumulators (tally -> tally) and
+     * subtype accumulators (tally -> RunningTally) alike.
      */
     private fun isSelfMaintained(type: String, agent: Agent): Boolean =
-        agent.actions.any { action ->
-            action.inputs.any { it.type == type } && action.outputs.any { it.type == type }
-        }
+        agent.actions.any { maintainsOwnInputProducing(it, type) }
+
+    private fun maintainsOwnInputProducing(action: Action, type: String): Boolean {
+        if (action.outputs.none { it.type == type }) return false
+        return requiredConditions(action.preconditions).any { producesCondition(action, it) }
+    }
 
     /**
      * The consumed request must be an off-chain input required on every
