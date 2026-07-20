@@ -173,6 +173,10 @@ data class PongTally(val count: Int)
  *     action budget ends it (pin: occurrence pairing rides ordering in
  *     phase 1; publish follow-ups from a non-completing action).
  * 44. ConcurrentAgentProcess shares the episode contract: park and rearm.
+ * 45. EpisodeCompletedEvent is observed only after consumption: a listener
+ *     reading the blackboard at event time sees the consumed state.
+ * 46. Terminal completion emits both a plain GoalAchievedEvent and a
+ *     process-finished event; episodes emit neither of those.
  */
 class GoalEpisodePhase1Test {
 
@@ -1560,6 +1564,61 @@ class GoalEpisodePhase1Test {
             "Episode completions are distinguishable by type, matching the platform's event idiom",
         )
         assertEquals(0, finished, "A nonterminal completion must not emit a process-finished event")
+    }
+
+    @Test
+    fun `EpisodeCompletedEvent is observed after consumption`() {
+        // The event contract says consumption occurred and the process
+        // continues, so a listener reading the blackboard at event time
+        // must see the consumed state
+        var requestVisibleAtEvent: Boolean? = null
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                if (event is EpisodeCompletedEvent) {
+                    requestVisibleAtEvent =
+                        event.agentProcess.last(CalibrationRequested::class.java) != null
+                }
+            }
+        }
+        val result = run(
+            GoapEpisodeOnlyAgent(),
+            "phase1-event-ordering",
+            ProcessOptions.DEFAULT
+                .withEpisodes(calibrationEpisode())
+                .withListener(listener),
+            CalibrationRequested("cal-1"),
+        )
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        assertEquals(false, requestVisibleAtEvent, "Consumption must precede the event that announces it")
+    }
+
+    @Test
+    fun `terminal completion emits both goal and finished events`() {
+        val events = mutableListOf<Any>()
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                events.add(event)
+            }
+        }
+        val result = run(
+            EpisodeLifecycleAgent(),
+            "phase1-terminal-events",
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEpisodes(calibrationEpisode())
+                .withListener(listener),
+            SampleTally(0),
+        )
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        val goalEvents = events.filterIsInstance<GoalAchievedEvent>()
+        assertEquals(2, goalEvents.count { it is EpisodeCompletedEvent }, "Two episodes completed")
+        assertEquals(1, goalEvents.count { it !is EpisodeCompletedEvent }, "One terminal achievement")
+        assertTrue(
+            events.any { it is AgentProcessFinishedEvent },
+            "Terminal completion emits a process-finished event",
+        )
     }
 
     @Test

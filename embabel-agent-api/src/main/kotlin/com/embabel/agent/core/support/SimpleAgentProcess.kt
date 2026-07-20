@@ -145,13 +145,6 @@ open class SimpleAgentProcess(
             this.id,
             plan.goal.name,
         )
-        processContext.onProcessEvent(
-            EpisodeCompletedEvent(
-                agentProcess = this,
-                worldState = worldState,
-                goal = plan.goal,
-            )
-        )
         val consumedRequest = consumeLatest(episode.consumes)
         val consumedProducts = episode.productsFor(plan.goal.name).sumOf { consumeAll(it) }
         if (!consumedRequest) {
@@ -173,7 +166,17 @@ open class SimpleAgentProcess(
             setStatus(AgentProcessStatusCode.FAILED)
             return
         }
-        makeRunning()
+        if (makeRunning()) {
+            // The event announces consumption and continuation, so it fires
+            // only once both are true
+            processContext.onProcessEvent(
+                EpisodeCompletedEvent(
+                    agentProcess = this,
+                    worldState = worldState,
+                    goal = plan.goal,
+                )
+            )
+        }
     }
 
     /**
