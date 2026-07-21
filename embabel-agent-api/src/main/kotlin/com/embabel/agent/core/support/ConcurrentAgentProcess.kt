@@ -60,7 +60,7 @@ open class ConcurrentAgentProcess(
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(
             system = agent.planningSystem,
-            excludedActionNames = replanBlacklist,
+            excludedActionNames = replanBlacklist + gatedChainActions(),
         )
         if (plan == null) {
             if (replanBlacklist.isNotEmpty()) {
@@ -121,7 +121,7 @@ open class ConcurrentAgentProcess(
                                 platformServices.asyncer.async {
                                     try {
                                         callbacks.forEach { it.onActionLaunched(process, action) }
-                                        executeAction(action)
+                                        executeActionAttributingConsumables(action)
                                     } catch (rpe: ReplanRequestedException) {
                                         // Capture for post-execution handling; return TERMINATED so
                                         // the status aggregation loop doesn't fail on a missing value.

@@ -134,9 +134,9 @@ data class PongTally(val count: Int)
  *     consumption follows default-binding semantics only.
  * 25. An output target resolving distinct goals that share a name fails fast
  *     instead of silently collapsing them.
- * 26. A visible chain product is planning bait, not an unexecuted-path
- *     casualty: the planner may route through it and consumption follows the
- *     completed plan (pin).
+ * 26. A foreign chain product is used, not consumed: the planner may route
+ *     through it, but attribution records only what this occurrence made,
+ *     so an instance made elsewhere survives as a standing resource.
  * 27. Self-maintenance follows planner semantics: an accumulator whose action
  *     returns a subtype of its input is standing state and survives
  *     consumption, exactly like the exact-type accumulator.
@@ -158,14 +158,15 @@ data class PongTally(val count: Int)
  * 35. A candidate goal without a JVM output type is rejected (pin: its
  *     required-input set is empty, so the every-path rule already fires).
  * 36. A seeded output does not pre-satisfy a reader-built episode goal:
- *     hasRun in goal preconditions demands real work, and completion sweeps
- *     every visible instance of a product type.
+ *     hasRun in goal preconditions demands real work. The occurrence
+ *     consumes its own fresh output; the foreign decoy merely lingers.
  * 37. A candidate goal with a dynamic (non-JVM) output type is rejected:
  *     its instances could never be hidden, so completion would spin.
  * 38. Standing state maintained by a two-action cycle survives consumption,
  *     exactly like a single-action accumulator.
- * 39. Every visible instance of a product type is consumed at completion:
- *     a stale duplicate cannot shortcut the next occurrence's plan.
+ * 39. Foreign duplicates of a product type survive as standing resources:
+ *     an occurrence consumes exactly what it made, by identity, and later
+ *     occurrences may legitimately route through what was made elsewhere.
  * 40. Two independent episodes in one process each complete and consume.
  * 41. Episode completion emits GoalAchievedEvent but never a process-finished
  *     event; the terminal goal emits both (pin).
@@ -1240,9 +1241,10 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
-    fun `a visible chain product is planning bait - consumption follows the completed plan`() {
-        // The decoy kit is not an unexecuted-path casualty: the planner routes
-        // through it, the goal completes off it, and consumption follows the plan
+    fun `a foreign chain product is used, not consumed - attribution takes only what the occurrence made`() {
+        // The seeded kit was made elsewhere, so the episode routes through it
+        // without consuming it: attribution records only instances the chain
+        // made for this occurrence. The next occurrence legitimately reuses it
         val process = create(
             RepeatableTwoStepAgent(),
             "phase1-product-bait",
@@ -1251,13 +1253,22 @@ class GoalEpisodePhase1Test {
             CalibrationKit("decoy"),
         )
 
-        val result = process.run()
+        val completedOnce = process.run()
 
-        assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertEquals(listOf("calibrate:decoy"), steps, "The planner used the visible kit; prep was unnecessary")
-        assertNull(result.last<CalibrationKit>(), "The kit that satisfied the plan is consumed")
-        assertNull(result.last<CalibrationRequested>(), "The configured request is the consumed occurrence")
+        assertEquals(AgentProcessStatusCode.STUCK, completedOnce.status)
+        assertNotNull(completedOnce.last<CalibrationKit>(), "A kit made elsewhere is used, not consumed")
+        assertNull(completedOnce.last<CalibrationRequested>(), "The occurrence itself is consumed")
+        assertNull(completedOnce.last<CalibrationCompleted>(), "The output the occurrence made is consumed")
+
+        completedOnce.addObject(CalibrationRequested("cal-2"))
+        val completedTwice = completedOnce.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, completedTwice.status)
+        val steps = completedTwice.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("calibrate:decoy", "calibrate:decoy"), steps,
+            "The foreign kit is a standing resource both occurrences route through; prep never runs",
+        )
     }
 
     @Test
@@ -1446,7 +1457,10 @@ class GoalEpisodePhase1Test {
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("calibrate:cal-1"), steps, "Real work ran despite the seeded output")
         assertNull(result.last<CalibrationRequested>(), "The request was consumed by a real completion")
-        assertNull(result.last<CalibrationCompleted>(), "Every visible instance of a product type is consumed")
+        assertEquals(
+            "stale", result.last<CalibrationCompleted>()?.id,
+            "The occurrence consumed its own fresh output; the foreign decoy merely lingers",
+        )
     }
 
     @Test
@@ -1526,10 +1540,14 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
-    fun `every visible instance of a product type is consumed at completion`() {
+    fun `foreign duplicates of a product type survive as standing resources`() {
+        // Under the old type sweep both seeded kits were eaten at the first
+        // completion, forcing the second occurrence to rebuild the chain.
+        // Attribution consumes only what the occurrence made, so kits made
+        // elsewhere persist and both occurrences legitimately route through one
         val process = create(
             RepeatableTwoStepAgent(),
-            "phase1-exhaustive-products",
+            "phase1-foreign-products",
             ProcessOptions.DEFAULT.withEpisodes(calibrationEpisode()),
             CalibrationRequested("cal-1"),
             CalibrationKit("stale-A"),
@@ -1538,7 +1556,11 @@ class GoalEpisodePhase1Test {
 
         val parked = process.run()
         assertEquals(AgentProcessStatusCode.STUCK, parked.status)
-        assertNull(parked.last<CalibrationKit>(), "No stale duplicate survives to shortcut the next plan")
+        assertEquals(
+            2, parked.objects.filterIsInstance<CalibrationKit>().size,
+            "Kits made elsewhere survive completion",
+        )
+        assertNull(parked.last<CalibrationCompleted>(), "The occurrence's own output is consumed")
 
         parked.addObject(CalibrationRequested("cal-2"))
         val rearmed = parked.run()
@@ -1546,8 +1568,8 @@ class GoalEpisodePhase1Test {
         assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
         val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
-            listOf("calibrate:stale-B", "prepKit:cal-2", "calibrate:cal-2"), steps,
-            "The second occurrence rebuilds the chain instead of reusing the surviving stale kit",
+            listOf("calibrate:stale-B", "calibrate:stale-B"), steps,
+            "Both occurrences route through the standing kit; the chain never needs rebuilding",
         )
     }
 

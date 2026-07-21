@@ -18,13 +18,18 @@ package com.embabel.agent.core.support
 import com.embabel.agent.core.EpisodeRule
 
 /**
- * One occurrence of a goal episode at runtime: the request that drives it
- * and where it stands in the serial-admission lifecycle. An [EpisodeRule]
- * declares which goals are episodic at construction; each arriving
- * occurrence becomes an Episode. At most one Episode per rule is ACTIVE.
- * Later arrivals wait PENDING, hidden until admitted, so each chain binds
- * exactly its own driver. Completion consumes the driver by identity and
- * admits the next.
+ * One occurrence of a goal episode at runtime: the request that drives it,
+ * the consumables its chain has made, and where it stands in the
+ * serial-admission lifecycle. An [EpisodeRule] declares which goals are
+ * episodic at construction; each arriving occurrence becomes an Episode.
+ * At most one Episode per rule is ACTIVE. Later arrivals wait PENDING,
+ * hidden until admitted, so each chain binds exactly its own driver.
+ *
+ * Consumables follow AIMA's consumable-resource idea: instances a chain
+ * action made for this occurrence, recorded by identity as they appear.
+ * Completion consumes the driver and the completed candidate's consumables,
+ * exactly what this occurrence made and nothing else. Off-chain inputs and
+ * standing state are used, not consumed, and survive.
  */
 internal class Episode(
     val driver: Any,
@@ -32,6 +37,8 @@ internal class Episode(
 
     var state: EpisodeState = EpisodeState.PENDING
         private set
+
+    private val consumables = mutableListOf<AttributedConsumable>()
 
     fun activate() {
         state = EpisodeState.ACTIVE
@@ -41,9 +48,27 @@ internal class Episode(
         state = EpisodeState.COMPLETED
     }
 
-    override fun toString(): String = "Episode(state=$state, driver=$driver)"
+    fun record(actionName: String, instance: Any) {
+        consumables += AttributedConsumable(actionName, instance)
+    }
+
+    /** Consumables made by the given chain actions, in production order */
+    fun consumablesFrom(chainActionNames: Set<String>): List<Any> =
+        consumables.filter { it.actionName in chainActionNames }.map { it.instance }
+
+    override fun toString(): String =
+        "Episode(state=$state, driver=$driver, consumables=${consumables.size})"
 
 }
+
+/**
+ * A consumable attributed to the chain action that made it, so completion
+ * can consume the completed candidate's consumables and no other's.
+ */
+internal data class AttributedConsumable(
+    val actionName: String,
+    val instance: Any,
+)
 
 internal enum class EpisodeState {
     PENDING,

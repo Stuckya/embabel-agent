@@ -30,23 +30,37 @@ import com.embabel.plan.common.condition.EffectSpec
  * An [EpisodeRule] resolved against the goals and actions of a process scope.
  * @param goalsByName the candidate declared goals, keyed by name
  * @param consumes the resolved request type, explicit or inferred
- * @param productsByGoal for each candidate goal, the types manufactured on its
- * chain, consumed alongside the request when that candidate completes. Includes
- * the satisfying output and any intermediates, so a stale intermediate cannot
- * shortcut the next occurrence's plan. Consumption is scoped to the completed
- * candidate; another candidate's products are not touched. Standing state an
- * action maintains for itself (its effects satisfy its own input, as with an
- * accumulator) is never an episode product and survives completion.
+ * @param consumableTypesByGoal for each candidate goal, the validated consumable types
+ * its chain can manufacture: the satisfying output and any intermediates,
+ * loaded and consumable. Standing state an action maintains for itself (its
+ * effects satisfy its own input, as with an accumulator) is never a consumable.
+ * @param chainActionsByGoal for each candidate goal, the names of the actions
+ * the planner can route toward it: attribution membership.
+ * @param attributedTypesByAction for each chain action, the consumable types
+ * whose new instances are attributed to the active episode when it runs.
+ * Completion consumes the attributed consumables of the completed candidate's
+ * chain by identity, so an occurrence consumes exactly what it made: a stale
+ * intermediate of its own cannot shortcut the next occurrence's plan, and
+ * instances made elsewhere are used, not consumed.
  */
 internal data class ResolvedEpisodeRule(
     val goalsByName: Map<String, Goal>,
     val consumes: Class<*>,
-    val productsByGoal: Map<String, List<Class<*>>>,
+    val consumableTypesByGoal: Map<String, List<Class<*>>>,
+    val chainActionsByGoal: Map<String, Set<String>>,
+    val attributedTypesByAction: Map<String, List<Class<*>>>,
+    val exclusiveChainActions: Set<String> = emptySet(),
 ) {
 
     fun matches(goalName: String): Boolean = goalName in goalsByName
 
-    fun productsFor(goalName: String): List<Class<*>> = productsByGoal[goalName] ?: emptyList()
+    fun chainActionsFor(goalName: String): Set<String> = chainActionsByGoal[goalName].orEmpty()
+
+    fun isChainAction(actionName: String): Boolean =
+        chainActionsByGoal.values.any { actionName in it }
+
+    fun attributedTypesFor(actionName: String): List<Class<*>> =
+        attributedTypesByAction[actionName].orEmpty()
 
 }
 
@@ -59,7 +73,7 @@ internal data class ResolvedEpisodeRule(
 internal object EpisodeResolution {
 
     fun resolve(policy: EpisodePolicy, agent: Agent): List<ResolvedEpisodeRule> {
-        val resolved = policy.episodes.map { resolveEpisode(it, agent) }
+        val resolved = policy.episodes.map { resolveRule(it, agent) }
         val duplicated = resolved.groupBy { it.consumes }.filterValues { it.size > 1 }.keys
         require(duplicated.isEmpty()) {
             "Each request type may drive only one episode; consumed by multiple episodes: " +
@@ -67,15 +81,38 @@ internal object EpisodeResolution {
         }
         val goalOwner = mutableMapOf<String, Class<*>>()
         resolved
-            .flatMap { episode -> episode.goalsByName.keys.map { it to episode.consumes } }
+            .flatMap { resolved -> resolved.goalsByName.keys.map { it to resolved.consumes } }
             .forEach { (goalName, consumes) -> requireSingleOwner(goalOwner, goalName, consumes) }
-        return resolved
+        return withExclusiveChainActions(resolved, agent)
     }
 
-    private fun resolveEpisode(episode: EpisodeRule, agent: Agent): ResolvedEpisodeRule {
-        val candidates = candidatesFor(episode, agent)
+    /**
+     * An episode chain is plannable only while one of its episodes is
+     * active, so a chain action serving no other goal is excluded from
+     * planning when its rule has no active episode. Without the gate a
+     * standing resource could let the chain complete driverless. Actions
+     * shared with non-episode goals are never gated.
+     */
+    private fun withExclusiveChainActions(
+        resolved: List<ResolvedEpisodeRule>,
+        agent: Agent,
+    ): List<ResolvedEpisodeRule> {
+        val episodeGoalNames = resolved.flatMapTo(mutableSetOf()) { it.goalsByName.keys }
+        val nonEpisodeChain = agent.goals
+            .filterNot { it.name in episodeGoalNames }
+            .flatMapTo(mutableSetOf()) { goal -> chainActions(goal, agent).map { it.name } }
+        return resolved.map { rule ->
+            rule.copy(
+                exclusiveChainActions = rule.chainActionsByGoal.values
+                    .flatMapTo(mutableSetOf()) { it } - nonEpisodeChain
+            )
+        }
+    }
+
+    private fun resolveRule(rule: EpisodeRule, agent: Agent): ResolvedEpisodeRule {
+        val candidates = candidatesFor(rule, agent)
         require(candidates.isNotEmpty()) {
-            "Episode target ${episode.target} resolves to no declared goal in scope. " +
+            "Episode target ${rule.target} resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
         }
         val chains = candidates.associate { it.name to analyzeGoalChain(it, agent) }
@@ -85,37 +122,64 @@ internal object EpisodeResolution {
         val requiredOnEveryPath = chains.values
             .map { it.requiredOffChainBindings }
             .reduce { a, b -> a intersect b }
-        val consumes = episode.consumes
-            ?.also { validateExplicitConsumes(episode, it, requiredOnEveryPath) }
-            ?: inferConsumes(episode, requiredOnEveryPath)
-        candidates.forEach { requireConsumableOutput(episode, it, agent) }
+        val consumes = rule.consumes
+            ?.also { validateExplicitConsumes(rule, it, requiredOnEveryPath) }
+            ?: inferConsumes(rule, requiredOnEveryPath)
+        candidates.forEach { requireConsumableOutput(rule, it, agent) }
+        val consumableTypesByGoal = chains.mapValues { (goalName, chain) ->
+            chain.outputTypes
+                .filterNot { isSelfMaintained(it, agent) }
+                .map { loadConsumableClass(goalName, it) }
+        }
         return ResolvedEpisodeRule(
             goalsByName = candidates.associateBy { it.name },
             consumes = consumes,
-            productsByGoal = chains.mapValues { (goalName, chain) ->
-                chain.productTypes
-                    .filterNot { isSelfMaintained(it, agent) }
-                    .map { loadProductClass(goalName, it) }
+            consumableTypesByGoal = consumableTypesByGoal,
+            chainActionsByGoal = chains.mapValues { (_, chain) ->
+                chain.chainActions.mapTo(linkedSetOf()) { it.name }
             },
+            attributedTypesByAction = attributedTypes(chains, consumableTypesByGoal),
         )
     }
 
-    private fun loadProductClass(goalName: String, typeName: String): Class<*> =
+    /**
+     * For each chain action, the consumable types whose instances are
+     * attributed to the active episode when the action executes: the
+     * action's declared outputs, restricted to validated consumable types, so
+     * self-maintained standing state is never attributed.
+     */
+    private fun attributedTypes(
+        chains: Map<String, GoalChain>,
+        consumableTypesByGoal: Map<String, List<Class<*>>>,
+    ): Map<String, List<Class<*>>> {
+        val byAction = mutableMapOf<String, MutableSet<Class<*>>>()
+        chains.forEach { (goalName, chain) ->
+            val consumables = consumableTypesByGoal[goalName].orEmpty()
+            chain.chainActions.forEach { action ->
+                val declared = action.outputs.mapTo(mutableSetOf()) { it.type }
+                byAction.getOrPut(action.name) { linkedSetOf() } +=
+                    consumables.filter { it.name in declared }
+            }
+        }
+        return byAction.mapValues { it.value.toList() }
+    }
+
+    private fun loadConsumableClass(goalName: String, typeName: String): Class<*> =
         IoBinding(typeName).resolveJvmType()?.clazz
             ?: throw IllegalArgumentException(
                 "Episode candidate $goalName produces $typeName, which cannot be loaded: " +
-                        "every product must be a consumable JVM type"
+                        "every consumable must be a loadable JVM type"
             )
 
-    private fun candidatesFor(episode: EpisodeRule, agent: Agent): List<Goal> =
-        when (val target = episode.target) {
-            is GoalTarget.Named -> namedCandidates(episode, target, agent)
-            is GoalTarget.Output -> outputCandidates(episode, target, agent)
+    private fun candidatesFor(rule: EpisodeRule, agent: Agent): List<Goal> =
+        when (val target = rule.target) {
+            is GoalTarget.Named -> namedCandidates(rule, target, agent)
+            is GoalTarget.Output -> outputCandidates(rule, target, agent)
         }
 
-    private fun outputCandidates(episode: EpisodeRule, target: GoalTarget.Output, agent: Agent): List<Goal> {
+    private fun outputCandidates(rule: EpisodeRule, target: GoalTarget.Output, agent: Agent): List<Goal> {
         val matches = agent.goals.filter { satisfiesOutputTarget(it, target) }
-        requireDistinctNames(episode, matches)
+        requireDistinctNames(rule, matches)
         requireNamesUniqueInScope(matches, agent)
         return matches
     }
@@ -135,12 +199,12 @@ internal object EpisodeResolution {
     }
 
     /**
-     * A satisfying output must be a per-occurrence product. An output that is
+     * A satisfying output must be a per-occurrence consumable. An output that is
      * standing state would survive consumption and keep the goal satisfied
      * forever, and a non-JVM output could never be hidden at all: either way
      * the episode could not rearm.
      */
-    private fun requireConsumableOutput(episode: EpisodeRule, goal: Goal, agent: Agent) {
+    private fun requireConsumableOutput(rule: EpisodeRule, goal: Goal, agent: Agent) {
         val outputType = goal.outputType
         require(outputType is JvmType) {
             "Episode candidate ${goal.name} does not produce a JVM output type: " +
@@ -149,22 +213,22 @@ internal object EpisodeResolution {
         require(!isSelfMaintained(outputType.className, agent)) {
             "Episode candidate ${goal.name} is satisfied by ${outputType.className}, which is standing state " +
                     "an action maintains for itself: a satisfying output must be a per-occurrence " +
-                    "product. Return a distinct completion type"
+                    "consumable. Return a distinct completion type"
         }
     }
 
-    private fun requireDistinctNames(episode: EpisodeRule, candidates: List<Goal>) {
+    private fun requireDistinctNames(rule: EpisodeRule, candidates: List<Goal>) {
         val duplicated = candidates.groupBy { it.name }.filterValues { it.size > 1 }.keys
         require(duplicated.isEmpty()) {
-            "Episode target ${episode.target} resolves distinct goals sharing a name: " +
+            "Episode target ${rule.target} resolves distinct goals sharing a name: " +
                     "${duplicated.joinToString()}; goal names must be unique to participate in an episode"
         }
     }
 
-    private fun namedCandidates(episode: EpisodeRule, target: GoalTarget.Named, agent: Agent): List<Goal> {
+    private fun namedCandidates(rule: EpisodeRule, target: GoalTarget.Named, agent: Agent): List<Goal> {
         val matches = agent.goals.filter { it.name == target.goalName }
         require(matches.size <= 1) {
-            "Episode target ${episode.target} resolves to ${matches.size} declared goals; " +
+            "Episode target ${rule.target} resolves to ${matches.size} declared goals; " +
                     "a named target must identify exactly one"
         }
         return matches
@@ -188,9 +252,13 @@ internal object EpisodeResolution {
     private data class GoalChain(
         /** Off-chain input bindings required on every completion path to the goal */
         val requiredOffChainBindings: Set<String>,
-        /** Output types declared by the chain's actions, satisfying output included */
-        val productTypes: Set<String>,
-    )
+        /** The actions the planner can route toward the goal */
+        val chainActions: Set<Action>,
+    ) {
+        /** Output types the chain's actions declare, satisfying output included */
+        val outputTypes: Set<String>
+            get() = chainActions.flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } }
+    }
 
     /**
      * Analyze the condition graph the planner searches: from the goal's
@@ -209,7 +277,7 @@ internal object EpisodeResolution {
             requiredOffChainBindings = requiredBindings(
                 requiredConditions(goal.preconditions), agent, mutableMapOf(), mutableSetOf(),
             ),
-            productTypes = chainProductTypes(goal, agent),
+            chainActions = chainActions(goal, agent),
         )
 
     /**
@@ -259,7 +327,7 @@ internal object EpisodeResolution {
         return setOf(condition)
     }
 
-    private fun chainProductTypes(goal: Goal, agent: Agent): Set<String> {
+    private fun chainActions(goal: Goal, agent: Agent): Set<Action> {
         val chainActions = linkedSetOf<Action>()
         val visited = mutableSetOf<String>()
         val toWalk = ArrayDeque(requiredConditions(goal.preconditions))
@@ -271,7 +339,7 @@ internal object EpisodeResolution {
                 .filter { chainActions.add(it) }
                 .forEach { toWalk.addAll(requiredConditions(it.preconditions)) }
         }
-        return chainActions.flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } }
+        return chainActions
     }
 
     private fun producesCondition(action: Action, condition: String): Boolean =
@@ -281,8 +349,8 @@ internal object EpisodeResolution {
         spec.filterValues { it == ConditionDetermination.TRUE }.keys.toList()
 
     /**
-     * A chain action's product is standing state, never a per-occurrence
-     * episode product, when some producer of it can sustain the type without a
+     * A chain action's output is standing state, never a per-occurrence
+     * consumable, when some producer of it can sustain the type without a
      * fresh occurrence: either the producer's effects satisfy one of its own
      * required inputs (an accumulator, exact or subtype), or the producer
      * transitively requires no off-chain input at all (a multi-action cycle
@@ -342,23 +410,23 @@ internal object EpisodeResolution {
      * could complete and consume an active driver whose work never ran.
      */
     private fun validateExplicitConsumes(
-        episode: EpisodeRule,
+        rule: EpisodeRule,
         explicit: Class<*>,
         requiredOnEveryPath: Set<String>,
     ) {
         val binding = requiredOnEveryPath.firstOrNull { IoBinding(it).type == explicit.name }
         require(binding != null) {
-            "Episode target ${episode.target} cannot consume ${explicit.name}: it is not an off-chain " +
+            "Episode target ${rule.target} cannot consume ${explicit.name}: it is not an off-chain " +
                     "input required on every completion path. Required off-chain inputs: " +
                     describeBindings(requiredOnEveryPath)
         }
-        requireDefaultBinding(episode, binding)
+        requireDefaultBinding(rule, binding)
     }
 
-    private fun requireDefaultBinding(episode: EpisodeRule, bindingCondition: String) {
+    private fun requireDefaultBinding(rule: EpisodeRule, bindingCondition: String) {
         val bindingName = IoBinding(bindingCondition).name
         require(bindingName == IoBinding.DEFAULT_BINDING) {
-            "Episode target ${episode.target} cannot consume a request bound as '$bindingName': " +
+            "Episode target ${rule.target} cannot consume a request bound as '$bindingName': " +
                     "named request bindings are not supported"
         }
     }
@@ -369,25 +437,25 @@ internal object EpisodeResolution {
     /**
      * Infer the consumed request type as the single off-chain input required on
      * every completion path. Such an input is an observation rather than a
-     * plannable product, which is exactly what a request occurrence is.
+     * plannable output, which is exactly what a request occurrence is.
      * Anything else is ambiguous and requires explicit consumeOnCompletion.
      */
-    private fun inferConsumes(episode: EpisodeRule, requiredOnEveryPath: Set<String>): Class<*> {
+    private fun inferConsumes(rule: EpisodeRule, requiredOnEveryPath: Set<String>): Class<*> {
         require(requiredOnEveryPath.isNotEmpty()) {
-            "Cannot infer the consumed request for episode target ${episode.target}: " +
+            "Cannot infer the consumed request for episode target ${rule.target}: " +
                     "no off-chain input is required on every completion path. " +
                     "Specify consumeOnCompletion explicitly"
         }
         require(requiredOnEveryPath.size == 1) {
-            "Cannot infer the consumed request for episode target ${episode.target}: " +
+            "Cannot infer the consumed request for episode target ${rule.target}: " +
                     "multiple off-chain inputs are required: ${describeBindings(requiredOnEveryPath)}. " +
                     "Specify consumeOnCompletion explicitly"
         }
         val binding = requiredOnEveryPath.single()
-        requireDefaultBinding(episode, binding)
+        requireDefaultBinding(rule, binding)
         return IoBinding(binding).resolveJvmType()?.clazz
             ?: throw IllegalArgumentException(
-                "Cannot infer the consumed request for episode target ${episode.target}: " +
+                "Cannot infer the consumed request for episode target ${rule.target}: " +
                         "cannot load inferred input type ${IoBinding(binding).type}. " +
                         "Specify consumeOnCompletion explicitly"
             )

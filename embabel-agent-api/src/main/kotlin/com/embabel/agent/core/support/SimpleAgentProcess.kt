@@ -24,6 +24,7 @@ import com.embabel.agent.api.tool.TerminateActionException
 import com.embabel.agent.api.tool.TerminateAgentException
 import com.embabel.agent.api.tool.ToolControlFlowSignal
 import com.embabel.agent.core.Action
+import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
@@ -185,9 +186,8 @@ open class SimpleAgentProcess(
 
     /**
      * Completes a goal episode without completing the process: consumes the
-     * active episode's driver by identity and the chain's products
-     * (satisfying output and any intermediates manufactured on the goal
-     * path) by hiding them, then keeps the process running so ordinary
+     * active episode's driver and its attributed consumables (satisfying
+     * output and any intermediates this occurrence made) by identity, then keeps the process running so ordinary
      * selection resumes at the next planning tick. The next pending episode,
      * if any, is admitted and replans the entire chain fresh.
      */
@@ -201,8 +201,8 @@ open class SimpleAgentProcess(
             this.id,
             plan.goal.name,
         )
+        val consumedConsumables = consumeAttributed(rule, plan.goal.name)
         val consumedRequest = completeActiveEpisode(rule)
-        val consumedProducts = rule.productsFor(plan.goal.name).sumOf { consumeAll(it) }
         if (!consumedRequest) {
             logger.warn(
                 "Process {} episode goal {} completed with no active episode; " +
@@ -212,7 +212,7 @@ open class SimpleAgentProcess(
                 rule.consumes.name,
             )
         }
-        if (!consumedRequest && consumedProducts == 0) {
+        if (!consumedRequest && consumedConsumables == 0) {
             logger.error(
                 "Process {} episode goal {} completed but nothing was consumed; " +
                         "failing instead of spinning on a goal that will stay satisfied",
@@ -236,23 +236,58 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Hides every visible instance of an episode product type. Products are
-     * per-occurrence, and a surviving stale duplicate could otherwise
-     * shortcut the next occurrence's plan.
+     * Consume the active episode's attributed consumables for the completed
+     * candidate by identity: exactly what this occurrence made, nothing
+     * made elsewhere. Consumables of the episode's own failed attempts are
+     * recorded like any other and swept here.
      */
-    private fun consumeAll(type: Class<*>): Int {
-        val consumed = blackboard.objectsOfType(type)
-        consumed.forEach { blackboard.hide(it) }
+    private fun consumeAttributed(rule: ResolvedEpisodeRule, goalName: String): Int {
+        val episode = activeEpisodes[rule] ?: return 0
+        val consumed = episode.consumablesFrom(rule.chainActionsFor(goalName))
+        consumed.forEach(blackboard::hide)
         if (consumed.isNotEmpty()) {
             logger.debug(
-                "Process {} consumed {} instance(s) of {}",
+                "Process {} consumed {} attributed consumable(s)",
                 this.id,
                 consumed.size,
-                type.simpleName,
             )
         }
         return consumed.size
     }
+
+    /**
+     * Execute the action, attributing new instances of its declared consumable
+     * types to the active episode whose chain it belongs to. Attribution is
+     * by identity, so completion consumes exactly what the occurrence made.
+     */
+    protected fun executeActionAttributingConsumables(action: Action): ActionStatus {
+        val owner = activeEpisodeOwning(action.name) ?: return executeAction(action)
+        val (rule, episode) = owner
+        val before: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
+        before.addAll(blackboard.objects)
+        val status = executeAction(action)
+        blackboard.objects
+            .filter { it !in before }
+            .filter { instance -> rule.attributedTypesFor(action.name).any { it.isInstance(instance) } }
+            .forEach { instance -> episode.record(action.name, instance) }
+        return status
+    }
+
+    private fun activeEpisodeOwning(actionName: String): Pair<ResolvedEpisodeRule, Episode>? =
+        activeEpisodes.entries
+            .firstOrNull { (rule, _) -> rule.isChainAction(actionName) }
+            ?.toPair()
+
+    /**
+     * Everything episodic happens inside an episode: a rule's exclusive
+     * chain actions are plannable only while the rule has an active
+     * episode, so a standing resource can never let the chain complete
+     * driverless.
+     */
+    protected fun gatedChainActions(): Set<String> =
+        resolvedEpisodes
+            .filter { it !in activeEpisodes }
+            .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
 
     protected fun sendProcessRunningEvent(
         plan: Plan,
@@ -273,7 +308,7 @@ open class SimpleAgentProcess(
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
             system = agent.planningSystem,
-            excludedActionNames = replanBlacklist,
+            excludedActionNames = replanBlacklist + gatedChainActions(),
         )
         if (plan == null) {
             // If no plan found with blacklist, try without it as a fallback
@@ -301,7 +336,7 @@ open class SimpleAgentProcess(
 
             val action = resolveActionFromPlan(plan)
             try {
-                val actionStatus = executeAction(action)
+                val actionStatus = executeActionAttributingConsumables(action)
                 setStatus(actionStatusToAgentProcessStatus(actionStatus))
             } catch (rpe: ReplanRequestedException) {
                 handleReplanRequest(action, rpe)
