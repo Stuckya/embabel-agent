@@ -73,6 +73,8 @@ class InMemoryBlackboard(
         hiddens += what
     }
 
+    override fun reveal(what: Any): Boolean = hiddens.remove(what)
+
     fun isHidden(what: Any): Boolean = hiddens.contains(what)
 
     override val objects: List<Any>

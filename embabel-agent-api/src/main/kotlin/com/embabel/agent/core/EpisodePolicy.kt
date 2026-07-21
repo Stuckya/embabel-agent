@@ -58,23 +58,24 @@ sealed interface GoalTarget {
 }
 
 /**
- * One repeatable, nonterminal goal episode: a declared goal reached via a
- * runtime request occurrence. Completing an episode goal does not complete
- * the process. On completion the request and the completed candidate's chain
- * products (the satisfying output and any intermediates) are hidden through
- * existing identity-based [Blackboard.hide], so a later occurrence replans
- * the chain fresh. Product cleanup is conservative static analysis over the
- * candidate's possible producer paths; standing state an action maintains for
- * itself survives. Validation against the process scope happens at process
- * creation.
+ * The rule declaring one repeatable, nonterminal goal episode: a declared
+ * goal reached via a runtime request occurrence. Completing an episode goal
+ * does not complete the process. On completion the request and the completed
+ * candidate's chain products (the satisfying output and any intermediates)
+ * are hidden through existing identity-based [Blackboard.hide], so a later
+ * occurrence replans the chain fresh. Product cleanup is conservative static
+ * analysis over the candidate's possible producer paths; standing state an
+ * action maintains for itself survives. Validation against the process scope
+ * happens at process creation. The rule is construction-time configuration;
+ * each admitted occurrence is a runtime episode.
  * @param target the candidate declared goal(s) this episode completes
- * @param consumes the request type consumed when the episode completes.
+ * @param consumes the request type whose occurrences drive this episode.
  * Must be an off-chain input required on every completion path of every
  * candidate, match that binding's type exactly, and use the default binding.
  * Null means infer it at process creation, permitted only when exactly one
  * such off-chain input exists.
  */
-data class Episode @JvmOverloads constructor(
+data class EpisodeRule @JvmOverloads constructor(
     val target: GoalTarget,
     val consumes: Class<*>? = null,
 )
@@ -88,10 +89,10 @@ data class Episode @JvmOverloads constructor(
  * validation against the process scope happens at process creation.
  */
 class EpisodePolicy @JvmOverloads constructor(
-    episodes: List<Episode> = emptyList(),
+    episodes: List<EpisodeRule> = emptyList(),
 ) {
 
-    val episodes: List<Episode> = copyOf(episodes)
+    val episodes: List<EpisodeRule> = copyOf(episodes)
 
     init {
         val duplicated = this.episodes.groupBy { it.target }.filterValues { it.size > 1 }.keys
@@ -106,7 +107,7 @@ class EpisodePolicy @JvmOverloads constructor(
      */
     @JvmName("addEpisode")
     fun episode(target: GoalTarget): EpisodePolicy =
-        EpisodePolicy(episodes + Episode(target))
+        EpisodePolicy(episodes + EpisodeRule(target))
 
     /**
      * Set the request type the most recently added episode consumes on completion.
@@ -139,7 +140,7 @@ class EpisodePolicy @JvmOverloads constructor(
          */
         @JvmStatic
         fun episode(target: GoalTarget): EpisodePolicy =
-            EpisodePolicy(listOf(Episode(target)))
+            EpisodePolicy(listOf(EpisodeRule(target)))
 
     }
 

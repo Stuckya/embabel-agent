@@ -100,8 +100,9 @@ data class PongTally(val count: Int)
  *    one off-chain input, across a multi-step path.
  * 8. Inference fails fast when the path has more than one off-chain input.
  * 9. Two episodes consuming the same request type fail fast.
- * 10. Overlapping occurrences follow the documented default: the latest visible
- *     occurrence is consumed first, matching default binding.
+ * 10. Overlapping occurrences are admitted serially in arrival order: one
+ *     active occurrence per episode, later arrivals queued FIFO and hidden
+ *     until admission, each chain binding its own driver.
  * 11. Episode rerun rides existing canRerun: a non-rerunnable completing action
  *     does not re-fire for a second occurrence.
  * 12. A repeatable multi-step episode reruns the whole chain fresh: intermediates
@@ -169,14 +170,18 @@ data class PongTally(val count: Int)
  * 41. Episode completion emits GoalAchievedEvent but never a process-finished
  *     event; the terminal goal emits both (pin).
  * 42. A failing completing action leaves the request unconsumed for retry.
- * 43. A completing action that publishes the next request livelocks until the
- *     action budget ends it (pin: occurrence pairing rides ordering in
- *     phase 1; publish follow-ups from a non-completing action).
+ * 43. A completing action that publishes the next request chains cleanly:
+ *     the follow-up is queued at arrival, admitted after the driver is
+ *     consumed by identity, and handled exactly once. Serial admission
+ *     cures the old self-rearming livelock.
  * 44. ConcurrentAgentProcess shares the episode contract: park and rearm.
  * 45. EpisodeCompletedEvent is observed only after consumption: a listener
  *     reading the blackboard at event time sees the consumed state.
  * 46. Terminal completion emits both a plain GoalAchievedEvent and a
  *     process-finished event; episodes emit neither of those.
+ * 47. A blocked active episode stalls its queue: head-of-line blocking is
+ *     the accepted cost of serial admission (AIMA 3e p. 405, "provided
+ *     that each action is feasible by itself").
  */
 class GoalEpisodePhase1Test {
 
@@ -814,6 +819,40 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
+    fun `a blocked active episode stalls its queue - the serial admission fine print`() {
+        // AIMA 3e p. 405: a nonoverlapping sequence avoids all conflicts
+        // "provided that each action is feasible by itself". When the active
+        // episode is blocked on a missing off-chain enabler, the queue waits
+        // behind it even though a queued occurrence would be just as blocked
+        // or just as ready. Head-of-line blocking is the accepted cost of
+        // serial admission; phase 3 should surface queue depth behind a stall
+        val process = create(
+            AmbiguousInputAgent(),
+            "phase1-head-of-line",
+            ProcessOptions.DEFAULT.withEpisodes(
+                EpisodePolicy
+                    .episode(GoalTarget.output(CalibrationCompleted::class.java))
+                    .consumeOnCompletion(CalibrationRequested::class.java)
+            ),
+            CalibrationRequested("cal-1"),
+            CalibrationRequested("cal-2"),
+        )
+
+        val stalled = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No ZoneInfo, so the chain cannot start")
+        val visible = stalled.objects.filterIsInstance<CalibrationRequested>()
+        assertEquals(listOf("cal-1"), visible.map { it.id }, "Only the active driver is visible; cal-2 waits hidden")
+
+        stalled.addObject(ZoneInfo("zone-9"))
+        val resumed = stalled.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, resumed.status, "Both episodes completed, then a clean park")
+        assertNull(resumed.last<CalibrationRequested>(), "Both occurrences consumed in arrival order")
+        assertNotNull(resumed.last<ZoneInfo>(), "The enabler is standing state and survives both episodes")
+    }
+
+    @Test
     fun `inference fails fast when the goal path has more than one off-chain input`() {
         val exception = assertThrows<IllegalArgumentException> {
             create(
@@ -849,7 +888,7 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
-    fun `overlapping occurrences are consumed latest-first, matching default binding`() {
+    fun `overlapping occurrences are admitted serially in arrival order`() {
         val process = create(
             GoapEpisodeOnlyAgent(),
             "phase1-overlapping-occurrences",
@@ -863,8 +902,9 @@ class GoalEpisodePhase1Test {
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
         val calibrated = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
-            listOf("calibrate:cal-B", "calibrate:cal-A"), calibrated,
-            "Default binding hands the action the latest occurrence; consumption must match it",
+            listOf("calibrate:cal-A", "calibrate:cal-B"), calibrated,
+            "One occurrence is active at a time; later arrivals queue FIFO and are " +
+                    "hidden until admission, so each chain binds its own driver",
         )
         assertNull(result.last<CalibrationRequested>(), "Both occurrences consumed")
     }
@@ -1642,14 +1682,14 @@ class GoalEpisodePhase1Test {
     }
 
     @Test
-    fun `a completing action that publishes the next request livelocks`() {
-        // Documented phase-1 limitation: consumption takes the latest visible
-        // occurrence, and a request published by the completing action itself
-        // is newer than the driver. The follow-up is consumed in the driver's
-        // place, the driver re-runs and republishes, and only the action
-        // budget ends the loop. Publish follow-up requests from an action that
-        // does not complete the episode; phase-2 ingress does not have this
-        // shape because external publications are not steps of the plan.
+    fun `a completing action that publishes the next request chains cleanly`() {
+        // Serial admission cures the old self-rearming livelock. The
+        // follow-up published by the completing action is queued and hidden,
+        // completion consumes the active driver by identity, and the
+        // follow-up is admitted for exactly one fresh chain. Before the
+        // queue, consumption took the latest visible occurrence, the
+        // follow-up was eaten in the driver's place, and the driver re-ran
+        // until the action budget ended the loop.
         val process = create(
             SelfRearmingAgent(),
             "phase1-self-rearming",
@@ -1659,12 +1699,13 @@ class GoalEpisodePhase1Test {
 
         val result = process.run()
 
-        assertEquals(AgentProcessStatusCode.TERMINATED, result.status, "The action budget ends the loop")
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "Both occurrences handled, then a clean park")
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertTrue(
-            steps.size > 2 && steps.all { it == "calibrate:cal-1" },
-            "The driver repeats while its follow-ups are consumed in its place: took ${steps.size} steps",
+        assertEquals(
+            listOf("calibrate:cal-1", "calibrate:cal-2"), steps,
+            "The driver runs once, its follow-up runs once, nothing is eaten and nothing loops",
         )
+        assertNull(result.last<CalibrationRequested>(), "Both occurrences consumed")
     }
 
     @Test

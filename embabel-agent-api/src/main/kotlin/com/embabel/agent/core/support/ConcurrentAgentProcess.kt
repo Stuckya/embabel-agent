@@ -56,6 +56,7 @@ open class ConcurrentAgentProcess(
     timestamp = timestamp,
 ) {
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
+        admitArrivals()
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(
             system = agent.planningSystem,

@@ -17,8 +17,8 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.Agent
-import com.embabel.agent.core.Episode
 import com.embabel.agent.core.EpisodePolicy
+import com.embabel.agent.core.EpisodeRule
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.IoBinding
@@ -27,7 +27,7 @@ import com.embabel.plan.common.condition.ConditionDetermination
 import com.embabel.plan.common.condition.EffectSpec
 
 /**
- * An [Episode] resolved against the goals and actions of a process scope.
+ * An [EpisodeRule] resolved against the goals and actions of a process scope.
  * @param goalsByName the candidate declared goals, keyed by name
  * @param consumes the resolved request type, explicit or inferred
  * @param productsByGoal for each candidate goal, the types manufactured on its
@@ -38,7 +38,7 @@ import com.embabel.plan.common.condition.EffectSpec
  * action maintains for itself (its effects satisfy its own input, as with an
  * accumulator) is never an episode product and survives completion.
  */
-internal data class ResolvedEpisode(
+internal data class ResolvedEpisodeRule(
     val goalsByName: Map<String, Goal>,
     val consumes: Class<*>,
     val productsByGoal: Map<String, List<Class<*>>>,
@@ -58,7 +58,7 @@ internal data class ResolvedEpisode(
  */
 internal object EpisodeResolution {
 
-    fun resolve(policy: EpisodePolicy, agent: Agent): List<ResolvedEpisode> {
+    fun resolve(policy: EpisodePolicy, agent: Agent): List<ResolvedEpisodeRule> {
         val resolved = policy.episodes.map { resolveEpisode(it, agent) }
         val duplicated = resolved.groupBy { it.consumes }.filterValues { it.size > 1 }.keys
         require(duplicated.isEmpty()) {
@@ -72,7 +72,7 @@ internal object EpisodeResolution {
         return resolved
     }
 
-    private fun resolveEpisode(episode: Episode, agent: Agent): ResolvedEpisode {
+    private fun resolveEpisode(episode: EpisodeRule, agent: Agent): ResolvedEpisodeRule {
         val candidates = candidatesFor(episode, agent)
         require(candidates.isNotEmpty()) {
             "Episode target ${episode.target} resolves to no declared goal in scope. " +
@@ -89,7 +89,7 @@ internal object EpisodeResolution {
             ?.also { validateExplicitConsumes(episode, it, requiredOnEveryPath) }
             ?: inferConsumes(episode, requiredOnEveryPath)
         candidates.forEach { requireConsumableOutput(episode, it, agent) }
-        return ResolvedEpisode(
+        return ResolvedEpisodeRule(
             goalsByName = candidates.associateBy { it.name },
             consumes = consumes,
             productsByGoal = chains.mapValues { (goalName, chain) ->
@@ -107,13 +107,13 @@ internal object EpisodeResolution {
                         "every product must be a consumable JVM type"
             )
 
-    private fun candidatesFor(episode: Episode, agent: Agent): List<Goal> =
+    private fun candidatesFor(episode: EpisodeRule, agent: Agent): List<Goal> =
         when (val target = episode.target) {
             is GoalTarget.Named -> namedCandidates(episode, target, agent)
             is GoalTarget.Output -> outputCandidates(episode, target, agent)
         }
 
-    private fun outputCandidates(episode: Episode, target: GoalTarget.Output, agent: Agent): List<Goal> {
+    private fun outputCandidates(episode: EpisodeRule, target: GoalTarget.Output, agent: Agent): List<Goal> {
         val matches = agent.goals.filter { satisfiesOutputTarget(it, target) }
         requireDistinctNames(episode, matches)
         requireNamesUniqueInScope(matches, agent)
@@ -140,7 +140,7 @@ internal object EpisodeResolution {
      * forever, and a non-JVM output could never be hidden at all: either way
      * the episode could not rearm.
      */
-    private fun requireConsumableOutput(episode: Episode, goal: Goal, agent: Agent) {
+    private fun requireConsumableOutput(episode: EpisodeRule, goal: Goal, agent: Agent) {
         val outputType = goal.outputType
         require(outputType is JvmType) {
             "Episode candidate ${goal.name} does not produce a JVM output type: " +
@@ -153,7 +153,7 @@ internal object EpisodeResolution {
         }
     }
 
-    private fun requireDistinctNames(episode: Episode, candidates: List<Goal>) {
+    private fun requireDistinctNames(episode: EpisodeRule, candidates: List<Goal>) {
         val duplicated = candidates.groupBy { it.name }.filterValues { it.size > 1 }.keys
         require(duplicated.isEmpty()) {
             "Episode target ${episode.target} resolves distinct goals sharing a name: " +
@@ -161,7 +161,7 @@ internal object EpisodeResolution {
         }
     }
 
-    private fun namedCandidates(episode: Episode, target: GoalTarget.Named, agent: Agent): List<Goal> {
+    private fun namedCandidates(episode: EpisodeRule, target: GoalTarget.Named, agent: Agent): List<Goal> {
         val matches = agent.goals.filter { it.name == target.goalName }
         require(matches.size <= 1) {
             "Episode target ${episode.target} resolves to ${matches.size} declared goals; " +
@@ -334,13 +334,15 @@ internal object EpisodeResolution {
     }
 
     /**
-     * The consumed request must be an off-chain input required on every
+     * The driving request must be an off-chain input required on every
      * completion path of every candidate, must match the binding type exactly,
-     * and must use the default binding. Anything looser could pair the wrong
-     * occurrence with a completion or leave the episode's real driver visible.
+     * and must use the default binding. Serial admission pairs completions
+     * with the active driver by identity, so mis-pairing is impossible; this
+     * rule guards attribution instead: a goal reachable without the driver
+     * could complete and consume an active driver whose work never ran.
      */
     private fun validateExplicitConsumes(
-        episode: Episode,
+        episode: EpisodeRule,
         explicit: Class<*>,
         requiredOnEveryPath: Set<String>,
     ) {
@@ -353,7 +355,7 @@ internal object EpisodeResolution {
         requireDefaultBinding(episode, binding)
     }
 
-    private fun requireDefaultBinding(episode: Episode, bindingCondition: String) {
+    private fun requireDefaultBinding(episode: EpisodeRule, bindingCondition: String) {
         val bindingName = IoBinding(bindingCondition).name
         require(bindingName == IoBinding.DEFAULT_BINDING) {
             "Episode target ${episode.target} cannot consume a request bound as '$bindingName': " +
@@ -370,7 +372,7 @@ internal object EpisodeResolution {
      * plannable product, which is exactly what a request occurrence is.
      * Anything else is ambiguous and requires explicit consumeOnCompletion.
      */
-    private fun inferConsumes(episode: Episode, requiredOnEveryPath: Set<String>): Class<*> {
+    private fun inferConsumes(episode: EpisodeRule, requiredOnEveryPath: Set<String>): Class<*> {
         require(requiredOnEveryPath.isNotEmpty()) {
             "Cannot infer the consumed request for episode target ${episode.target}: " +
                     "no off-chain input is required on every completion path. " +

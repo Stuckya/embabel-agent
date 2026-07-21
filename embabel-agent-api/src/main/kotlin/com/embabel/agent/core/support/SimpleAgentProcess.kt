@@ -37,6 +37,8 @@ import com.embabel.plan.Planner
 import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import java.time.Instant
+import java.util.Collections
+import java.util.IdentityHashMap
 
 open class SimpleAgentProcess(
     id: String,
@@ -68,7 +70,7 @@ open class SimpleAgentProcess(
      * Episode policy resolved against the process scope.
      * Resolution validates the policy, so invalid configuration fails here at construction.
      */
-    private val resolvedEpisodes: List<ResolvedEpisode> =
+    private val resolvedEpisodes: List<ResolvedEpisodeRule> =
         EpisodeResolution.resolve(processOptions.episodes, agent)
 
     /**
@@ -78,6 +80,61 @@ open class SimpleAgentProcess(
      * Cleared after each successful planning cycle.
      */
     protected val replanBlacklist = mutableSetOf<String>()
+
+    /**
+     * Serial admission: each arriving occurrence becomes an [Episode], and
+     * at most one Episode per rule is ACTIVE. Later arrivals wait PENDING,
+     * hidden and queued FIFO, admitted when the active episode completes.
+     * A pending request never changes type-level conditions because the
+     * active driver of the same type stays visible.
+     */
+    private val admissionSeen: MutableSet<Any> =
+        Collections.newSetFromMap(IdentityHashMap())
+    private val pendingEpisodes = mutableMapOf<ResolvedEpisodeRule, ArrayDeque<Episode>>()
+    private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
+
+    protected fun admitArrivals() {
+        resolvedEpisodes.forEach(::admitArrivalsFor)
+    }
+
+    private fun admitArrivalsFor(rule: ResolvedEpisodeRule) {
+        blackboard.objectsOfType(rule.consumes)
+            .filter { admissionSeen.add(it) }
+            .forEach { arrival -> admitOrQueue(rule, Episode(arrival)) }
+    }
+
+    private fun admitOrQueue(rule: ResolvedEpisodeRule, episode: Episode) {
+        if (activeEpisodes.putIfAbsent(rule, episode) == null) {
+            episode.activate()
+            logger.debug("Process {} admitted {}", id, episode)
+            return
+        }
+        blackboard.hide(episode.driver)
+        pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
+        logger.debug("Process {} queued {}", id, episode)
+    }
+
+    /**
+     * Complete the active episode: consume its driver by identity, then
+     * admit the next pending episode so a fresh chain can begin at the
+     * next tick.
+     */
+    private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
+        val episode = activeEpisodes.remove(rule) ?: return false
+        blackboard.hide(episode.driver)
+        episode.complete()
+        logger.debug("Process {} completed {}", this.id, episode)
+        admitNext(rule)
+        return true
+    }
+
+    private fun admitNext(rule: ResolvedEpisodeRule) {
+        val next = pendingEpisodes[rule]?.removeFirstOrNull() ?: return
+        blackboard.reveal(next.driver)
+        next.activate()
+        activeEpisodes[rule] = next
+        logger.debug("Process {} admitted queued {}", id, next)
+    }
 
     protected fun handlePlanNotFound(worldState: WorldState): AgentProcess {
         logger.debug(
@@ -104,9 +161,9 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
-        val episode = resolvedEpisodes.firstOrNull { it.matches(plan.goal.name) }
-        if (episode != null) {
-            completeEpisode(episode, plan, worldState)
+        val rule = resolvedEpisodes.firstOrNull { it.matches(plan.goal.name) }
+        if (rule != null) {
+            completeEpisode(rule, plan, worldState)
             return
         }
         logger.debug(
@@ -128,15 +185,14 @@ open class SimpleAgentProcess(
 
     /**
      * Completes a goal episode without completing the process: consumes the
-     * request occurrence and the chain's products (satisfying output and any
-     * intermediates manufactured on the goal path) by hiding them, then keeps
-     * the process running so ordinary selection resumes at the next planning
-     * tick. A later occurrence therefore replans the entire chain fresh.
-     * The latest visible instance of each type is consumed, matching the
-     * default binding the completing action received.
+     * active episode's driver by identity and the chain's products
+     * (satisfying output and any intermediates manufactured on the goal
+     * path) by hiding them, then keeps the process running so ordinary
+     * selection resumes at the next planning tick. The next pending episode,
+     * if any, is admitted and replans the entire chain fresh.
      */
     private fun completeEpisode(
-        episode: ResolvedEpisode,
+        rule: ResolvedEpisodeRule,
         plan: Plan,
         worldState: WorldState,
     ) {
@@ -145,15 +201,15 @@ open class SimpleAgentProcess(
             this.id,
             plan.goal.name,
         )
-        val consumedRequest = consumeLatest(episode.consumes)
-        val consumedProducts = episode.productsFor(plan.goal.name).sumOf { consumeAll(it) }
+        val consumedRequest = completeActiveEpisode(rule)
+        val consumedProducts = rule.productsFor(plan.goal.name).sumOf { consumeAll(it) }
         if (!consumedRequest) {
             logger.warn(
-                "Process {} episode goal {} completed with no visible {} to consume; " +
-                        "occurrence pairing may be skewed",
+                "Process {} episode goal {} completed with no active episode; " +
+                        "no {} occurrence was admitted for this completion",
                 this.id,
                 plan.goal.name,
-                episode.consumes.name,
+                rule.consumes.name,
             )
         }
         if (!consumedRequest && consumedProducts == 0) {
@@ -177,17 +233,6 @@ open class SimpleAgentProcess(
                 )
             )
         }
-    }
-
-    /**
-     * Hides the latest visible instance of the given type, if any,
-     * matching the default binding the completing action received.
-     */
-    private fun consumeLatest(type: Class<*>): Boolean {
-        val latest = blackboard.last(type) ?: return false
-        blackboard.hide(latest)
-        logger.debug("Process {} consumed {}", this.id, latest)
-        return true
     }
 
     /**
@@ -224,6 +269,7 @@ open class SimpleAgentProcess(
     }
 
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
+        admitArrivals()
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
             system = agent.planningSystem,
