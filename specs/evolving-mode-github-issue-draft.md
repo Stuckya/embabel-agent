@@ -1,9 +1,10 @@
 # GitHub Issue Draft: Evolving Mode Essentials
 
-> **Status: canonical long-form proposal and sub-issue drafts.** The shorter
-> body posted as issue #1756 is the maintainer-facing summary. This document
-> preserves implementation detail and incorporates the baseline behavior tests
-> and subsequent maintainer discussion.
+> **Status: canonical long-form proposal, v2.** The shorter body posted as
+> issue #1756 is the maintainer-facing summary. v2 incorporates the runtime
+> episode contract developed on the `evolving-mode-episode-ladder` branch:
+> the reified `Episode`, serial admission, consumable attribution by
+> identity, and the episode gate.
 
 Draft issue text for the post-1.0.0 Evolving Mode discussion.
 
@@ -53,7 +54,7 @@ The more emergent reading of the README arrives later through Open Evolving: val
 
 A `@Condition` remains the right model for current truth. Evolving episodes are for selected facts that represent a unit of follow-up work to handle once. The framework should own that completion and rearm bookkeeping rather than require lifecycle-only actions, manual blackboard hiding, and value tuning in each consumer application.
 
-In the terms of Russell and Norvig's *Artificial Intelligence: A Modern Approach* (AIMA, 3rd edition, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for hand-tuned search guidance: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Heuristics estimate cost within plan search; preferences between competing goals remain utility values. Deriving search guidance from the condition graph is a future issue beyond this epic.
+In the terms of Russell and Norvig's *Artificial Intelligence: A Modern Approach* (AIMA, 3rd edition, §11.3.3), this is the online replanning agent. Per-tick replanning already gives Embabel action and plan monitoring; goal monitoring — "is there a better set of goals" before each action — is what Evolving Mode adds, and episodes are the lifecycle that keeps it meaningful by letting a handled goal leave the candidate set. The section's opening example — a spot-welding robot that handles a fallen door mid-cycle and then resumes its standing work — is this epic's motivating example in textbook form. The same chapters name the field's remedy for hand-tuned search guidance: strong domain-independent heuristics derived automatically from action structure (§10.2.3). Heuristics estimate cost within plan search; preferences between competing goals remain utility values. Deriving search guidance from the condition graph is a future issue beyond this epic. Two further chapters ground the runtime contract. Serial episode admission implements the serializable-subgoals condition (§10.5, the Remote Agent trick): noninterleaved handling is complete exactly when subgoals cannot interfere, and episode validation manufactures that non-interference. And the blocked-episode story is §11.3.3's plan repair: when an episode is blocked on a missing input, deterministic mode waits for the fact, and Open Evolving can author a bounded episode to produce it.
 
 ### Proposed Work Streams
 
@@ -161,13 +162,13 @@ Because episodes live in `ProcessOptions`, they also compose with Autonomy/Open 
 The complete deterministic phase-1 surface, gathered in one place. Spellings are placeholders (see Open Questions); the shape is the contract.
 
 ```java
-// The substrate is data. The fluent EpisodePolicy.episode(...) chain is sugar over it.
-record Episode(
+// The rule is construction-time data. The fluent EpisodePolicy.episode(...) chain is sugar over it.
+record EpisodeRule(
     GoalTarget target,   // one or more candidate declared goals
-    Class<?> consumes    // the request occurrence this episode consumes
+    Class<?> consumes    // the request type whose occurrences drive this episode
 ) {}
 
-record EpisodePolicy(List<Episode> episodes) {}
+record EpisodePolicy(List<EpisodeRule> episodes) {}
 
 // The single new entry point, following the existing ProcessOptions wither pattern
 ProcessOptions withEpisodes(EpisodePolicy episodes);
@@ -176,6 +177,8 @@ ProcessOptions withEpisodes(EpisodePolicy episodes);
 GoalTarget.output(Class<?> satisfiedByType)  // all scoped declared goals satisfied by that type
 GoalTarget.named(String goalName)            // exactly one declared goal by stable identity
 ```
+
+The rule is not the episode. Each arriving occurrence becomes a runtime `Episode`: it holds the request that began it, the consumables its chain has made, and its lifecycle state (`PENDING`, `ACTIVE`, `COMPLETED`). The definition: an episode is one occurrence of a request, planned to goal completion. Completion consumes the request and whatever the episode made. That is what makes the next occurrence independent. In AIMA chapter 2's terms the request is the episode's percept: its arrival begins the episode, its consumption ends it. The runtime object is internal in phase 1; later phases surface it through events (3), a cancellation handle (4), and authoring (5). One supporting blackboard primitive ships with it: `Blackboard.reveal(Object)`, the identity-based inverse of `hide`, added as a default interface method.
 
 Surface rules, gathered from the sections below:
 
@@ -191,9 +194,17 @@ Not phase 1: `ingress()` (phase 2, Sub-Issue 2), an `interruptsCurrentAction` ep
 
 The existing type, condition, binding, goal, and planner model remains authoritative. A request object can make one or more declared goals plannable today. Episode policy changes what happens when a selected candidate goal is satisfied; it does not maintain a second goal set or add a planner overlay for deterministic phase 1.
 
-An episode is one bounded plan-execute-complete cycle. It is not an atomic block: per-tick replanning can interleave standing work between its steps when values favor it (baseline test 10). On completion of an episode goal, the exact triggering fact occurrence and every product the episode's chain manufactured — the satisfying output and any intermediates, found by walking the goal's producing actions — are hidden through the existing blackboard API. Nothing is deleted; the blackboard remains append-only. Hiding makes the goal unsatisfied and its chain unreplannable from leftovers, so a later occurrence plans the entire chain fresh. Standing state the scope maintains for itself — an action whose effects satisfy its own input, or a multi-action cycle regenerable without a fresh occurrence, by the planner's matching rules — is never an episode product and survives completion.
+An episode is one bounded plan-execute-complete cycle. It is not an atomic block: per-tick replanning can interleave standing work between its steps when values favor it (baseline test 10). Three runtime mechanisms carry the contract.
 
-The lifecycle is per occurrence and the declared goal is reusable. Completing an episode never completes the process. Ordinary declared goals keep today's behavior and may complete the process.
+**Serial admission.** Each arriving occurrence of a rule's request type becomes an `Episode`. At most one episode per rule is `ACTIVE`; later arrivals wait `PENDING`, hidden and queued FIFO, and are revealed and admitted when the active episode completes. A pending request never changes type-level conditions, because the active request of the same type stays visible. Occurrence pairing is therefore identity, not ordering: each chain binds exactly its own request, and completion consumes exactly that instance. Serial admission also cures a v1 pathology: a completing action that publishes the follow-up request now chains cleanly, one episode per occurrence, instead of livelocking. Admission is per rule, so episodes of different kinds run concurrently interleaved and never queue behind each other.
+
+**Consumable attribution.** While an episode is `ACTIVE`, new instances of its chain actions' declared output types are recorded onto it by identity as they appear. On completion the framework hides the request and the completed candidate's attributed consumables: exactly what this occurrence made, nothing made elsewhere. Nothing is deleted; the blackboard remains append-only. A stale intermediate of the episode's own making cannot shortcut the next occurrence's plan, while an instance made elsewhere is used, not consumed, and survives as a standing resource — AIMA §11.1's consumable versus reusable distinction, enforced per instance. Standing state the scope maintains for itself — an action whose effects satisfy its own input, or a multi-action cycle regenerable without a fresh occurrence, by the planner's matching rules — is never attributed and survives completion.
+
+**The episode gate.** A rule's exclusive chain actions — those serving no non-episode goal — are excluded from planning whenever the rule has no active episode, through the same exclusion mechanism the replan blacklist uses. Everything episodic happens inside an episode: a standing resource can never let a chain complete with no admitted occurrence. Shared actions serving both mission and episode goals are never gated.
+
+The lifecycle is per occurrence and the declared goal is reusable. Completing an episode never completes the process. Ordinary declared goals keep today's behavior and may complete the process. Episodes are independent, not idempotent: duplicate requests are distinct occurrences and each is handled, while standing state legitimately advances across episodes.
+
+The contract has two rungs, following AIMA ch 2's observation that environments are episodic at higher levels than individual actions. In-process episodes interleave with standing work and share the blackboard. A child process is an episode's most tangible form: an episode chain can be one dispatch action running a child through existing `createChildProcess`, with isolation, lineage, and per-episode identity free at the process boundary. The policy is identical on both rungs and never knows where the chain runs. In-process episodes stay one-active-per-rule, because the planner is occurrence-blind; parallel same-rule episodes belong at the child rung, where a bounded admission width — how many may run at once — encodes the capacity of what the chains borrow (AIMA §11.1's `Inspectors(2)` aggregation). Width defaults to one and its generalization ships with phase 2's async dispatch.
 
 Nonterminal completion and consumption are one contract. They should not be separate switches: a nonterminal goal that leaves its request or satisfying output visible remains satisfied, so its empty plan can immediately compete again.
 
@@ -241,11 +252,11 @@ For urgent external facts, a later phase may add `.terminateCurrentAction()`: re
 
 ### Episode Matching and Rearm Semantics
 
-The phase-1 contract is deliberately concrete. `consumeOnCompletion(Request.class)` identifies the request consumed by the episode. When a candidate goal completes, the framework hides the exact request object and the chain's products: the satisfying output and any intermediates manufactured on the goal path. A later distinct request object therefore replans the same episode from scratch — a stale intermediate cannot shortcut it. Consumption follows the plannability boundary: what the chain manufactured is consumed, while everything the path merely read — other off-chain inputs and self-maintained facts — survives. Product cleanup is conservative static analysis: it hides by type across the candidate's possible producer paths rather than tracking what this completion manufactured. A visible product of an alternative path is planning bait the planner may legitimately route through, so types manufactured on an episode chain should not double as standing data. A resource that should outlive episodes is therefore an off-chain input, not a declared product — AIMA's consumable versus reusable resource distinction (§11.1): chain products are consumed, off-chain inputs are used. When several occurrences are visible at completion, the latest visible one is consumed, matching the default binding the completing action received; every visible instance of a product type is consumed, since products are per-occurrence and a stale duplicate could shortcut the next plan. One consequence is a documented limitation: a completing action that publishes the follow-up request itself livelocks (the follow-up is newer than the driver and is consumed in its place), bounded by the action budget — publish follow-ups from a non-completing action, or through phase-2 ingress, whose publications are not plan steps.
+The phase-1 contract is deliberately concrete. `consumeOnCompletion(Request.class)` identifies the request type whose occurrences drive the episode. When a candidate goal completes, the framework consumes the active episode's request by identity and its attributed consumables: the satisfying output and any intermediates this occurrence actually made. A later request replans the same episode from scratch — the episode's own stale intermediate cannot shortcut it. Consumption follows attribution, not type: what this occurrence manufactured is consumed, while everything else survives — other off-chain inputs, self-maintained facts, and same-type instances made elsewhere. A foreign chain product the planner routes through is used, not consumed, and later occurrences may legitimately reuse it. That is AIMA's consumable versus reusable resource distinction (§11.1), enforced per instance rather than approximated per type. Overlapping occurrences are handled by serial admission: FIFO in arrival order, one active at a time, pending arrivals hidden until admitted. A completing action that publishes the follow-up request chains cleanly — the follow-up is queued at arrival, admitted after its request is consumed, and handled exactly once. The known cost of serial admission is head-of-line blocking within one rule (AIMA §11.1.2 p. 405: a nonoverlapping sequence is sound "provided that each action is feasible by itself"): a blocked active episode stalls its own queue, never another rule's. Phase 2's `BLOCKED` state and publication-time wake address it; phase 3 surfaces queue depth behind a stall.
 
 The first implementation should reject configurations where one request type ambiguously owns several independent episode definitions, and likewise where two episodes resolve to the same declared goal. One episode target may still resolve to several declared candidate goals; they are alternative ways to complete the same episode, not fan-out. Consumption is scoped to the candidate that completed; another candidate's products are untouched.
 
-Consumption is resolved statically at process creation — by walking the same condition graph the planner searches, so chain membership follows the planner's own assignability rules — and applied through `Blackboard.hide` at completion. The analysis computes the two bounds of angelic semantics (AIMA §11.2.3): the consumed request validates against the pessimistic description (required on every completion path), while cleanup uses the optimistic one (produced on any path). There is no per-occurrence tracking and no consumer-facing activation API. Hiding is identity-based, honoring the hide contract: consuming an occurrence hides exactly that object, and a distinct but equal occurrence remains a live request. Domain records need no occurrence ids for lifecycle purposes. This is a fix, not a redesign: `Blackboard.hide` documents "hide this object", but the implementation hid by equality — a hash-set accident that coalesced distinct occurrences and permanently blocked an episode whose equal output had already been consumed. Phase 1 corrects `InMemoryBlackboard` to match its documented contract, and the full module suite passes unchanged. Reader-built goals also include `hasRun` of their achieving action, so a seeded or stale output cannot complete an episode without real work — the opposite of AIMA's serendipity, and test-pinned. The observable contract is consume once, do not complete the process, and allow a later occurrence to run again.
+Chain membership is resolved statically at process creation — by walking the same condition graph the planner searches, so membership follows the planner's own assignability rules — and consumption is applied through `Blackboard.hide` at completion. The analysis computes the two bounds of angelic semantics (AIMA §11.2.3): the consumed request validates against the pessimistic description (required on every completion path), while the optimistic one (produced on any path) bounds which types attribution may record. Per-occurrence tracking is framework-internal — the runtime `Episode` carries it — and there is no consumer-facing activation API. Hiding is identity-based, honoring the hide contract: consuming an occurrence hides exactly that object, and a distinct but equal occurrence remains a live request. Domain records need no occurrence ids for lifecycle purposes. This is a fix, not a redesign: `Blackboard.hide` documents "hide this object", but the implementation hid by equality — a hash-set accident that coalesced distinct occurrences and permanently blocked an episode whose equal output had already been consumed. Phase 1 corrects `InMemoryBlackboard` to match its documented contract, and the full module suite passes unchanged. Reader-built goals also include `hasRun` of their achieving action, so a seeded or stale output cannot complete an episode without real work — the opposite of AIMA's serendipity, and test-pinned. The observable contract is consume once, do not complete the process, and allow a later occurrence to run again.
 
 ### Completion And Waiting
 
@@ -281,7 +292,7 @@ The `ObjectiveAuthor` should not need to remember universal safety and recovery 
 
 Maintainer input would be helpful on these decisions.
 
-- **Which method name spellings should ship?** `EpisodePolicy`, `withEpisodes`, `episode`, `consumeOnCompletion`, `GoalTarget.output(...)`, `GoalTarget.named(...)`, and `ingress()` are illustrative. Their semantics are settled and tested; the type and method names are the open part, following the existing immutable `ProcessOptions` wither pattern.
+- **Which method name spellings should ship?** `EpisodePolicy`, `EpisodeRule`, `withEpisodes`, `episode`, `consumeOnCompletion`, `GoalTarget.output(...)`, `GoalTarget.named(...)`, `reveal`, and `ingress()` are illustrative. Their semantics are settled and tested; the type and method names are the open part, following the existing immutable `ProcessOptions` wither pattern. One candidate rename is queued: under serial admission, consumption is a consequence of admission rather than a mapping, so `consumeOnCompletion` may read better as `drivenBy`.
 - **How do `withObjectiveAuthor(...)` and an explicit episode policy combine?** Policy Sources assumes they merge into one validated `ObjectivePolicy` at launch. The open part is phase-5 conflict handling when both bind the same request type or goal.
 
 ### Additional Context
@@ -295,7 +306,11 @@ Maintainer input would be helpful on these decisions.
 - **Declared capability** - immutable `@Agent` and `@EmbabelComponent` actions, conditions, and goals.
 - **Consumer application** - the application using Embabel, configuring invocation, providing scoped capabilities, owning domain state modules, and publishing selected external facts.
 - **Request fact** - typed domain object on the blackboard that represents one occurrence of follow-up work. Not a new public `Fact` API.
-- **Episode / goal episode** - one bounded plan-execute-complete cycle toward an existing declared goal. In AIMA terms, one pass of the plan-execute-replan loop that ends in goal completion (§11.3.3: "the loop is created by a process of plan-execute-replan, rather than by an explicit loop in a plan"). Episode completion is nonterminal and rearms after its request and chain products are consumed. An episode is not an atomic block: per-tick replanning can interleave standing work between its steps (baseline test 10). Work stream 7 explores recurring episodes for pure-GOAP standing work.
+- **Episode / goal episode** - one occurrence of a request, planned to goal completion. Completion consumes the request and whatever the episode made, which is what makes the next occurrence independent (AIMA ch 2: "the next episode does not depend on the actions taken in previous episodes"). At runtime an episode is a framework-internal object holding its request, its attributed consumables, and its state (`PENDING`, `ACTIVE`, `COMPLETED`). In AIMA terms it is one pass of the plan-execute-replan loop (§11.3.3), and its request is its percept (ch 2). Not an atomic block: per-tick replanning can interleave standing work between its steps (baseline test 10). Independent, not idempotent: duplicate requests are distinct occurrences. Work stream 7 explores recurring episodes — no request — for pure-GOAP standing work.
+- **Episode rule** - the construction-time declaration: a goal target and the request type whose occurrences drive it. The rule is reusable configuration; each admitted occurrence is an episode.
+- **Consumable** - an instance a chain action made for the active episode, recorded by identity as it appears (AIMA §11.1's consumable resource). Completion consumes the completed candidate's consumables and nothing made elsewhere; foreign same-type instances are used, not consumed.
+- **Serial admission** - one active episode per rule; later arrivals wait pending, hidden and queued FIFO, admitted on completion. Pairing by identity. Known cost: head-of-line blocking within a rule, addressed by phase 2's `BLOCKED` state.
+- **Episode gate** - a rule's exclusive chain actions are plannable only while the rule has an active episode. Everything episodic happens inside an episode.
 - **Runtime goal** - reserved here for a process-local objective proposed later by Open Evolving or scope expansion. Deterministic phase 1 reuses declared goals rather than adding a second goal set.
 - **Deterministic Evolving** - predeclared episode lifecycle for known request types and known declared goals.
 - **Open Evolving** - an `ObjectiveAuthor` authors or revises the objective policy when predefined episode policy and scope cannot handle the situation. It proposes goal references as typed data, never executable code. Proposed goals use the same scope validation and may opt into the same nonterminal lifecycle.
@@ -339,8 +354,10 @@ Maintainer input would be helpful on these decisions.
 - Authored policies MUST reference declared goals with typed targets. Authoring MUST NOT introduce executable code, and per-instance declared goals (one goal per concrete target) SHOULD NOT be required where a generic goal plus typed target works.
 - Memoryless ongoing state SHOULD remain in `@Condition` or action inputs. It is not an episode merely because it changes while the process runs.
 - Episode candidates MUST be declared goal producers in the active scope, for example by producing the goal's satisfied-by type and using `@AchievesGoal` where appropriate. A candidate's satisfying output MUST be a per-occurrence product, never standing state the goal action maintains for itself: such an output would survive consumption and keep the goal satisfied forever.
-- Episode completion MUST hide the exact configured request occurrence and every visible instance of the completed candidate's product types — satisfying output and intermediates — before the process returns to ordinary selection. Self-maintained facts, other off-chain inputs, and other candidates' products MUST survive. A completion that consumes nothing MUST fail the process rather than spin on a goal that stays satisfied.
-- The consumed request MUST be an off-chain input required on every completion path of every candidate goal, MUST match the off-chain binding type exactly, and MUST arrive under the default binding. Anything looser could pair the wrong occurrence with a completion or leave the episode's real driver visible.
+- Episode completion MUST consume the active episode's request by identity and the completed candidate's attributed consumables — satisfying output and intermediates this occurrence made — before the process returns to ordinary selection. Self-maintained facts, other off-chain inputs, other candidates' consumables, and same-type instances made elsewhere MUST survive. A completion with no active episode and nothing attributed MUST fail the process rather than spin on a goal that stays satisfied.
+- Occurrence admission MUST be serial per rule: one active episode, later arrivals hidden and queued FIFO, the next admitted on completion. A pending request MUST NOT be visible to planning or binding while queued.
+- A rule's exclusive chain actions MUST be excluded from planning while the rule has no active episode, so a chain can never complete outside an episode. Actions shared with non-episode goals MUST NOT be gated.
+- The consumed request MUST be an off-chain input required on every completion path of every candidate goal, MUST match the off-chain binding type exactly, and MUST arrive under the default binding. Serial admission makes mis-pairing impossible; this rule guards attribution: a goal reachable without the request could complete and consume an admitted request whose work never ran.
 - Each declared goal may belong to at most one episode; a named target matching more than one goal identity and an output target resolving distinct goals that share a name MUST both be rejected. A candidate sharing its name with any other scoped goal MUST also be rejected, since completion recognition matches by name. Without per-occurrence tracking, overlapping episodes could pair the wrong request with a completion.
 - Normal action completion reaches the next planning tick through ordinary execution; action/tool-initiated early replanning reuses `ReplanRequestedException`; selected external facts use ingress and wake from phase 2. Declared actions from the scoped capabilities remain the only executable steps.
 
@@ -374,23 +391,26 @@ This phase does not require external ingress or a new goal-discovery mechanism. 
 
 Occurrence requests should normally be observations added through `ActionContext`, not outputs declared as producible steps in a GOAP path. If a planner action declares `SensorCalibrationRequested` as an output, A* correctly treats the request as something it can manufacture on demand. The baseline contrast test documents that difference.
 
-Phase 1 adds three lifecycle guarantees:
+Phase 1 adds four lifecycle guarantees:
 
 1. satisfying an episode goal does not complete the process;
-2. the exact request occurrence and the goal path's products — satisfying output and intermediates — are hidden through `Blackboard.hide`;
-3. a later request can run the same declared goal episode again.
+2. completion consumes the active episode's request by identity and its attributed consumables — the satisfying output and intermediates this occurrence made — through `Blackboard.hide`;
+3. a later request runs the same declared goal episode again, admitted serially in arrival order;
+4. a rule's exclusive chain actions are plannable only while an episode is active, so a chain can never complete outside an episode.
 
 Ordinary declared goals retain existing goal-completes-process behavior. GOAP, Utility, and Hybrid retain their existing planning and selection behavior.
 
 The first implementation can remain process data. Illustrative Java records are enough to show the substrate without committing to fluent syntax:
 
 ```java
-record Episode(
+record EpisodeRule(
     GoalTarget target,
     Class<?> consumes) {}
 
-record EpisodePolicy(List<Episode> episodes) {}
+record EpisodePolicy(List<EpisodeRule> episodes) {}
 ```
+
+At runtime each admitted occurrence is a framework-internal `Episode` holding its request, its attributed consumables, and its state. The rule is the declaration; the episode is the occurrence.
 
 Cooperative interruption adds an `interruptsCurrentAction` field in Phase 4; phase 1 carries no dormant surface for it. `SimpleAgentProcess.handleProcessCompletion(...)` is the existing shared recognition point used by simple and concurrent processes. It can read the policy before applying ordinary goal-completes-process behavior.
 
@@ -404,13 +424,13 @@ nonterminal consume-on-completion behavior
 
 An output target resolves matching scoped goal candidates; a named target resolves one stable declared goal identity. Existing conditions and planner selection choose among candidates. No candidate is a configuration error, while a candidate that is temporarily blocked remains an ordinary planner concern.
 
-The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values — and a multi-step path additionally owes one hide per intermediate, or a leftover intermediate re-satisfies the goal without a new request. The `evolving-mode-phase-1` branch carries a reference implementation driven by a 47-test suite exercising these criteria, including regressions from an adversarial review pass.
+The framework owns the point after goal satisfaction and before process completion. That is where it can hide both the exact request and the newly produced satisfying output before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values — and a multi-step path additionally owes one hide per intermediate, or a leftover intermediate re-satisfies the goal without a new request. The `evolving-mode-episode-ladder` branch carries the reference implementation driven by a 61-test suite exercising these criteria, including regressions from an adversarial review pass, the AIMA-scenario dogfooding rounds, and the subagent-composition proof; the frozen `evolving-mode-phase-1` branch preserves the smaller v1 cut it supersedes.
 
 Existing `Blackboard.hide` is sufficient: consumption resolves statically at process creation and applies through identity-based hiding at completion, with no per-occurrence tracking. Consumers never manage activation ids or lifecycle-only blackboard records.
 
 Action failure does not complete the episode. Existing failure and replanning behavior remains in force; retry limits and backoff are separate concerns.
 
-Under Utility/Hybrid, an episode still competes using ordinary values. If standing work always out-values it, the episode can starve; phase 3 observability should make that visible. Phase 1 does not introduce priority or lane semantics.
+Under Utility/Hybrid, an episode still competes using ordinary values. If standing work always out-values it, the episode can starve; phase 3 observability should make that visible. Phase 1 does not introduce priority or lane semantics. Multi-step chains under Utility/Hybrid also want ascending step values: a chain input stays visible until the episode consumes it, so an early rerunnable step that out-values its successors re-runs instead of progressing. The real fix is derived step values from the condition graph (see Motivation), not hand-frozen constants.
 
 Example flow:
 
@@ -447,8 +467,9 @@ Acceptance criteria:
 - a target with a scoped producer is not rejected merely because it is currently blocked by missing facts or preconditions
 - an output target can resolve several candidate goals; existing conditions and planning choose among them
 - completing a candidate episode goal does not complete the process
-- completion hides the exact triggering request and the goal path's products — satisfying output and intermediates — through `Blackboard.hide`
-- a repeatable multi-step episode replans its full chain for a later occurrence; a stale intermediate cannot shortcut it
+- completion consumes the active episode's request by identity and its attributed consumables — satisfying output and intermediates this occurrence made — through `Blackboard.hide`
+- a repeatable multi-step episode replans its full chain for a later occurrence; the episode's own stale intermediate cannot shortcut it
+- a same-type instance made elsewhere is used, not consumed: it survives completion and later occurrences may legitimately route through it
 - self-maintained facts and other off-chain inputs survive episode completion
 - a later distinct request makes the episode eligible again and is not pre-satisfied by the earlier output
 - ordinary declared goals retain existing goal-completes-process behavior
@@ -463,7 +484,10 @@ Acceptance criteria:
 - distinct-but-equal occurrences are separate occurrences: identity-based hiding consumes exactly the consumed instance, and an equal earlier output cannot block a later completion
 - no phase-1 behavior depends on `CompletionPolicy`, external ingress, automatic wake, or process-local goal projection
 - episode rerun rides existing `canRerun`, decided and tested: the framework does not reset execution state, and a non-rerunnable completing action makes the episode one-shot
-- overlapping request occurrences are consumed latest-visible-first, matching the default binding handed to the completing action
+- overlapping request occurrences are admitted serially in arrival order: one active episode per rule, later arrivals hidden and queued FIFO, each chain binding exactly its own request
+- a completing action that publishes the follow-up request chains cleanly: the follow-up is queued at arrival, admitted after its request is consumed, and handled exactly once
+- a rule's exclusive chain actions are unplannable while the rule has no active episode; actions shared with non-episode goals are never gated
+- a blocked active episode stalls only its own rule's queue: head-of-line blocking is the documented, pinned cost of serial admission, and other rules and standing work continue
 - base GOAP, Utility, and Hybrid planners remain the execution planners
 
 Out of scope:
@@ -536,6 +560,10 @@ Per-process ordering is FIFO in acceptance order. Concurrent publishers receive 
 ### Wake Dependency
 
 Publication to an eligible parked process should schedule a platform-owned re-run. A status change alone is not enough; the process must reach a planning tick without requiring the publisher to call `run()`.
+
+### Blocked Episodes
+
+Phase 2 adds a `BLOCKED` episode state, the chosen answer to serial admission's head-of-line cost. When the active episode's chain is unplannable for want of an off-chain input, the framework suspends it: mark `BLOCKED`, hide its whole footprint — the request and its recorded consumables, which attribution makes safe — and admit the next pending episode. A blocked episode names its missing inputs; resolution already computes them. Publication-time wake re-admits it at the front of the queue when a matching fact arrives. Fairness becomes FIFO among ready. `Blackboard.reveal` restores the footprint on re-admission.
 
 Waking is not a publish side-effect. `publish` enqueues and returns a receipt; the platform maintains the invariant that an eligible parked process with undrained publications is scheduled to reach a planning tick. Several accepted publications may satisfy the invariant with one wake while preserving FIFO drain order.
 
@@ -657,6 +685,10 @@ Useful lifecycle transitions:
 - episode rearmed for a later request
 - episode action or plan failed
 - plan selected after a request became visible
+- episode blocked with a request held, naming the missing off-chain inputs and the queue depth behind it
+- action budget exhausted with an episode armed, naming the chain step that dominated the history
+
+These diagnostics are not only observability. The blocked-episode transition, with its named missing inputs, is the input format phase 5's `ObjectiveAuthor` consumes: the blocker is what Open Evolving reacts to.
 
 Acceptance criteria:
 
@@ -737,6 +769,8 @@ Evolving Mode phase 5: Open Evolving — `ObjectiveAuthor` re-authoring at a pla
 Support revising the `ObjectivePolicy` mid-run when the process encounters something no predefined rule covers: an unknown blocker, no viable plan, or unresolved runtime facts.
 
 Deterministic Evolving covers known request types and the lifecycle of known declared goal episodes. Open Evolving is the generic re-authoring mechanism when the current objective, episode policy, and scope cannot handle what the process discovers. It should not require predeclared per-type hooks like `.onUnhandledFact(X.class)`.
+
+The primary trigger is a `BLOCKED` episode. A blocked episode names its missing off-chain inputs (Sub-Issue 3), which gives the `ObjectiveAuthor` a concrete, verifiable objective: produce the missing fact. The authored fix runs as an episode itself — bounded, attributed, approval-gated, consumed — and its completion publishes the enabler, whose arrival wakes the blocked episode through phase 2's ordinary mechanism. This is AIMA §11.3.3's plan repair: the painting agent discovering it is out of paint and replanning to acquire more. The author reacts to named blockers, not open-ended judgment, and even the repairs happen inside episodes. Recursion is bounded by budget and approval.
 
 Illustrative flow:
 
