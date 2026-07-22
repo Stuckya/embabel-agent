@@ -28,6 +28,8 @@ import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ObjectAddedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -135,8 +137,7 @@ class GoalEvolvingContractTest {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
         val agent = AgentMetadataReader().createAgentMetadata(agentInstance) as CoreAgent
-        var options = objective?.let { ProcessOptions.DEFAULT.withEvolving(it) }
-            ?: ProcessOptions.DEFAULT.withEvolving()
+        var options = ProcessOptions.DEFAULT.withEvolving(Evolving(objective, EpisodeExecution.IN_PROCESS))
         listener?.let { options = options.withListener(it) }
         return SimpleAgentProcess(
             "evolving-contract",
@@ -345,7 +346,7 @@ class GoalEvolvingContractTest {
             "evolving-contract-concurrent",
             null,
             agent,
-            ProcessOptions.DEFAULT.withEvolving(),
+            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

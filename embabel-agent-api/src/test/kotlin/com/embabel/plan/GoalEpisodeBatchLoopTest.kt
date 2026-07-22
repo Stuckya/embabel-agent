@@ -24,6 +24,8 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -73,6 +75,12 @@ data class BatchMissionDone(val samples: Int)
  *   mission goal rather than won on value, terminal evaluation precedes
  *   rearming, and the founding episode - the mission itself - completes
  *   last, holding the process's founding percept.
+ *
+ * This file pins the in-process rung: episode bodies run as multi-action
+ * chains inside the parent, the supported degenerate case. The same
+ * composed scenario runs child-primary - each body a dispatched subagent -
+ * in GoalEpisodeChildPrimaryTest, the authoring model. One contract, both
+ * rungs, deliberately pinned twice.
  */
 class GoalEpisodeBatchLoopTest {
 
@@ -140,7 +148,7 @@ class GoalEpisodeBatchLoopTest {
                 .withPlannerType(PlannerType.HYBRID)
                 // No policy anywhere: both rules derive from the goal
                 // graph, and the objective anchors completion
-                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
+                .withEvolving(Evolving(GoalTarget.output(BatchMissionDone::class.java), EpisodeExecution.IN_PROCESS)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

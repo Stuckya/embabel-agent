@@ -25,6 +25,8 @@ import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -91,15 +93,8 @@ class GoalEpisodeLadderTest {
 
         val children = mutableListOf<AgentProcess>()
 
-        /**
-         * Discovered by this spike: the child inherits the parent's HYBRID
-         * planner type and createChildProcess offers no options override, so
-         * the child scope needs its own NIRVANA pairing to execute a
-         * multi-step chain. Without it the child is STUCK at tick one.
-         */
         private val repairCrew: CoreAgent by lazy {
-            val agent = AgentMetadataReader().createAgentMetadata(RepairCrewAgent()) as CoreAgent
-            agent.copy(goals = agent.goals + NIRVANA)
+            AgentMetadataReader().createAgentMetadata(RepairCrewAgent()) as CoreAgent
         }
 
         @Action(canRerun = true, value = 0.2)
@@ -132,7 +127,9 @@ class GoalEpisodeLadderTest {
         fun dispatchRepair(door: DoorDown, context: ActionContext): DoorFixed {
             context.addObject(ExecutedStep("dispatch:${door.id}"))
             val platform = context.processContext.platformServices.agentPlatform
-            val child = platform.createChildProcess(repairCrew, context.agentProcess)
+            // Declared child options: the crew plans under GOAP regardless
+            // of the parent's HYBRID declaration
+            val child = platform.createChildProcess(repairCrew, context.agentProcess, ProcessOptions.DEFAULT)
             children += child
             val completed = child.run()
             return completed.last<DoorFixed>()
@@ -182,7 +179,7 @@ class GoalEpisodeLadderTest {
                 // evolved DoorDown is one occurrence, and the shift's
                 // objective anchors completion at the parent level exactly
                 // as it would for an in-process chain
-                .withEvolving(GoalTarget.output(ShiftLog::class.java)),
+                .withEvolving(Evolving(GoalTarget.output(ShiftLog::class.java), EpisodeExecution.IN_PROCESS)),
             WeldTally(0),
         )
 

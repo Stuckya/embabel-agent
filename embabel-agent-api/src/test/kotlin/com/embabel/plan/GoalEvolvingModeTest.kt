@@ -24,6 +24,8 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -100,8 +102,7 @@ class GoalEvolvingModeTest {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
         val agent = AgentMetadataReader().createAgentMetadata(agentInstance) as CoreAgent
-        val options = objective?.let { ProcessOptions.DEFAULT.withEvolving(it) }
-            ?: ProcessOptions.DEFAULT.withEvolving()
+        val options = ProcessOptions.DEFAULT.withEvolving(Evolving(objective, EpisodeExecution.IN_PROCESS))
         return SimpleAgentProcess(
             "evolving-test",
             null,
@@ -467,7 +468,7 @@ class GoalEvolvingModeTest {
             agent.copy(goals = agent.goals + NIRVANA),
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
+                .withEvolving(Evolving(GoalTarget.output(BatchMissionDone::class.java), EpisodeExecution.IN_PROCESS)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

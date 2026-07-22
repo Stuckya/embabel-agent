@@ -209,6 +209,19 @@ open class DefaultAgentPlatform(
     override fun createChildProcess(
         agent: Agent,
         parentAgentProcess: AgentProcess,
+    ): AgentProcess =
+        createChildProcess(
+            agent = agent,
+            parentAgentProcess = parentAgentProcess,
+            // The evolving declaration is scoped to the process it was
+            // declared for: a child must never inherit the parent's mode
+            processOptions = parentAgentProcess.processContext.processOptions.copy(evolving = null),
+        )
+
+    override fun createChildProcess(
+        agent: Agent,
+        parentAgentProcess: AgentProcess,
+        processOptions: ProcessOptions,
     ): AgentProcess {
         // Ephemeral processes cannot spawn child processes
         require(!parentAgentProcess.processOptions.ephemeral) {
@@ -220,10 +233,6 @@ open class DefaultAgentPlatform(
 
         val childBlackboard = parentAgentProcess.processContext.blackboard.spawn()
 
-        // Episode policy is scoped to the process it was configured for:
-        // a child running a different agent must not inherit it
-        val processOptions = parentAgentProcess.processContext.processOptions
-            .copy(evolving = null)
         val childAgentProcess = SimpleAgentProcess(
             agent = agent,
             platformServices = parentAgentProcess.processContext.platformServices,
@@ -238,6 +247,12 @@ open class DefaultAgentPlatform(
             processOptions = processOptions,
             plannerFactory = plannerFactory,
         )
+        // evolve from inside any child of an evolving process delegates up
+        // the tower to the nearest evolving ancestor, so chain actions
+        // publish occurrences identically on both rungs
+        if (parentAgentProcess is SimpleAgentProcess && parentAgentProcess.isEvolving) {
+            childAgentProcess.evolveDelegate = parentAgentProcess::evolve
+        }
         logger.debug("👶 Creating child process {} from {}", childAgentProcess.id, parentAgentProcess.id)
         agentProcessRepository.save(childAgentProcess)
         eventListener.onProcessEvent(AgentProcessCreationEvent(childAgentProcess))

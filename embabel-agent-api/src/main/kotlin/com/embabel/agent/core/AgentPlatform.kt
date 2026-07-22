@@ -127,9 +127,27 @@ interface AgentPlatform : AgentScope {
         }
     }
 
+    /**
+     * Create a child process inheriting the parent's options, minus the
+     * evolving declaration: a child running a different agent must not
+     * inherit the parent's mode or objective.
+     */
     fun createChildProcess(
         agent: Agent,
         parentAgentProcess: AgentProcess,
+    ): AgentProcess
+
+    /**
+     * Create a child process with options declared at the dispatch site,
+     * used verbatim. The dispatcher knows facts the platform cannot derive:
+     * the child's planner type, budget, and evolving declaration. A child
+     * becomes an evolving loop only through this explicit declaration,
+     * never by inheritance, so levels compose deliberately.
+     */
+    fun createChildProcess(
+        agent: Agent,
+        parentAgentProcess: AgentProcess,
+        processOptions: ProcessOptions,
     ): AgentProcess
 
     override val domainTypes: Collection<DomainType>

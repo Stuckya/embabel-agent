@@ -24,6 +24,8 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -231,7 +233,7 @@ class GoalEpisodeAimaTest {
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-problem",
-            ProcessOptions.DEFAULT.withEvolving(),
+            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
         )
         process.evolve(PaintRequested("job-1"))
 
@@ -277,7 +279,7 @@ class GoalEpisodeAimaTest {
             "aima-painting-hybrid",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(),
+                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
         )
         process.evolve(PaintRequested("job-1"))
 
@@ -306,7 +308,7 @@ class GoalEpisodeAimaTest {
             "aima-painting-hybrid-spin",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(),
+                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
         )
         process.evolve(PaintRequested("job-1"))
 
@@ -332,7 +334,7 @@ class GoalEpisodeAimaTest {
                 // The repair rule derives from the goal graph; each evolved
                 // DoorFellOff is one occurrence, and the shift's committed
                 // objective anchors the end
-                .withEvolving(GoalTarget.output(ShiftReport::class.java)),
+                .withEvolving(Evolving(GoalTarget.output(ShiftReport::class.java), EpisodeExecution.IN_PROCESS)),
             WeldsCompleted(0),
         )
 
@@ -368,7 +370,7 @@ class GoalEpisodeAimaTest {
         val process = create(
             SharedIntermediateAgent(),
             "aima-sussman-analogue",
-            ProcessOptions.DEFAULT.withEvolving(),
+            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
         )
 
         val exception = assertThrows<IllegalArgumentException> {

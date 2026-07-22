@@ -29,6 +29,7 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
+import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
@@ -157,9 +158,6 @@ open class SimpleAgentProcess(
     internal var lastCompletedEpisode: Episode? = null
         private set
 
-    /** The active episode for the rule owning the given goal, for inspection */
-    internal fun episodeFor(goalName: String): Episode? =
-        resolvedEpisodes.firstOrNull { it.matches(goalName) }?.let { activeEpisodes[it] }
     private val pendingEpisodes = mutableMapOf<ResolvedEpisodeRule, ArrayDeque<Episode>>()
     private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
 
@@ -173,14 +171,36 @@ open class SimpleAgentProcess(
     private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
 
     /**
+     * Children the framework spawned to execute episodes, in dispatch
+     * order, retained for inspection and observability.
+     */
+    internal val frameworkChildren = mutableListOf<AgentProcess>()
+
+    /**
      * Publish a fact as an occurrence. The process evolves only at evolve
      * boundaries, and every evolution is handled inside an episode: the
      * instance is admitted to the rule whose chain consumes its type,
      * serially, and consumed by identity on completion.
      */
+    /** Whether this process declared evolving mode, for platform wiring */
+    internal val isEvolving: Boolean get() = derivedScope != null
+
+    /**
+     * Set by the platform on children of an evolving process: evolve from
+     * inside a child delegates up the tower to the nearest evolving
+     * ancestor, so chain actions publish occurrences identically on both
+     * rungs.
+     */
+    internal var evolveDelegate: ((Any) -> Unit)? = null
+
     fun evolve(fact: Any) {
-        require(derivedScope != null) {
-            "evolve requires an evolving process: declare withEvolving() on the process options"
+        if (derivedScope == null) {
+            val delegate = evolveDelegate
+            require(delegate != null) {
+                "evolve requires an evolving process: declare withEvolving() on the process options"
+            }
+            delegate(fact)
+            return
         }
         val candidates = routableRules(fact)
         requireRoutable(fact, candidates)
@@ -393,7 +413,7 @@ open class SimpleAgentProcess(
     ) {
         val rule = resolvedEpisodes.firstOrNull { it.matches(plan.goal.name) }
         if (rule != null && episodicCompletion(rule)) {
-            completeEpisode(rule, plan, worldState)
+            completeEpisode(rule, rule.goalsByName.getValue(plan.goal.name), worldState)
             return
         }
         if (!completesProcess(plan.goal.name)) {
@@ -428,15 +448,15 @@ open class SimpleAgentProcess(
      */
     private fun completeEpisode(
         rule: ResolvedEpisodeRule,
-        plan: Plan,
+        goal: Goal,
         worldState: WorldState,
     ) {
         logger.debug(
             "🔁 Process {} completed episode goal {}; consuming and continuing",
             this.id,
-            plan.goal.name,
+            goal.name,
         )
-        val consumedConsumables = consumeAttributed(rule, plan.goal.name)
+        val consumedConsumables = consumeAttributed(rule, goal.name)
         val consumedRequest = completeActiveEpisode(rule)
         if (foundingWorkPlannable()) {
             logger.debug("Process {} deferring admission: terminal evaluation precedes rearming", id)
@@ -448,7 +468,7 @@ open class SimpleAgentProcess(
                 "Process {} episode goal {} completed with no active episode; " +
                         "no evolved occurrence was admitted for this completion",
                 this.id,
-                plan.goal.name,
+                goal.name,
             )
         }
         if (!consumedRequest && consumedConsumables == 0) {
@@ -456,7 +476,7 @@ open class SimpleAgentProcess(
                 "Process {} episode goal {} completed but nothing was consumed; " +
                         "failing instead of spinning on a goal that will stay satisfied",
                 this.id,
-                plan.goal.name,
+                goal.name,
             )
             setStatus(AgentProcessStatusCode.FAILED)
             return
@@ -468,7 +488,7 @@ open class SimpleAgentProcess(
                 EpisodeCompletedEvent(
                     agentProcess = this,
                     worldState = worldState,
-                    goal = plan.goal,
+                    goal = goal,
                 )
             )
         }
@@ -652,15 +672,20 @@ open class SimpleAgentProcess(
      * outside an episode.
      */
     protected fun gatedChainActions(): Set<String> {
+        // Under child execution an activated rule's chain is never the
+        // parent planner's to run: the framework dispatches it
         val dormant = resolvedEpisodes
-            .filter { episodicNow(it) && it !in activeEpisodes }
+            .filter { episodicNow(it) && (childExecution || it !in activeEpisodes) }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
-        // An action serving a live episode is never gated by a dormant
-        // sibling sharing it: liveness wins
-        val live = activeEpisodes.keys
+        // An action serving a live in-process episode is never gated by a
+        // dormant sibling sharing it: liveness wins
+        val live = if (childExecution) emptySet<String>() else activeEpisodes.keys
             .flatMapTo(mutableSetOf()) { rule -> rule.chainActionsByGoal.values.flatten() }
         return dormant - live
     }
+
+    private val childExecution: Boolean
+        get() = processOptions.evolving?.execution == EpisodeExecution.CHILD
 
     /**
      * A rule becomes episodic at its first observed occurrence: before that
@@ -687,6 +712,108 @@ open class SimpleAgentProcess(
         }
     }
 
+    /**
+     * Framework dispatch: run every active episode's chain in a child
+     * process synthesized from the derived rule. The developer writes one
+     * ordinary agent and calls evolve; dispatch, isolation, and merge-back
+     * are the framework's. Drains self-chained sequences within one parent
+     * tick: a completing child's delegated evolve queues the follow-up,
+     * and the loop admits and dispatches it until nothing progresses.
+     */
+    protected fun dispatchChildEpisodes() {
+        if (!childExecution) {
+            return
+        }
+        while (true) {
+            admitArrivals()
+            val active = activeEpisodes.entries.toList()
+            if (active.isEmpty()) {
+                return
+            }
+            var progressed = false
+            active.forEach { (rule, episode) ->
+                if (dispatchChildEpisode(rule, episode)) {
+                    progressed = true
+                }
+            }
+            if (!progressed) {
+                return
+            }
+        }
+    }
+
+    private fun dispatchChildEpisode(rule: ResolvedEpisodeRule, episode: Episode): Boolean {
+        // The parent's action budget bounds dispatches: an unboundedly
+        // self-chaining agent terminates like an in-process spin would,
+        // instead of spawning children forever
+        if (frameworkChildren.size >= processOptions.budget.actions) {
+            logger.warn(
+                "Process {} reached its action budget ({}) dispatching child episodes; terminating",
+                id,
+                processOptions.budget.actions,
+            )
+            setStatus(AgentProcessStatusCode.TERMINATED)
+            return false
+        }
+        val goal = rule.goalsByName.values.first()
+        val chainNames = rule.chainActionsFor(goal.name)
+        val childAgent = agent.copy(
+            actions = agent.actions.filter { it.name in chainNames },
+            goals = setOf(goal),
+        )
+        val parentVisible: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
+        parentVisible.addAll(blackboard.objects)
+        val platform = processContext.platformServices.agentPlatform
+        val child = platform.createChildProcess(childAgent, this, ProcessOptions.DEFAULT)
+        frameworkChildren += child
+        val completed = child.run()
+        if (completed.status != AgentProcessStatusCode.COMPLETED) {
+            logger.debug(
+                "Process {} child episode for {} did not complete ({}); request stays, redispatch next tick",
+                id,
+                goal.name,
+                completed.status,
+            )
+            return false
+        }
+        mergeChildOutcome(rule, episode, goal, child, parentVisible)
+        completeEpisode(rule, goal, planner.worldState())
+        return true
+    }
+
+    /**
+     * Merge-back contract, decided empirically: everything the chain wrote
+     * comes home, so accumulator patterns author identically on both
+     * rungs. Consumable-typed instances are recorded onto the episode and
+     * consumed at completion; undeclared standing writes survive as they
+     * would in-process. The strict declared-outputs-only contract was
+     * tried and rejected: it silently strands standing state in the child.
+     */
+    private fun mergeChildOutcome(
+        rule: ResolvedEpisodeRule,
+        episode: Episode,
+        goal: Goal,
+        child: AgentProcess,
+        parentVisible: Set<Any>,
+    ) {
+        val attributedTypes = rule.consumableTypesByGoal[goal.name].orEmpty()
+        val anchor = rule.chainActionsFor(goal.name).first()
+        child.objects
+            .filter { it !in parentVisible && it !in blackboard.objects.toIdentitySet() }
+            .forEach { instance ->
+                blackboard.addObject(instance)
+                if (attributedTypes.any { it.isInstance(instance) }) {
+                    episode.record(anchor, instance)
+                }
+            }
+    }
+
+    private fun List<Any>.toIdentitySet(): Set<Any> {
+        val set: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
+        set.addAll(this)
+        return set
+    }
+
     protected fun sendProcessRunningEvent(
         plan: Plan,
         worldState: WorldState,
@@ -703,6 +830,10 @@ open class SimpleAgentProcess(
 
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         admitArrivals()
+        dispatchChildEpisodes()
+        if (status == AgentProcessStatusCode.TERMINATED) {
+            return this
+        }
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
             system = planningSystem(),
