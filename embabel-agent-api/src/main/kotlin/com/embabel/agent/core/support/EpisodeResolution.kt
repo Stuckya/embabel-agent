@@ -17,8 +17,6 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.Agent
-import com.embabel.agent.core.EpisodePolicy
-import com.embabel.agent.core.EpisodeRule
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.IoBinding
@@ -27,9 +25,8 @@ import com.embabel.plan.common.condition.ConditionDetermination
 import com.embabel.plan.common.condition.EffectSpec
 
 /**
- * An [EpisodeRule] resolved against the goals and actions of a process scope.
+ * An episode rule derived from a declared goal's graph at process creation.
  * @param goalsByName the candidate declared goals, keyed by name
- * @param consumes the resolved request type, explicit or inferred
  * @param consumableTypesByGoal for each candidate goal, the validated consumable types
  * its chain can manufacture: the satisfying output and any intermediates,
  * loaded and consumable. Standing state an action maintains for itself (its
@@ -45,7 +42,6 @@ import com.embabel.plan.common.condition.EffectSpec
  */
 internal data class ResolvedEpisodeRule(
     val goalsByName: Map<String, Goal>,
-    val consumes: Class<*>?,
     val evolvedEligible: List<Class<*>> = emptyList(),
     val consumableTypesByGoal: Map<String, List<Class<*>>>,
     val chainActionsByGoal: Map<String, Set<String>>,
@@ -66,33 +62,75 @@ internal data class ResolvedEpisodeRule(
     fun isEvolvedEligible(instance: Any): Boolean =
         evolvedEligible.any { it.isInstance(instance) }
 
-    fun describeDriver(): String =
-        consumes?.name ?: "evolved(${evolvedEligible.joinToString { it.simpleName }})"
-
 }
 
 /**
- * Resolves an [EpisodePolicy] against an agent's declared goals at process
- * creation, failing fast on invalid configuration. Targets resolve only to
- * canonical declared goals; a target with a scoped producer that is currently
- * blocked by missing facts remains a planner concern and passes here.
+ * Every rule derived for an evolving process, plus the goals derivation
+ * excluded and why. Exclusion is not rejection: a goal that cannot support
+ * episodes never asked for them, and its recorded reason surfaces at the
+ * evolve call site that needed the goal to be evolvable.
+ */
+internal data class DerivedEvolvingScope(
+    val rules: List<ResolvedEpisodeRule>,
+    val exclusions: Map<String, String>,
+    val objectiveGoals: Set<String>,
+)
+
+/**
+ * Derives episode rules from an agent's declared goals at process creation.
+ * A goal with a scoped producer that is currently blocked by missing facts
+ * remains a planner concern and derives normally here.
  */
 internal object EpisodeResolution {
 
-    fun resolve(policy: EpisodePolicy, agent: Agent): List<ResolvedEpisodeRule> {
-        val resolved = policy.episodes.map { resolveRule(it, agent) }
-        val duplicated = resolved.mapNotNull { it.consumes }.groupBy { it }.filterValues { it.size > 1 }.keys
-        require(duplicated.isEmpty()) {
-            "Each request type may drive only one episode; consumed by multiple episodes: " +
-                    duplicated.joinToString { it.name }
+    /**
+     * Derive an evolved rule for every declared goal whose graph supports one:
+     * the declaration razor keeps only declarations that add facts the goal
+     * graph lacks, and target, consumes and evolved all restate it. The same
+     * validations that reject a declared rule decide derivability here, so
+     * evolving mode keeps construction-time fail-fast without a declared
+     * policy. Cross-rule routing checks do not apply: contested arrival types
+     * are legal and routed by the planner at arrival.
+     */
+    fun deriveEvolving(agent: Agent, objective: GoalTarget?): DerivedEvolvingScope {
+        val rules = mutableListOf<ResolvedEpisodeRule>()
+        val exclusions = mutableMapOf<String, String>()
+        agent.goals.forEach { goal ->
+            try {
+                rules += resolveRule(goal, agent)
+            } catch (e: IllegalArgumentException) {
+                exclusions[goal.name] = e.message ?: "underivable"
+            }
         }
-        requireUnambiguousRouting(resolved)
-        val goalOwner = mutableMapOf<String, String>()
-        resolved
-            .flatMap { resolved -> resolved.goalsByName.keys.map { it to resolved.describeDriver() } }
-            .forEach { (goalName, driver) -> requireSingleOwner(goalOwner, goalName, driver) }
-        return withExclusiveChainActions(resolved, agent)
+        return DerivedEvolvingScope(
+            rules = withExclusiveChainActions(rules, agent),
+            exclusions = exclusions,
+            objectiveGoals = resolveObjective(objective, agent),
+        )
     }
+
+    /**
+     * The committed objective: the goals whose completion completes the
+     * process. Empty means intentionally infinite. An objective naming no
+     * declared goal fails fast.
+     */
+    private fun resolveObjective(objective: GoalTarget?, agent: Agent): Set<String> {
+        if (objective == null) {
+            return emptySet()
+        }
+        val candidates = agent.goals.filter { matchesTarget(it, objective) }
+        require(candidates.isNotEmpty()) {
+            "Evolving objective $objective resolves to no declared goal in scope. " +
+                    "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
+        }
+        return candidates.mapTo(mutableSetOf()) { it.name }
+    }
+
+    private fun matchesTarget(goal: Goal, target: GoalTarget): Boolean =
+        when (target) {
+            is GoalTarget.Named -> goal.name == target.goalName
+            is GoalTarget.Output -> satisfiesOutputTarget(goal, target)
+        }
 
     /**
      * An episode chain is plannable only while one of its episodes is
@@ -117,31 +155,21 @@ internal object EpisodeResolution {
         }
     }
 
-    private fun resolveRule(rule: EpisodeRule, agent: Agent): ResolvedEpisodeRule {
-        val candidates = candidatesFor(rule, agent)
-        require(candidates.isNotEmpty()) {
-            "Episode target ${rule.target} resolves to no declared goal in scope. " +
-                    "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
-        }
-        val chains = candidates.associate { it.name to analyzeGoalChain(it, agent) }
-        check(chains.size == candidates.size) {
-            "Candidate goal names must be unique before chain analysis"
-        }
+    private fun resolveRule(goal: Goal, agent: Agent): ResolvedEpisodeRule {
+        requireNamesUniqueInScope(listOf(goal), agent)
+        val chains = mapOf(goal.name to analyzeGoalChain(goal, agent))
         val requiredOnEveryPath = chains.values
             .map { it.requiredOffChainBindings }
             .reduce { a, b -> a intersect b }
-        val consumes = resolveConsumes(rule, requiredOnEveryPath)
-        val evolvedEligible =
-            if (rule.evolved) evolvedEligibleTypes(rule, requiredOnEveryPath) else emptyList()
-        candidates.forEach { requireConsumableOutput(rule, it, agent) }
+        val evolvedEligible = evolvedEligibleTypes(goal, requiredOnEveryPath)
+        requireConsumableOutput(goal, agent)
         val consumableTypesByGoal = chains.mapValues { (goalName, chain) ->
             chain.outputTypes
                 .filterNot { isSelfMaintained(it, agent) }
                 .map { loadConsumableClass(goalName, it) }
         }
         return ResolvedEpisodeRule(
-            goalsByName = candidates.associateBy { it.name },
-            consumes = consumes,
+            goalsByName = mapOf(goal.name to goal),
             evolvedEligible = evolvedEligible,
             consumableTypesByGoal = consumableTypesByGoal,
             chainActionsByGoal = chains.mapValues { (_, chain) ->
@@ -174,60 +202,25 @@ internal object EpisodeResolution {
     }
 
     /**
-     * Explicit consumes and single-input inference keep type-subscription
-     * admission. A bare rule over several off-chain inputs is evolved-only:
-     * no driver mapping exists, and designation rides each instance at
-     * publication through the process's evolve entry point.
-     */
-    private fun resolveConsumes(rule: EpisodeRule, requiredOnEveryPath: Set<String>): Class<*>? {
-        if (rule.evolved) {
-            return null
-        }
-        if (rule.consumes != null) {
-            validateExplicitConsumes(rule, rule.consumes, requiredOnEveryPath)
-            return rule.consumes
-        }
-        return inferConsumes(rule, requiredOnEveryPath)
-    }
-
-    /**
      * The types an evolved instance may arrive under for this rule: the
      * default-binding off-chain inputs required on every completion path,
      * loaded. An evolved arrival of any other type never routes here.
      */
-    private fun evolvedEligibleTypes(rule: EpisodeRule, requiredOnEveryPath: Set<String>): List<Class<*>> {
+    private fun evolvedEligibleTypes(goal: Goal, requiredOnEveryPath: Set<String>): List<Class<*>> {
         val eligible = requiredOnEveryPath
             .filter { IoBinding(it).name == IoBinding.DEFAULT_BINDING }
             .map { binding ->
                 IoBinding(binding).resolveJvmType()?.clazz
                     ?: throw IllegalArgumentException(
-                        "Episode target ${rule.target} cannot load off-chain input " +
+                        "Goal ${goal.name} cannot load off-chain input " +
                                 "${IoBinding(binding).type}: evolved occurrences must be loadable JVM types"
                     )
             }
         require(eligible.isNotEmpty()) {
-            "Episode target ${rule.target} has no default-binding off-chain input: " +
+            "Goal ${goal.name} has no default-binding off-chain input: " +
                     "nothing can be evolved for it"
         }
         return eligible
-    }
-
-    /**
-     * An evolved arrival must route to exactly one rule, so an evolved-only
-     * rule's eligible types may not overlap another rule's eligible or
-     * consumed types.
-     */
-    private fun requireUnambiguousRouting(resolved: List<ResolvedEpisodeRule>) {
-        val claims = mutableMapOf<String, Int>()
-        resolved.forEach { rule ->
-            val names = rule.consumes?.let { listOf(it.name) } ?: rule.evolvedEligible.map { it.name }
-            names.forEach { claims.merge(it, 1, Int::plus) }
-        }
-        val contested = claims.filterValues { it > 1 }.keys
-        require(contested.isEmpty()) {
-            "An evolved arrival must route to exactly one episode; contested types: " +
-                    contested.joinToString()
-        }
     }
 
     private fun loadConsumableClass(goalName: String, typeName: String): Class<*> =
@@ -236,19 +229,6 @@ internal object EpisodeResolution {
                 "Episode candidate $goalName produces $typeName, which cannot be loaded: " +
                         "every consumable must be a loadable JVM type"
             )
-
-    private fun candidatesFor(rule: EpisodeRule, agent: Agent): List<Goal> =
-        when (val target = rule.target) {
-            is GoalTarget.Named -> namedCandidates(rule, target, agent)
-            is GoalTarget.Output -> outputCandidates(rule, target, agent)
-        }
-
-    private fun outputCandidates(rule: EpisodeRule, target: GoalTarget.Output, agent: Agent): List<Goal> {
-        val matches = agent.goals.filter { satisfiesOutputTarget(it, target) }
-        requireDistinctNames(rule, matches)
-        requireNamesUniqueInScope(matches, agent)
-        return matches
-    }
 
     /**
      * Completion recognition matches by goal name, so a candidate must not
@@ -270,7 +250,7 @@ internal object EpisodeResolution {
      * forever, and a non-JVM output could never be hidden at all: either way
      * the episode could not rearm.
      */
-    private fun requireConsumableOutput(rule: EpisodeRule, goal: Goal, agent: Agent) {
+    private fun requireConsumableOutput(goal: Goal, agent: Agent) {
         val outputType = goal.outputType
         require(outputType is JvmType) {
             "Episode candidate ${goal.name} does not produce a JVM output type: " +
@@ -283,37 +263,8 @@ internal object EpisodeResolution {
         }
     }
 
-    private fun requireDistinctNames(rule: EpisodeRule, candidates: List<Goal>) {
-        val duplicated = candidates.groupBy { it.name }.filterValues { it.size > 1 }.keys
-        require(duplicated.isEmpty()) {
-            "Episode target ${rule.target} resolves distinct goals sharing a name: " +
-                    "${duplicated.joinToString()}; goal names must be unique to participate in an episode"
-        }
-    }
-
-    private fun namedCandidates(rule: EpisodeRule, target: GoalTarget.Named, agent: Agent): List<Goal> {
-        val matches = agent.goals.filter { it.name == target.goalName }
-        require(matches.size <= 1) {
-            "Episode target ${rule.target} resolves to ${matches.size} declared goals; " +
-                    "a named target must identify exactly one"
-        }
-        return matches
-    }
-
     private fun satisfiesOutputTarget(goal: Goal, target: GoalTarget.Output): Boolean =
         goal.outputType?.isAssignableTo(target.satisfiedByType) == true
-
-    private fun requireSingleOwner(
-        goalOwner: MutableMap<String, String>,
-        goalName: String,
-        driver: String,
-    ) {
-        val prior = goalOwner.putIfAbsent(goalName, driver)
-        require(prior == null) {
-            "Episodes consuming $prior and $driver both resolve to " +
-                    "declared goal $goalName; each declared goal may belong to only one episode"
-        }
-    }
 
     private data class GoalChain(
         /** Off-chain input bindings required on every completion path to the goal */
@@ -465,66 +416,6 @@ internal object EpisodeResolution {
         return producers.any { producer ->
             requiredConditions(producer.preconditions).all { canRegenerate(it, agent, inProgress) }
         }
-    }
-
-    /**
-     * The consumed request must be an off-chain input required on every
-     * completion path of every candidate, must match the binding type exactly,
-     * and must use the default binding. Serial admission pairs completions
-     * with the active request by identity, so mis-pairing is impossible; this
-     * rule guards attribution instead: a goal reachable without the request
-     * could complete and consume an admitted request whose work never ran.
-     */
-    private fun validateExplicitConsumes(
-        rule: EpisodeRule,
-        explicit: Class<*>,
-        requiredOnEveryPath: Set<String>,
-    ) {
-        val binding = requiredOnEveryPath.firstOrNull { IoBinding(it).type == explicit.name }
-        require(binding != null) {
-            "Episode target ${rule.target} cannot consume ${explicit.name}: it is not an off-chain " +
-                    "input required on every completion path. Required off-chain inputs: " +
-                    describeBindings(requiredOnEveryPath)
-        }
-        requireDefaultBinding(rule, binding)
-    }
-
-    private fun requireDefaultBinding(rule: EpisodeRule, bindingCondition: String) {
-        val bindingName = IoBinding(bindingCondition).name
-        require(bindingName == IoBinding.DEFAULT_BINDING) {
-            "Episode target ${rule.target} cannot consume a request bound as '$bindingName': " +
-                    "named request bindings are not supported"
-        }
-    }
-
-    private fun describeBindings(bindings: Set<String>): String =
-        bindings.joinToString().ifEmpty { "none" }
-
-    /**
-     * Infer the consumed request type as the single off-chain input required on
-     * every completion path. Such an input is an observation rather than a
-     * plannable output, which is exactly what a request occurrence is.
-     * Anything else is ambiguous and requires explicit consumeOnCompletion.
-     */
-    private fun inferConsumes(rule: EpisodeRule, requiredOnEveryPath: Set<String>): Class<*> {
-        require(requiredOnEveryPath.isNotEmpty()) {
-            "Cannot infer the consumed request for episode target ${rule.target}: " +
-                    "no off-chain input is required on every completion path. " +
-                    "Specify consumeOnCompletion explicitly"
-        }
-        require(requiredOnEveryPath.size == 1) {
-            "Cannot infer the consumed request for episode target ${rule.target}: " +
-                    "multiple off-chain inputs are required: ${describeBindings(requiredOnEveryPath)}. " +
-                    "Specify consumeOnCompletion explicitly, or declare the rule evolved()"
-        }
-        val binding = requiredOnEveryPath.single()
-        requireDefaultBinding(rule, binding)
-        return IoBinding(binding).resolveJvmType()?.clazz
-            ?: throw IllegalArgumentException(
-                "Cannot infer the consumed request for episode target ${rule.target}: " +
-                        "cannot load inferred input type ${IoBinding(binding).type}. " +
-                        "Specify consumeOnCompletion explicitly"
-            )
     }
 
 }

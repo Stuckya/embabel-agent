@@ -29,12 +29,14 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
+import com.embabel.agent.core.Goal
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
 import com.embabel.agent.spi.PlannerFactory
 import com.embabel.common.util.indentLines
 import com.embabel.plan.Plan
 import com.embabel.plan.Planner
+import com.embabel.plan.PlanningSystem
 import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import java.time.Instant
@@ -68,11 +70,46 @@ open class SimpleAgentProcess(
     override val planner: Planner<*, *, *> = plannerFactory.createPlanner(processOptions, worldStateDeterminer)
 
     /**
-     * Episode policy resolved against the process scope.
-     * Resolution validates the policy, so invalid configuration fails here at construction.
+     * In evolving mode every episode rule is derived from the goal graph at
+     * construction, with underivable goals excluded and their reasons kept
+     * for the evolve call site. Null outside evolving mode.
+     */
+    private val derivedScope: DerivedEvolvingScope? =
+        processOptions.evolving?.let { EpisodeResolution.deriveEvolving(agent, it.objective) }
+
+    /**
+     * Episode rules derived from the goal graph in evolving mode. Empty
+     * outside evolving mode, where no episode machinery engages.
      */
     private val resolvedEpisodes: List<ResolvedEpisodeRule> =
-        EpisodeResolution.resolve(processOptions.episodes, agent)
+        derivedScope?.rules.orEmpty()
+
+    /**
+     * Rules that have admitted at least one occurrence. In evolving mode a
+     * goal's episodicity is established by its first observed occurrence:
+     * before that the goal is founding scope and behaves exactly as default
+     * mode, and after that its exclusive chain gates between episodes.
+     * Declared rules are episodic from construction and never consult this.
+     */
+    private val activatedRules = mutableSetOf<ResolvedEpisodeRule>()
+
+    /**
+     * The process-episode: in evolving mode the process itself is the
+     * outermost episode, active from construction, terminal from within and
+     * episodic from a parent's level. Its request is the founding percept,
+     * the initial observations present at construction. Founding-frame work
+     * executes inside it, so evolves it publishes record it as their cause.
+     */
+    private val foundingEpisode: Episode? =
+        derivedScope?.let { Episode(FoundingPercept(blackboard.objects.toList())).also(Episode::activate) }
+
+    /**
+     * Founding-frame goals already achieved: recorded and withdrawn from
+     * planning so the process resumes its mission instead of completing or
+     * replaying them. The spot-welding robot reattaches the door and
+     * resumes its work (AIMA 3e p. 422); only the objective ends the mission.
+     */
+    private val achievedFrameGoals = mutableSetOf<String>()
 
     /**
      * Actions to exclude from the next planning cycle.
@@ -101,7 +138,11 @@ open class SimpleAgentProcess(
      */
     private val evolvedArrivals: MutableMap<Any, EvolveOrigin> = IdentityHashMap()
 
-    private data class EvolveOrigin(val causedBy: Episode?, val publishedBy: String?)
+    private data class EvolveOrigin(
+        val causedBy: Episode?,
+        val publishedBy: String?,
+        val owner: ResolvedEpisodeRule? = null,
+    )
 
     /** The episode whose chain action is currently executing, if any */
     private var executingEpisode: Episode? = null
@@ -129,33 +170,93 @@ open class SimpleAgentProcess(
      * serially, and consumed by identity on completion.
      */
     fun evolve(fact: Any) {
-        requireRoutable(fact)
-        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction)
+        require(derivedScope != null) {
+            "evolve requires an evolving process: declare withEvolving() on the process options"
+        }
+        val candidates = routableRules(fact)
+        requireRoutable(fact, candidates)
         blackboard.addObject(fact)
+        val owner = candidates.singleOrNull() ?: routeByPlan(fact, candidates)
+        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction, owner)
     }
+
+    private fun routableRules(fact: Any): List<ResolvedEpisodeRule> =
+        resolvedEpisodes.filter { it.isEvolvedEligible(fact) }
+
+    /**
+     * Routing is planning: a contested arrival is owned by the rule whose
+     * goal the planner values highest given the arrival, the same best-value
+     * decision default mode makes over shared input types. Ownership is part
+     * of the arrival boundary fact, decided once here and never renegotiated,
+     * so a busy rule cannot lose an arrival that belongs to it on the merits.
+     * Ties go to the first-declared candidate, matching the planner's own
+     * stable ordering. Same-class competitors are hidden during the
+     * competition, mirroring request grounding.
+     */
+    private fun routeByPlan(fact: Any, candidates: List<ResolvedEpisodeRule>): ResolvedEpisodeRule {
+        val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
+        competitors.forEach(blackboard::hide)
+        try {
+            return candidates.maxByOrNull(::bestPlanValue) ?: candidates.first()
+        } finally {
+            competitors.forEach(blackboard::reveal)
+        }
+    }
+
+    private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
+        rule.goalsByName.values.maxOfOrNull { goal ->
+            planner.planToGoal(agent.planningSystem.actions, goal)
+                ?.netValue(planner.worldState())
+                ?: Double.NEGATIVE_INFINITY
+        } ?: Double.NEGATIVE_INFINITY
 
     /**
      * Fail fast at the boundary: an evolving process's evolvable types are
      * its enforced contract. Without this, a mis-deployed publisher would
-     * believe work was scheduled while nothing ever admits the fact.
+     * believe work was scheduled while nothing ever admits the fact. In
+     * evolving mode the message also carries why derivation excluded goals,
+     * so the publisher learns what the graph could not support.
      */
-    private fun requireRoutable(fact: Any) {
-        val routable = resolvedEpisodes.any { rule ->
-            rule.consumes?.isInstance(fact) == true || rule.isEvolvedEligible(fact)
-        }
-        require(routable) {
+    private fun requireRoutable(fact: Any, candidates: List<ResolvedEpisodeRule>) {
+        require(candidates.isNotEmpty()) {
             "${fact.javaClass.simpleName} cannot evolve this process: no episodic rule consumes it. " +
-                    "Evolvable types: ${evolvableTypeNames().ifEmpty { "none" }}"
+                    "Evolvable types: ${evolvableTypeNames().ifEmpty { "none" }}" +
+                    describeExclusions()
         }
     }
 
+    private fun describeExclusions(): String {
+        val exclusions = derivedScope?.exclusions.orEmpty()
+        if (exclusions.isEmpty()) {
+            return ""
+        }
+        return ". Goals excluded from derivation: " +
+                exclusions.entries.joinToString("; ") { (goal, reason) -> "$goal ($reason)" }
+    }
+
     private fun evolvableTypeNames(): String =
-        resolvedEpisodes
-            .flatMap { rule -> rule.consumes?.let { listOf(it) }.orEmpty() + rule.evolvedEligible }
-            .joinToString { it.simpleName }
+        resolvedEpisodes.flatMap { it.evolvedEligible }.joinToString { it.simpleName }
 
     protected fun admitArrivals() {
         resolvedEpisodes.forEach(::admitArrivalsFor)
+        admitDeferred()
+    }
+
+    /**
+     * Resume admissions deferred at an episode boundary once founding-scope
+     * work is no longer plannable: terminal evaluation precedes rearming.
+     */
+    private fun admitDeferred() {
+        if (derivedScope == null) {
+            return
+        }
+        val idleWithPending = resolvedEpisodes.filter {
+            activeEpisodes[it] == null && !pendingEpisodes[it].isNullOrEmpty()
+        }
+        if (idleWithPending.isEmpty() || foundingWorkPlannable()) {
+            return
+        }
+        idleWithPending.forEach(::admitNext)
     }
 
     private fun admitArrivalsFor(rule: ResolvedEpisodeRule) {
@@ -168,17 +269,24 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Type-subscribed rules admit every visible instance of their consumed
-     * type. Evolved-only rules admit only instances published through
-     * [evolve], routed by eligible type.
+     * A rule admits only instances published through [evolve], routed to
+     * their owning rule fixed at the arrival boundary.
      */
-    private fun arrivalsFor(rule: ResolvedEpisodeRule): List<Any> {
-        val consumes = rule.consumes
-            ?: return blackboard.objects.filter { evolvedArrivals.containsKey(it) && rule.isEvolvedEligible(it) }
-        return blackboard.objectsOfType(consumes)
+    private fun arrivalsFor(rule: ResolvedEpisodeRule): List<Any> =
+        blackboard.objects.filter { routesTo(rule, it) }
+
+    /**
+     * An evolved arrival routes to its owning rule, fixed at the arrival
+     * boundary. An arrival with no recorded owner routes by eligible type.
+     */
+    private fun routesTo(rule: ResolvedEpisodeRule, instance: Any): Boolean {
+        val origin = evolvedArrivals[instance] ?: return false
+        origin.owner?.let { return it == rule }
+        return rule.isEvolvedEligible(instance)
     }
 
     private fun admitOrQueue(rule: ResolvedEpisodeRule, episode: Episode) {
+        activatedRules += rule
         if (activeEpisodes.putIfAbsent(rule, episode) == null) {
             episode.activate()
             logger.debug("Process {} admitted {}", id, episode)
@@ -190,9 +298,9 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Complete the active episode: consume its request by identity, then
-     * admit the next pending episode so a fresh chain can begin at the
-     * next tick.
+     * Complete the active episode: consume its request by identity. Rearm
+     * is the caller's decision, because terminal evaluation sits between
+     * consumption and the next admission.
      */
     private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
         val episode = activeEpisodes.remove(rule) ?: return false
@@ -200,7 +308,6 @@ open class SimpleAgentProcess(
         episode.complete()
         lastCompletedEpisode = episode
         logger.debug("Process {} completed {}", this.id, episode)
-        admitNext(rule)
         return true
     }
 
@@ -238,10 +345,16 @@ open class SimpleAgentProcess(
         worldState: WorldState,
     ) {
         val rule = resolvedEpisodes.firstOrNull { it.matches(plan.goal.name) }
-        if (rule != null) {
+        if (rule != null && episodicCompletion(rule)) {
             completeEpisode(rule, plan, worldState)
             return
         }
+        if (!completesProcess(plan.goal.name)) {
+            recordFrameAchievement(plan.goal.name)
+            return
+        }
+        reportAbandonedOccurrences()
+        completeFoundingEpisode()
         logger.debug(
             "✅ Process {} completed, achieving goal {} in {} seconds",
             this.id,
@@ -278,13 +391,17 @@ open class SimpleAgentProcess(
         )
         val consumedConsumables = consumeAttributed(rule, plan.goal.name)
         val consumedRequest = completeActiveEpisode(rule)
+        if (foundingWorkPlannable()) {
+            logger.debug("Process {} deferring admission: terminal evaluation precedes rearming", id)
+        } else {
+            admitNext(rule)
+        }
         if (!consumedRequest) {
             logger.warn(
                 "Process {} episode goal {} completed with no active episode; " +
-                        "no {} occurrence was admitted for this completion",
+                        "no evolved occurrence was admitted for this completion",
                 this.id,
                 plan.goal.name,
-                rule.consumes?.name ?: "evolved occurrence",
             )
         }
         if (!consumedRequest && consumedConsumables == 0) {
@@ -306,6 +423,83 @@ open class SimpleAgentProcess(
                     worldState = worldState,
                     goal = plan.goal,
                 )
+            )
+        }
+    }
+
+    /**
+     * A rule completes as an episode only while one is active: a
+     * never-activated goal completing off standing facts is founding-frame
+     * work, never an episode.
+     */
+    private fun episodicCompletion(rule: ResolvedEpisodeRule): Boolean =
+        activeEpisodes[rule] != null
+
+    /**
+     * Completion is anchored to the committed objective: in evolving mode
+     * only the founding episode's goal completes the process, and no
+     * objective means intentionally infinite. Outside evolving mode any
+     * goal completes the process, as ever.
+     */
+    private fun completesProcess(goalName: String): Boolean {
+        val scope = derivedScope ?: return true
+        return goalName in scope.objectiveGoals
+    }
+
+    /**
+     * An incidental founding-frame achievement is recorded and withdrawn
+     * from planning; the process resumes instead of completing.
+     */
+    private fun recordFrameAchievement(goalName: String) {
+        achievedFrameGoals += goalName
+        logger.info(
+            "Process {} achieved frame goal {} and resumes: completion is anchored to the objective",
+            id,
+            goalName,
+        )
+        makeRunning()
+    }
+
+    private fun completeFoundingEpisode() {
+        val founding = foundingEpisode ?: return
+        founding.complete()
+        lastCompletedEpisode = founding
+    }
+
+    /**
+     * Terminal evaluation precedes rearming: at an episode boundary,
+     * founding-scope work that is plannable runs before any pending
+     * occurrence is admitted, so termination never depends on value tuning
+     * between a terminal plan and the next episode. Founding scope is every
+     * goal not owned by an activated rule, evaluated on the
+     * post-consumption world.
+     */
+    private fun foundingWorkPlannable(): Boolean {
+        if (derivedScope == null) {
+            return false
+        }
+        return foundingGoals().any { planner.planToGoal(agent.planningSystem.actions, it) != null }
+    }
+
+    private fun foundingGoals(): List<Goal> =
+        agent.goals.filter {
+            it.name != NIRVANA.name && it.name !in achievedFrameGoals && !ownedByActivatedRule(it.name)
+        }
+
+    private fun ownedByActivatedRule(goalName: String): Boolean =
+        resolvedEpisodes.any { it.matches(goalName) && it in activatedRules }
+
+    /**
+     * A process completing with occurrences still queued abandons them:
+     * report the fact rather than dropping it silently.
+     */
+    private fun reportAbandonedOccurrences() {
+        val abandoned = pendingEpisodes.values.sumOf { it.size }
+        if (abandoned > 0) {
+            logger.info(
+                "Process {} completed with {} pending occurrence(s) abandoned in queue",
+                id,
+                abandoned,
             )
         }
     }
@@ -337,14 +531,16 @@ open class SimpleAgentProcess(
      */
     protected fun executeActionAttributingConsumables(action: Action, servedGoal: String): ActionStatus {
         val owner = attributionOwner(servedGoal, action.name)
-        executingEpisode = owner?.second
+        // Founding-frame work executes inside the process-episode, so an
+        // evolve it publishes records the founding episode as its cause
+        executingEpisode = owner?.second ?: foundingEpisode
         executingAction = action.name
         try {
             if (owner == null) {
                 return executeAction(action)
             }
             val (rule, episode) = owner
-            val grounded = groundRequestBinding(rule, episode)
+            val grounded = groundRequestBinding(episode)
             try {
                 val before: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
                 before.addAll(blackboard.objects)
@@ -364,17 +560,12 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Ground the request binding for an evolved episode's chain execution:
-     * while the action runs, the episode's request is the only visible
-     * instance of its own class, so binding by type resolves the occurrence
-     * the episode holds. Standard ground-action semantics, per occurrence.
-     * Type-subscribed rules need no grounding: their queues already hide
-     * every competitor.
+     * Ground the request binding for an episode's chain execution: while
+     * the action runs, the episode's request is the only visible instance
+     * of its own class, so binding by type resolves the occurrence the
+     * episode holds. Standard ground-action semantics, per occurrence.
      */
-    private fun groundRequestBinding(rule: ResolvedEpisodeRule, episode: Episode): List<Any> {
-        if (rule.consumes != null) {
-            return emptyList()
-        }
+    private fun groundRequestBinding(episode: Episode): List<Any> {
         val requestClass = episode.request.javaClass
         val shadowing = blackboard.objects
             .filter { it !== episode.request && requestClass.isInstance(it) }
@@ -415,8 +606,33 @@ open class SimpleAgentProcess(
      */
     protected fun gatedChainActions(): Set<String> =
         resolvedEpisodes
-            .filter { it !in activeEpisodes }
+            .filter { episodicNow(it) && it !in activeEpisodes }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
+
+    /**
+     * A rule becomes episodic at its first observed occurrence: before that
+     * the goal is founding frame, and its chain runs ungated.
+     */
+    private fun episodicNow(rule: ResolvedEpisodeRule): Boolean =
+        rule in activatedRules
+
+    /**
+     * The planning system for the next tick: achieved founding-frame goals
+     * are withdrawn so a satisfied incident never outcompetes the mission,
+     * everything else is the agent's declared system.
+     */
+    protected fun planningSystem(): PlanningSystem {
+        if (achievedFrameGoals.isEmpty()) {
+            return agent.planningSystem
+        }
+        val declared = agent.planningSystem
+        return object : PlanningSystem {
+            override val actions = declared.actions
+            override val goals = declared.goals.filterNot { it.name in achievedFrameGoals }.toSet()
+            override fun knownConditions() = declared.knownConditions()
+            override fun infoString(verbose: Boolean?, indent: Int) = declared.infoString(verbose, indent)
+        }
+    }
 
     protected fun sendProcessRunningEvent(
         plan: Plan,
@@ -436,7 +652,7 @@ open class SimpleAgentProcess(
         admitArrivals()
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
-            system = agent.planningSystem,
+            system = planningSystem(),
             excludedActionNames = replanBlacklist + gatedChainActions(),
         )
         if (plan == null) {

@@ -15,17 +15,16 @@
  */
 package com.embabel.agent.core.support
 
-import com.embabel.agent.core.EpisodeRule
-
 /**
  * One occurrence of a goal episode at runtime: the request that begins it,
  * the consumables its chain has made, and where it stands in the
  * serial-admission lifecycle. The request is the episode's percept in the
  * sense of AIMA 3e chapter 2: its arrival begins the episode, and its
- * consumption ends it. An [EpisodeRule] declares which goals are episodic
- * at construction; each arriving occurrence becomes an Episode. At most
- * one Episode per rule is ACTIVE. Later arrivals wait PENDING, hidden
- * until admitted, so each chain binds exactly its own request.
+ * consumption ends it. Episode rules are derived from the goal graph at
+ * construction; each occurrence arriving through evolve becomes an
+ * Episode. At most one Episode per rule is ACTIVE. Later arrivals wait
+ * PENDING, hidden until admitted, so each chain binds exactly its own
+ * request.
  *
  * Consumables follow AIMA's consumable-resource idea: instances a chain
  * action made for this occurrence, recorded by identity as they appear.
@@ -68,6 +67,15 @@ internal class Episode(
                 (causedBy?.let { ", causedBy=${it.request}" } ?: "") + ")"
 
 }
+
+/**
+ * The founding episode's request: the percept that began the process-episode.
+ * In evolving mode the process itself is the outermost episode, terminal from
+ * within and episodic from a parent's level (AIMA 3e ch 2 p. 45: many
+ * environments are episodic at higher levels; the tournament is not one of
+ * its games). Its percept is the process's initial observations.
+ */
+internal data class FoundingPercept(val seeds: List<Any>)
 
 /**
  * A consumable attributed to the chain action that made it, so completion

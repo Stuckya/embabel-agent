@@ -59,7 +59,7 @@ open class ConcurrentAgentProcess(
         admitArrivals()
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(
-            system = agent.planningSystem,
+            system = planningSystem(),
             excludedActionNames = replanBlacklist + gatedChainActions(),
         )
         if (plan == null) {

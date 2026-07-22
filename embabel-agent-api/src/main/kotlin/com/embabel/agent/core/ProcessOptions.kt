@@ -213,10 +213,9 @@ constructor(
  * @param toolCallContext out-of-band metadata (e.g., auth tokens, tenant IDs) passed to tools
  * at call time. This context is propagated to all tools, including MCP tools where it bridges
  * to Spring AI's ToolContext and ultimately to MCP's McpMeta.
- * @param episodes episode policy for this process. Declared goals matched by the policy
- * become repeatable nonterminal episodes: completing one consumes its request occurrence
- * and satisfying output rather than completing the process. Empty preserves
- * ordinary goal completion behavior.
+ * @param evolving the evolving-mode declaration, or null for default mode. When
+ * present, every episode rule is derived from the goal graph and occurrences
+ * arrive only through the process's evolve entry point.
  */
 data class ProcessOptions @JvmOverloads constructor(
     val contextId: ContextId? = null,
@@ -235,7 +234,7 @@ data class ProcessOptions @JvmOverloads constructor(
     val outputChannel: OutputChannel = DevNullOutputChannel,
     val plannerType: PlannerType = PlannerType.GOAP,
     val toolCallContext: ToolCallContext = ToolCallContext.EMPTY,
-    val episodes: EpisodePolicy = EpisodePolicy.NONE,
+    val evolving: Evolving? = null,
 ) {
 
     /**
@@ -307,8 +306,22 @@ data class ProcessOptions @JvmOverloads constructor(
     fun withToolCallContext(context: Map<String, Any>): ProcessOptions =
         this.copy(toolCallContext = ToolCallContext.of(context))
 
-    fun withEpisodes(episodes: EpisodePolicy): ProcessOptions =
-        this.copy(episodes = episodes)
+    /**
+     * Declare this process's environment evolving. Every declared goal's episode
+     * rule is derived from the goal graph, and occurrences arrive only through
+     * the process's evolve entry point. The mode is declared once; rules are
+     * never declared. Without an objective the process is intentionally infinite.
+     */
+    fun withEvolving(): ProcessOptions =
+        this.copy(evolving = Evolving())
+
+    /**
+     * Declare the evolving process's committed objective. The founding episode
+     * completes the process when this goal completes; no other completion ends
+     * it.
+     */
+    fun withEvolving(objective: GoalTarget): ProcessOptions =
+        withEvolving().copy(evolving = Evolving(objective))
 
     companion object {
 
@@ -318,3 +331,11 @@ data class ProcessOptions @JvmOverloads constructor(
     }
 
 }
+
+/**
+ * Evolving-mode declaration for a process: the environment classification,
+ * declared once. The optional [objective] is the committed objective: the
+ * founding episode completes the process when it completes, and no other
+ * completion ends it. No objective means intentionally infinite.
+ */
+data class Evolving(val objective: GoalTarget? = null)

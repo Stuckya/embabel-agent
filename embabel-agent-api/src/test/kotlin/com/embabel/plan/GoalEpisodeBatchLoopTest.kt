@@ -24,10 +24,10 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodePolicy
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
+import com.embabel.agent.core.support.FoundingPercept
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -36,6 +36,7 @@ import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServ
 import org.junit.jupiter.api.Test
 import java.time.Instant
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
 data class BatchRequested(val id: Int)
@@ -46,11 +47,12 @@ data class HazardCleared(val id: String)
 data class BatchMissionDone(val samples: Int)
 
 /**
- * The batch loop: collect 500 samples in batches of 50, each batch one
- * episode. RepeatUntil for a group of actions is emergent, not a construct:
- * the rule admits every new occurrence, each episode runs once and is
- * consumed, and the until is an ordinary condition-gated terminal goal.
- * AIMA 3e p. 423, directly: "the loop is created by a process of
+ * The batch loop in the derived shape: collect 500 samples in batches of
+ * 50, each batch one episode, no EpisodePolicy anywhere. RepeatUntil for a
+ * group of actions is emergent, not a construct: every rule derives from
+ * the goal graph under withEvolving(), each evolved occurrence runs once
+ * and is consumed, and the until is the committed objective. AIMA 3e
+ * p. 423, directly: "the loop is created by a process of
  * plan-execute-replan, rather than by an explicit loop in a plan."
  *
  * What it pins, composed in one scenario:
@@ -62,13 +64,15 @@ data class BatchMissionDone(val samples: Int)
  * - The tally is standing state, advanced by addObject rather than declared
  *   as an output, so it is never attributed and survives every completion.
  *   Episodes are independent, not idempotent: the mission accumulates.
- * - A hazard mid-shift runs its own episode between batches: admission is
- *   per rule, so the hazard never queues behind pending batches, and its
- *   two-step chain out-values batch work until cleared.
+ * - A hazard mid-shift runs its own derived episode between batches:
+ *   admission is per rule, so the hazard never queues behind pending
+ *   batches, and its two-step chain out-values batch work until cleared.
  * - Group repetition is the conjunction of per-action canRerun on the
  *   chain; there is no group-level rerun declaration.
- * - The until is ordinary: the terminal goal completes the process when the
- *   tally reaches 500, ending ten episodes of batch work normally.
+ * - The until is the committed objective: completion is anchored to the
+ *   mission goal rather than won on value, terminal evaluation precedes
+ *   rearming, and the founding episode - the mission itself - completes
+ *   last, holding the process's founding percept.
  */
 class GoalEpisodeBatchLoopTest {
 
@@ -134,13 +138,9 @@ class GoalEpisodeBatchLoopTest {
             agent.copy(goals = agent.goals + NIRVANA),
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEpisodes(
-                    // Both rules evolved: no driver mappings anywhere.
-                    // Occurrences are whatever arrives through evolve()
-                    EpisodePolicy
-                        .episode(GoalTarget.output(BatchCollected::class.java)).evolved()
-                        .episode(GoalTarget.output(HazardCleared::class.java)).evolved()
-                ),
+                // No policy anywhere: both rules derive from the goal
+                // graph, and the objective anchors completion
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
@@ -150,8 +150,8 @@ class GoalEpisodeBatchLoopTest {
 
         val result = process.run()
 
-        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The terminal goal ends the process normally")
-        assertEquals(500, result.last<BatchMissionDone>()?.samples, "The until was an ordinary terminal goal")
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The committed objective ends the process")
+        assertEquals(500, result.last<BatchMissionDone>()?.samples, "The until was the anchored objective")
         assertEquals(500, result.last<SampleTally>()?.count, "Standing state accumulated across every episode")
 
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
@@ -164,8 +164,11 @@ class GoalEpisodeBatchLoopTest {
 
         assertNull(result.last<BatchRequested>(), "Every batch request was consumed by its own episode")
         assertNull(result.last<BatchCollected>(), "Every batch output was consumed as its episode's consumable")
-        assertNull(result.last<HazardDetected>(), "The inferred hazard request was consumed")
+        assertNull(result.last<HazardDetected>(), "The evolved hazard request was consumed")
         assertNull(result.last<HazardAssessed>(), "The hazard chain's intermediate was consumed")
         assertNull(result.last<HazardCleared>(), "The hazard output was consumed")
+
+        val founding = process.lastCompletedEpisode
+        assertNotNull(founding?.request as? FoundingPercept, "The mission itself completed last")
     }
 }

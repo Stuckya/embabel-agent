@@ -25,7 +25,6 @@ import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodePolicy
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -57,8 +56,8 @@ data class ShiftLog(val welds: Int)
  *
  * What it pins:
  * - The parent-level episode contract is indifferent to what the chain does.
- *   Bare inference, consumption, and rearm all work when the chain's one
- *   action delegates to a child process.
+ *   Derived rules, evolved admission, consumption, and rearm all work when
+ *   the chain's one action delegates to a child process.
  * - Standing work still interleaves BETWEEN child-process episodes, because
  *   the parent planner arbitrates the dispatch like any other action.
  * - A child-process episode is atomic from the parent's view. Nothing
@@ -108,10 +107,10 @@ class GoalEpisodeLadderTest {
             context.addObject(ExecutedStep("weld"))
             val next = WeldTally(tally.count + 1)
             if (next.count == 2) {
-                context.addObject(DoorDown("door-7"))
+                (context.agentProcess as SimpleAgentProcess).evolve(DoorDown("door-7"))
             }
             if (next.count == 4) {
-                context.addObject(DoorDown("door-8"))
+                (context.agentProcess as SimpleAgentProcess).evolve(DoorDown("door-8"))
             }
             return next
         }
@@ -179,12 +178,11 @@ class GoalEpisodeLadderTest {
             "episode-ladder",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEpisodes(
-                    // Bare episode: DoorDown is the only off-chain input of
-                    // the dispatch, so consumption is inferred at the parent
-                    // level exactly as it would be for an in-process chain
-                    EpisodePolicy.episode(GoalTarget.output(DoorFixed::class.java))
-                ),
+                // Derived: the repair rule comes from the goal graph, each
+                // evolved DoorDown is one occurrence, and the shift's
+                // objective anchors completion at the parent level exactly
+                // as it would for an in-process chain
+                .withEvolving(GoalTarget.output(ShiftLog::class.java)),
             WeldTally(0),
         )
 

@@ -223,7 +223,7 @@ open class DefaultAgentPlatform(
         // Episode policy is scoped to the process it was configured for:
         // a child running a different agent must not inherit it
         val processOptions = parentAgentProcess.processContext.processOptions
-            .withEpisodes(EpisodePolicy.NONE)
+            .copy(evolving = null)
         val childAgentProcess = SimpleAgentProcess(
             agent = agent,
             platformServices = parentAgentProcess.processContext.platformServices,
