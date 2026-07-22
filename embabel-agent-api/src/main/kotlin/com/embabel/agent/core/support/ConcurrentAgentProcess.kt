@@ -57,15 +57,14 @@ open class ConcurrentAgentProcess(
 ) {
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         admitArrivals()
-        dispatchChildEpisodes()
-        if (status == AgentProcessStatusCode.TERMINATED) {
-            return this
-        }
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(
             system = planningSystem(),
             excludedActionNames = replanBlacklist + gatedChainActions(),
         )
+        if (dispatchIfEpisodeWins(plan, worldState)) {
+            return this
+        }
         if (plan == null) {
             if (replanBlacklist.isNotEmpty()) {
                 logger.debug(
@@ -74,12 +73,6 @@ open class ConcurrentAgentProcess(
                 )
                 replanBlacklist.clear()
                 return formulateAndExecutePlan(worldState)
-            }
-            if (lastDispatchProgressed) {
-                // Mirror SimpleAgentProcess: a productive dispatch wave may
-                // have queued follow-ups for the next tick
-                makeRunning()
-                return this
             }
             return handlePlanNotFound(worldState)
         }

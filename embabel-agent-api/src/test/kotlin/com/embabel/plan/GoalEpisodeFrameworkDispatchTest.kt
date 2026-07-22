@@ -271,25 +271,26 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `a failed child is contained and a later run respawns - the occurrence survives the failure`() {
+    fun `a failed child is contained and re-selection respawns - the occurrence survives to a fresh child`() {
         // Failure containment is a rung upgrade: an in-process action throw
         // fails the parent run, while a failed child leaves the parent
-        // running with the occurrence unconsumed for a fresh child
+        // running with the occurrence unconsumed. The next tick's selection
+        // respawns a fresh child in the same run, bounded by the parent's
+        // action budget
         val agent = PlainFlakyAgent()
         val process = dispatching(agent)
         process.evolve(CalibrationRequested("cal-1"))
 
-        val afterFailure = process.run()
+        val result = process.run()
 
-        assertEquals(AgentProcessStatusCode.STUCK, afterFailure.status, "The parent survived the child's failure")
-        assertNotNull(afterFailure.last<CalibrationRequested>(), "A failed child must not consume the occurrence")
-        assertEquals(1, process.frameworkChildren.size, "One child was spawned and failed")
-
-        val retried = afterFailure.run()
-
-        assertEquals(AgentProcessStatusCode.STUCK, retried.status)
-        assertEquals(2, agent.attempts, "A fresh child was respawned")
-        assertNull(retried.last<CalibrationRequested>(), "The respawned child's completion consumed the occurrence")
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "The parent survived the child's failure")
+        assertEquals(2, agent.attempts, "The contained failure was re-selected and a fresh child respawned")
+        assertEquals(2, process.frameworkChildren.size, "One failed child, one successful respawn")
+        assertNull(result.last<CalibrationRequested>(), "Only the successful child consumed the occurrence")
+        assertEquals(
+            AgentProcessStatusCode.COMPLETED, process.frameworkChildren.last().status,
+            "The respawned child ran the chain to its goal",
+        )
     }
 
     @Test
@@ -398,8 +399,10 @@ class GoalEpisodeFrameworkDispatchTest {
     @Agent(description = "Batches beside capped standing welds - waves must interleave")
     inner class InterleavedMissionAgent {
 
-        @Action(canRerun = true, value = 0.5)
-        @AchievesGoal(description = "Batch collected", value = 1.0)
+        // The batch chain is deliberately priced below the welds: goal 0.2
+        // plus step 0.1 against weld 0.9, so preemption is value's verdict
+        @Action(canRerun = true, value = 0.1)
+        @AchievesGoal(description = "Batch collected", value = 0.2)
         fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
             context.addObject(ExecutedStep("batch:${request.id}"))
             val next = SampleTally(tally.count + 50)
@@ -410,10 +413,13 @@ class GoalEpisodeFrameworkDispatchTest {
             return BatchCollected(request.id)
         }
 
+        // Welding becomes available only after the first batch and is
+        // capped at two: interleaving must be earned by value, not fiat
         @Condition(name = "welding")
-        fun welding(missions: MissionTally): Boolean = missions.count < 2
+        fun welding(tally: SampleTally, missions: MissionTally): Boolean =
+            tally.count >= 50 && missions.count < 2
 
-        @Action(pre = ["welding"], canRerun = true, value = 0.6)
+        @Action(pre = ["welding"], canRerun = true, value = 0.9)
         fun weld(missions: MissionTally, context: ActionContext): MissionTally {
             context.addObject(ExecutedStep("weld"))
             return MissionTally(missions.count + 1)
@@ -428,11 +434,11 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `standing work interleaves between framework children - one dispatch wave per tick`() {
-        // Episodes are atomic; the mission is not. The spot-welding robot
-        // resumes its standing work between repairs (AIMA 3e p. 422), so a
-        // self-chained sequence must not drain to exhaustion before frame
-        // work gets a tick
+    fun `standing work interleaves with framework children by value - selection is the planner's`() {
+        // Episodes are atomic; the mission is not. Selection is value-owned
+        // on both rungs: the welds out-value the remaining batches once
+        // available, so they preempt the chain exactly as in-process
+        // standing work would (AIMA 3e p. 422), then the batches resume
         val process = dispatching(
             InterleavedMissionAgent(),
             SampleTally(0),
@@ -447,8 +453,8 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
-            listOf("batch:1", "weld", "batch:2", "weld", "batch:3"), steps,
-            "Standing welds slotted between child episodes, never starved behind the chain",
+            listOf("batch:1", "weld", "weld", "batch:2", "batch:3"), steps,
+            "The higher-value welds preempted the remaining batches, then the chain resumed",
         )
         assertEquals(150, result.last<BatchMissionDone>()?.samples)
     }
@@ -509,6 +515,10 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(150, result.last<BatchMissionDone>()?.samples)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertTrue("assess:spill-1" in steps && "clear:spill-1" in steps, "The hazard chain ran and merged: $steps")
+        assertTrue(
+            steps.indexOf("clear:spill-1") < steps.indexOf("batch:3"),
+            "The higher-value hazard episode dispatched before the remaining batch: $steps",
+        )
         assertNull(result.last<HazardDetected>(), "The evolved hazard occurrence was consumed")
         assertNull(result.last<HazardCleared>(), "The hazard result was consumed")
     }

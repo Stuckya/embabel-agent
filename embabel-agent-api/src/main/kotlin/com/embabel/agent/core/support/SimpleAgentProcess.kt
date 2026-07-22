@@ -42,13 +42,10 @@ import com.embabel.plan.Planner
 import com.embabel.plan.PlanningSystem
 import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
-import com.embabel.agent.api.common.PlannerType
 import java.time.Instant
 import java.util.Collections
 import java.util.IdentityHashMap
 
-/** Bounded inspection window for framework-dispatched children */
-private const val RETAINED_CHILDREN = 32
 
 open class SimpleAgentProcess(
     id: String,
@@ -205,34 +202,19 @@ open class SimpleAgentProcess(
     private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
 
     /**
-     * Recent children the framework spawned to execute episodes, in
-     * dispatch order. Retention is bounded: a recurring mission must not
-     * hoard process objects, so inspection sees the most recent
-     * [RETAINED_CHILDREN] and [frameworkChildCount] for the total.
+     * The child rung's execution adapter: it runs already-selected
+     * episodes and supplies the values selection ranks. Selection itself
+     * stays with the planner.
      */
-    internal val frameworkChildren: List<AgentProcess> get() = recentChildren.toList()
-
-    private val recentChildren = ArrayDeque<AgentProcess>()
-
-    /** Total children ever dispatched by this process */
-    internal var frameworkChildCount = 0
-        private set
-
-    private fun recordFrameworkChild(child: AgentProcess) {
-        recentChildren.addLast(child)
-        if (recentChildren.size > RETAINED_CHILDREN) {
-            recentChildren.removeFirst()
-        }
-        frameworkChildCount++
+    private val childExecutor: ChildEpisodeExecutor by lazy {
+        ChildEpisodeExecutor(this, plannerFactory, worldStateDeterminer)
     }
 
-    /**
-     * The full-path planner children run under, used to check a chain's
-     * feasibility before dispatch regardless of the parent's planner type.
-     */
-    private val childFeasibilityPlanner: Planner<*, *, *> by lazy {
-        plannerFactory.createPlanner(ProcessOptions.DEFAULT, worldStateDeterminer)
-    }
+    /** Recent framework children, bounded, for inspection */
+    internal val frameworkChildren: List<AgentProcess> get() = childExecutor.recentChildrenView
+
+    /** Total framework children ever dispatched */
+    internal val frameworkChildCount: Int get() = childExecutor.childCount
 
     /**
      * Publish a fact as an occurrence. The process evolves only at evolve
@@ -782,140 +764,36 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * True when the most recent dispatch wave completed at least one
-     * episode: more child work may be pending, so the tick loop must not
-     * park even if no frame plan exists this tick.
+     * Selection is the planner's on both rungs: active child episodes are
+     * valued by the plans their children would run and compete with frame
+     * work on net value. One execution per tick, so standing work and
+     * other episodes interleave exactly as value dictates. An unplannable
+     * chain is never a candidate, so a blocked episode never spawns a
+     * doomed child.
      */
-    protected var lastDispatchProgressed = false
-        private set
-
-    /**
-     * Framework dispatch: one wave per tick. Each active episode's chain
-     * runs in a child process synthesized from the derived rule; the
-     * developer writes one ordinary agent and calls evolve, and dispatch,
-     * isolation, and merge-back are the framework's. Episodes are atomic;
-     * the mission is not: frame work planned after the wave interleaves
-     * between children, and a completing child's delegated evolve queues
-     * the follow-up for the next tick's wave.
-     */
-    protected fun dispatchChildEpisodes() {
-        lastDispatchProgressed = false
+    protected fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean {
         if (!childExecution) {
-            return
+            return false
         }
-        activeEpisodes.entries.toList().forEach { (rule, episode) ->
-            if (dispatchChildEpisode(rule, episode)) {
-                lastDispatchProgressed = true
+        val choice = childExecutor.choices(activeEpisodes, agent).maxByOrNull { it.value } ?: return false
+        if (plan != null && plan.netValue(worldState) > choice.value) {
+            return false
+        }
+        when (childExecutor.execute(choice)) {
+            ChildExecution.COMPLETED -> completeEpisode(choice.rule, choice.goal, planner.worldState())
+            ChildExecution.NOT_COMPLETED -> {
+                // Contained failure or a stuck child: the occurrence is
+                // intact and the next tick re-selects by value
+            }
+            ChildExecution.BUDGET_EXHAUSTED -> {
+                setStatus(AgentProcessStatusCode.TERMINATED)
+                return true
             }
         }
-    }
-
-    private fun dispatchChildEpisode(rule: ResolvedEpisodeRule, episode: Episode): Boolean {
-        // The parent's action budget bounds dispatches: an unboundedly
-        // self-chaining agent terminates like an in-process spin would,
-        // instead of spawning children forever
-        if (frameworkChildCount >= processOptions.budget.actions) {
-            logger.warn(
-                "Process {} reached its action budget ({}) dispatching child episodes; terminating",
-                id,
-                processOptions.budget.actions,
-            )
-            setStatus(AgentProcessStatusCode.TERMINATED)
-            return false
+        if (status != AgentProcessStatusCode.TERMINATED) {
+            makeRunning()
         }
-        // Derived rules are per goal by construction; single() fails loudly
-        // if that invariant ever changes
-        val goal = rule.goalsByName.values.single()
-        val chainNames = rule.chainActionsFor(goal.name)
-        val chainActions = agent.actions.filter { it.name in chainNames }
-        // Stall-before-work at the dispatch boundary: a chain the parent
-        // can predict will stall never becomes a child, so a blocked
-        // episode costs one plan check per tick instead of a doomed
-        // process and a budget unit. Feasibility is a full-path question,
-        // asked of the planner the child will actually run
-        if (childFeasibilityPlanner.planToGoal(chainActions, goal) == null) {
-            logger.debug(
-                "Process {} episode for {} is not yet feasible; awaiting a world change",
-                id,
-                goal.name,
-            )
-            return false
-        }
-        val childAgent = agent.copy(
-            actions = chainActions,
-            goals = setOf(goal),
-        )
-        val parentVisible: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
-        parentVisible.addAll(blackboard.objects)
-        val platform = processContext.platformServices.agentPlatform
-        // The child inherits the parent's options - budget limits,
-        // identities, context - minus the evolving declaration, with the
-        // full-path planner episodes require
-        val child = platform.createChildProcess(
-            childAgent,
-            this,
-            processOptions.copy(evolving = null, plannerType = PlannerType.GOAP),
-        )
-        recordFrameworkChild(child)
-        // A failing child is contained: the parent keeps running, the
-        // occurrence stays unconsumed, and a later tick respawns
-        val completed = runCatching { child.run() }.getOrElse { failure ->
-            logger.warn(
-                "Process {} child episode for {} failed: {}",
-                id,
-                goal.name,
-                failure.message,
-            )
-            return false
-        }
-        if (completed.status != AgentProcessStatusCode.COMPLETED) {
-            logger.debug(
-                "Process {} child episode for {} did not complete ({}); request stays, redispatch next tick",
-                id,
-                goal.name,
-                completed.status,
-            )
-            return false
-        }
-        mergeChildOutcome(rule, episode, goal, child, parentVisible)
-        completeEpisode(rule, goal, planner.worldState())
         return true
-    }
-
-    /**
-     * Merge-back: everything the chain wrote comes home, so accumulator
-     * patterns author identically on both rungs. Consumable-typed
-     * instances are recorded onto the episode and consumed at completion;
-     * undeclared standing writes survive as they would in-process. A
-     * narrower contract would strand standing state in the child: a chain
-     * whose loop condition reads a stranded accumulator self-chains
-     * forever.
-     */
-    private fun mergeChildOutcome(
-        rule: ResolvedEpisodeRule,
-        episode: Episode,
-        goal: Goal,
-        child: AgentProcess,
-        parentVisible: Set<Any>,
-    ) {
-        val attributedTypes = rule.consumableTypesByGoal[goal.name].orEmpty()
-        val anchor = rule.chainActionsFor(goal.name).first()
-        child.objects
-            .filter { it !in parentVisible && it !in blackboard.objects.toIdentitySet() }
-            .forEach { instance ->
-                // Through the process path, so merged outputs emit
-                // ObjectAddedEvent like any other addition
-                addObject(instance)
-                if (attributedTypes.any { it.isInstance(instance) }) {
-                    episode.record(anchor, instance)
-                }
-            }
-    }
-
-    private fun List<Any>.toIdentitySet(): Set<Any> {
-        val set: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
-        set.addAll(this)
-        return set
     }
 
     protected fun sendProcessRunningEvent(
@@ -934,15 +812,14 @@ open class SimpleAgentProcess(
 
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         admitArrivals()
-        dispatchChildEpisodes()
-        if (status == AgentProcessStatusCode.TERMINATED) {
-            return this
-        }
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
             system = planningSystem(),
             excludedActionNames = replanBlacklist + gatedChainActions(),
         )
+        if (dispatchIfEpisodeWins(plan, worldState)) {
+            return this
+        }
         if (plan == null) {
             // If no plan found with blacklist, try without it as a fallback
             // This handles the case where the blacklisted action is the only option
@@ -953,12 +830,6 @@ open class SimpleAgentProcess(
                 )
                 replanBlacklist.clear()
                 return formulateAndExecutePlan(worldState)
-            }
-            if (lastDispatchProgressed) {
-                // A wave just completed episode work: follow-ups may be
-                // queued for the next tick, so do not park yet
-                makeRunning()
-                return this
             }
             return handlePlanNotFound(worldState)
         }
