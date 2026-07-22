@@ -6,8 +6,8 @@
 > `evolving-mode-episode-ladder` branch: derived episode rules under a
 > single `withEvolving` declaration, the founding episode and committed
 > objective, occurrence designation through `evolve`, routing by planning,
-> and the child-primary authoring model over `createChildProcess` with
-> declared child options. The declared `EpisodePolicy` dialect described
+> and framework-dispatched child execution as the default rung, over
+> `createChildProcess` with declared child options. The declared `EpisodePolicy` dialect described
 > by earlier versions was implemented, fully test-pinned, and then deleted
 > once derivation subsumed it; its shape survives in git history.
 > Sub-issues 2-8 predate the derived shape and are queued for a
@@ -190,7 +190,7 @@ process.evolve(Object fact);   // throws for unroutable types, naming every excl
 GoalTarget.output(Class<?> satisfiedByType)  // all scoped declared goals satisfied by that type
 GoalTarget.named(String goalName)            // exactly one declared goal by stable identity
 
-// The child-primary authoring surface: options declared at the dispatch site
+// Manual dispatch for explicit crews: options declared at the dispatch site
 AgentPlatform.createChildProcess(agent, parent)           // inherits, minus the evolving declaration
 AgentPlatform.createChildProcess(agent, parent, options)  // declared verbatim; evolving children compose
 ```
@@ -317,7 +317,7 @@ Maintainer input would be helpful on these decisions. Three earlier open questio
 - **Where does evolve live, and what does its rejection throw?** `process.evolve` is the shipped surface; `ctx.evolve()` on `ActionContext` and `evolve` on the `AgentProcess` interface are the proposed homes, and every test currently casting `context.agentProcess` is the evidence they are overdue. The unroutable rejection is `IllegalArgumentException` today, carrying the exclusion reasons; a distinct type would let publishers and phase-5 machinery catch it specifically.
 - **Should a plannable objective structurally preempt standing frame work?** Deferred admission guarantees the queue never outbids the terminal plan, but standing HYBRID work competing on value is goal monitoring (§11.3.3) and can defer the ending until the budget intervenes — test-pinned as a deliberate choice. Forcing the objective would kill legitimate pre-shutdown opportunism; not forcing it means a mission can weld forever. This is the sharpest genuinely-open semantic question.
 - **Re-derivation on a live process.** Derivation runs once at construction, and the runtime keys activation, admission, and queues by rule instance. Open Evolving's "add further goals and agents" needs scope mutation plus re-derivation with rule identity preserved across derivations — likely keyed by goal name. Nothing forecloses it; nobody has built it.
-- **Parallel actions inside one evolving process.** The episode machinery is single-threaded by construction: execution context lives in process fields, and grounding windows mutate shared visibility. Child-primary dissolves this — parallel episodes are parallel processes — so the in-process variant is deliberately unsupported rather than half-supported. Whether it is ever worth building is a real question; the honest alternative is instance-scoped binding views, the deeper platform primitive the two grounding windows approximate.
+- **Parallel actions inside one evolving process.** The episode machinery is single-threaded by construction: execution context lives in process fields, and grounding windows mutate shared visibility. Child execution dissolves this — parallel episodes are parallel processes — so the in-process variant is deliberately unsupported rather than half-supported. Whether it is ever worth building is a real question; the honest alternative is instance-scoped binding views, the deeper platform primitive the two grounding windows approximate.
 - **How do `withObjectiveAuthor(...)` and the derived scope combine?** Authoring under derivation is simpler than under declared policy — an authored goal enters scope and re-derivation does the rest — which strengthens phase 5 but leaves its conflict-handling questions open.
 
 ### Additional Context
@@ -337,7 +337,7 @@ Maintainer input would be helpful on these decisions. Three earlier open questio
 - **Committed objective** - the founding episode's goal, declared in `withEvolving(objective)`. Only its completion completes the process; the mission "needs to know what it's trying to do" (§11.3.3, p. 422). No objective means intentionally infinite.
 - **Founding episode / founding percept** - the process as the outermost episode: active from construction, its percept the initial observations, terminal from within and episodic from a parent's level (ch 2, p. 45: the tournament is not one of its games). Founding-frame work executes inside it and roots lineage.
 - **Exclusion** - derivation's fail-fast: a goal whose graph cannot support episodes (or which is the objective) is excluded with a recorded reason that surfaces verbatim at any evolve needing it. Exclusion is not rejection; the agent still runs.
-- **Child-primary** - the authoring model: an episode body is a subagent dispatched through `createChildProcess` with options declared at the dispatch site. The child boundary draws structurally what in-process mechanisms police; in-process chains remain the supported degenerate case.
+- **Child execution** - the default rung: the framework synthesizes a child process from the derived chain, runs the episode there, and merges the outcome home. The child boundary draws structurally what in-process mechanisms police. Manual dispatch through `createChildProcess` remains for explicit crews and for the tower, since framework children are default-mode and an evolving child requires declared options. `EpisodeExecution.IN_PROCESS` is the declared opt-out.
 - **Consumable** - an instance a chain action made for the active episode, recorded by identity as it appears (AIMA §11.1's consumable resource). Completion consumes the completed candidate's consumables and nothing made elsewhere; foreign same-type instances are used, not consumed.
 - **Evolve / occurrence designation** - publishing a fact as an occurrence (`process.evolve`, proposed `ctx.evolve()`). Designation rides the instance: evolved facts are admitted to drive episodes, plain facts are standing state, and the same type can be either by call site. Unroutable evolves fail fast; with an author they become the capability trigger.
 - **Lineage** - each evolved occurrence records the episode whose chain published it (`causedBy`) and the publishing action's name (`publishedBy`), so every episode answers why it exists: a causing episode and action, an ingress source, or an author.
@@ -420,7 +420,7 @@ Evolving Mode phase 1: nonterminal repeatable goal episodes
 
 ### Body
 
-Add explicit lifecycle for declared goals that represent repeatable, nonterminal episodes. **Status: implemented and test-pinned** on `evolving-mode-episode-ladder` (60 episode tests across nine suites; full module green). The text below describes the shipped contract.
+Add explicit lifecycle for declared goals that represent repeatable, nonterminal episodes. **Status: implemented and test-pinned** on `evolving-mode-episode-ladder` (56 episode tests across eight suites; full module green). The text below describes the shipped contract.
 
 This phase requires no external ingress and no new goal-discovery mechanism. An action that observes a request publishes it through `evolve`; the existing planner sees the matching declared goal at the next tick. `ReplanRequestedException.blackboardUpdater` remains the yield-and-replan path from inside execution.
 
@@ -443,7 +443,7 @@ The shipped surface is one declaration and one entry point; there is no rule typ
 ProcessOptions.DEFAULT.withEvolving(GoalTarget.output(SamplesStored.class));
 process.evolve(new SensorCalibrationRequested("sensor-7"));
 
-// child-primary authoring: the episode body is a subagent
+// manual dispatch, for explicit crews and evolving children
 platform.createChildProcess(calibrationCrew, parentProcess, ProcessOptions.DEFAULT);
 ```
 
@@ -451,7 +451,7 @@ At runtime each admitted occurrence is a framework-internal `Episode` holding it
 
 Cooperative interruption adds an `interruptsCurrentAction` field in Phase 4; phase 1 carries no dormant surface for it. `SimpleAgentProcess.handleProcessCompletion(...)` is the shared recognition point for simple and concurrent processes: episodic completion consumes and rearms, incidental founding-frame achievement records and resumes, and only the objective completes.
 
-The framework owns the point after goal satisfaction and before process completion. That is where it consumes the exact request and the attributed consumables before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values. The reference implementation was driven test-first through five adversarial rounds: the declared-policy dialect (implemented, pinned, then deleted under the declaration razor), the derived mode, the founding episode, two external review passes, and the child-primary proof; git history preserves each stage.
+The framework owns the point after goal satisfaction and before process completion. That is where it consumes the exact request and the attributed consumables before ordinary selection resumes. An action cannot reliably perform both halves itself because its satisfying output is added after it returns. The baseline demonstrates that hand-rolling this today requires a janitor action, an archive type, `canRerun`, two hide calls, and coordinated action values. The reference implementation was driven test-first through five adversarial rounds: the declared-policy dialect (implemented, pinned, then deleted under the declaration razor), the derived mode, the founding episode, two external review passes, the subagent proof, and framework dispatch as the default execution; git history preserves each stage.
 
 Action failure does not complete the episode: a failed attempt leaves the request unconsumed, and at the child rung the next tick respawns a fresh child. Existing failure and replanning behavior remains in force; retry limits and backoff are separate concerns.
 
@@ -489,7 +489,7 @@ Acceptance criteria, all test-pinned:
 - episode completion emits `EpisodeCompletedEvent` after consumption and never a finished event; the founding completion emits the terminal pair; evolve publishes through the object-event path
 - episode rerun rides existing `canRerun`; a non-rerunnable completing action makes the episode one-shot
 - the concurrent process shares the contract for single-action ticks; parallel in-process actions are declared unsupported under evolving mode
-- child-primary: the batch mission runs as a loop of subagents with zero additional machinery; snapshot pairing rides serial admission; a failed child respawns; the paint can shares while intermediates do not
+- framework dispatch: the batch mission runs as a loop of framework-synthesized children with no dispatch code, snapshot pairing rides serial admission, a stale satisfying output cannot vacuously complete a child, a failing child is contained and respawned with its occurrence intact, standing USE-resources share across children, and the parent budget bounds the dispatch loop
 - declared child options compose the tower: an evolving child inside an evolving parent, never by inheritance
 - the AIMA scenario suite passes in this dialect: painting stall-before-work and can-reuse, HYBRID stranded-intermediate swept at completion, rerunnable spin to budget, the spot-welding robot with committed objective, and the Sussman analogue as exclusion at the boundary
 - base GOAP, Utility, and Hybrid planners remain the execution planners
