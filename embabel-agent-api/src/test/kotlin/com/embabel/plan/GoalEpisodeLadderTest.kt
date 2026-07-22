@@ -46,6 +46,14 @@ data class DoorDown(val id: String)
 data class GripperOn(val id: String)
 data class DoorFixed(val id: String)
 data class ShiftLog(val welds: Int)
+data class WaveRequested(val id: Int)
+data class WaveDone(val id: Int)
+data class StepRequested(val id: Int)
+data class StepTally(val count: Int)
+data class StepsDone(val steps: Int)
+data class StepDone(val id: Int)
+data class MissionTally(val count: Int)
+data class WavesComplete(val waves: Int)
 
 /**
  * The episode ladder: AIMA 3e p. 45 observes that "many environments are
@@ -68,6 +76,10 @@ data class ShiftLog(val welds: Int)
  * - The child sees a snapshot of the parent blackboard, hidden entries
  *   included, so a consumed request from an earlier episode is invisible to
  *   a later child. The child's intermediates never reach the parent.
+ * - Manual dispatch with declared options composes the tower: an evolving
+ *   child running its own episode loop inside an evolving parent's
+ *   episode. The evolving declaration reaches a child only by explicit
+ *   dispatch-site declaration, never by inheritance.
  */
 class GoalEpisodeLadderTest {
 
@@ -223,5 +235,97 @@ class GoalEpisodeLadderTest {
             "Each door ran its own two-step chain in its own process; " +
                     "the second child's snapshot excluded the first consumed request",
         )
+    }
+
+    @Agent(description = "Crew that runs its own episode loop inside a contained episode")
+    inner class SubMissionCrewAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Step collected", value = 1.0)
+        fun collectStep(request: StepRequested, tally: StepTally, context: ActionContext): StepDone {
+            context.addObject(ExecutedStep("child-step:${request.id}"))
+            val next = StepTally(tally.count + 1)
+            context.addObject(next)
+            if (next.count < 2) {
+                (context.agentProcess as SimpleAgentProcess).evolve(StepRequested(request.id + 1))
+            }
+            return StepDone(request.id)
+        }
+
+        @Condition(name = "stepsDone")
+        fun stepsDone(tally: StepTally): Boolean = tally.count >= 2
+
+        @Action(pre = ["stepsDone"], value = 0.9)
+        @AchievesGoal(description = "Steps complete", value = 0.5)
+        fun wrapUp(tally: StepTally): StepsDone = StepsDone(tally.count)
+    }
+
+    @Agent(description = "Parent whose contained episodes are themselves evolving loops")
+    inner class TowerParentAgent {
+
+        val children = mutableListOf<AgentProcess>()
+
+        private val crew: CoreAgent by lazy {
+            AgentMetadataReader().createAgentMetadata(SubMissionCrewAgent()) as CoreAgent
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Wave done", value = 1.0)
+        fun dispatchWave(wave: WaveRequested, missions: MissionTally, context: ActionContext): WaveDone {
+            context.addObject(ExecutedStep("wave:${wave.id}"))
+            context.addObject(StepTally(0))
+            val platform = context.processContext.platformServices.agentPlatform
+            val child = platform.createChildProcess(
+                crew,
+                context.agentProcess,
+                ProcessOptions.DEFAULT.withEvolving(
+                    Evolving(GoalTarget.output(StepsDone::class.java), EpisodeExecution.IN_PROCESS)
+                ),
+            )
+            children += child
+            (child as SimpleAgentProcess).evolve(StepRequested(1))
+            val done = child.run().last<StepsDone>()
+                ?: error("Sub-mission for wave ${wave.id} produced nothing: status=${child.status}")
+            context.addObject(MissionTally(missions.count + 1))
+            return WaveDone(done.steps)
+        }
+
+        @Condition(name = "allWaves")
+        fun allWaves(missions: MissionTally): Boolean = missions.count >= 1
+
+        @Action(pre = ["allWaves"], value = 0.9)
+        @AchievesGoal(description = "Waves complete", value = 0.4)
+        fun finish(missions: MissionTally): WavesComplete = WavesComplete(missions.count)
+    }
+
+    @Test
+    fun `an evolving child composes inside an evolving parent - the tower is unbounded`() {
+        // The evolving declaration reaches the child only by explicit
+        // dispatch-site declaration, never by inheritance, so levels
+        // compose deliberately
+        val parent = TowerParentAgent()
+        val process = create(
+            parent,
+            "episode-ladder-tower",
+            ProcessOptions.DEFAULT.withEvolving(
+                Evolving(GoalTarget.output(WavesComplete::class.java), EpisodeExecution.IN_PROCESS)
+            ),
+            MissionTally(0),
+        )
+        process.evolve(WaveRequested(1))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The parent mission ended at its objective")
+        assertEquals(1, result.last<WavesComplete>()?.waves, "One wave episode served the mission")
+
+        val child = parent.children.single()
+        assertEquals(AgentProcessStatusCode.COMPLETED, child.status, "The contained loop ended at its own objective")
+        val childSteps = child.objects.filterIsInstance<ExecutedStep>().map { it.name }.filter { it.startsWith("child-") }
+        assertEquals(
+            listOf("child-step:1", "child-step:2"), childSteps,
+            "The child ran its own serial episodes, self-chained through its own evolve",
+        )
+        assertNull(result.last<WaveRequested>(), "The parent's occurrence was consumed by the parent's episode")
     }
 }

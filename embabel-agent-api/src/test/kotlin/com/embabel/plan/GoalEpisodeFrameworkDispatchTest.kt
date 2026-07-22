@@ -49,20 +49,25 @@ import kotlin.test.assertTrue
  *
  * What it pins:
  * - Hidden complexity: a plain agent's evolved episode runs in a
- *   framework-spawned child, observable only through creation events and
- *   lineage. The developer never sees createChildProcess.
+ *   framework-spawned child with lineage recorded. The developer never
+ *   sees createChildProcess.
  * - evolve delegates up the tower: a chain action executing inside a
  *   framework child publishes its follow-up through the child's process
  *   handle, and the occurrence reaches the owning evolving parent.
- * - Standing state merges back: undeclared writes made by the chain
- *   return to the parent at completion, so accumulator patterns author
- *   identically on both rungs. The strict declared-outputs-only contract
- *   was tried first and rejected: it silently strands the tally and the
- *   mission can never end - ergonomics decided the contract.
- * - A blocked child consumes nothing and the next tick redispatches: the
- *   painting stall survives the rung change, request untouched.
+ * - Standing state merges back: everything the chain wrote returns at
+ *   completion, so accumulator patterns author identically on both rungs.
+ * - Snapshot pairing: each child sees exactly its own occurrence, because
+ *   queued arrivals hidden in the parent stay hidden in the snapshot.
+ * - A stale satisfying output cannot vacuously complete a child: hasRun
+ *   is process-scoped, so a fresh child must run its chain.
+ * - A blocked child consumes nothing and a later tick redispatches; a
+ *   failed child is contained - the parent keeps running - and the next
+ *   run respawns a fresh one with the occurrence intact.
+ * - Standing USE-resources share across children through snapshots,
+ *   consumed by none (AIMA 3e SS11.1).
  * - A HYBRID parent's framework children plan under GOAP: full-path
  *   planning inside episodes, no pairing goal anywhere.
+ * - The parent's action budget bounds the dispatch loop.
  */
 class GoalEpisodeFrameworkDispatchTest {
 
@@ -196,6 +201,71 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(4, process.frameworkChildren.size, "One framework child per occurrence")
         assertNull(result.last<BatchRequested>(), "Every occurrence was consumed, including tower-delegated ones")
         assertNull(result.last<BatchCollected>(), "Every satisfying output was consumed")
+        assertEquals(
+            listOf(listOf(1), listOf(2), listOf(3), listOf(4)),
+            process.frameworkChildren.map { child ->
+                child.objects.filterIsInstance<BatchRequested>().map(BatchRequested::id)
+            },
+            "Snapshot pairing: each child saw exactly its own occurrence, never a queued one",
+        )
+    }
+
+    @Test
+    fun `a stale satisfying output cannot vacuously complete a framework child`() {
+        // hasRun is process-scoped: a fresh child must run its chain even
+        // when a stale output of the goal's type rides in from the parent
+        val process = dispatching(PlainCalibrationAgent(), CalibrationCompleted("stale-victory"))
+        process.evolve(CalibrationRequested("cal-1"))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("prep:cal-1", "calibrate:cal-1"), steps, "The child ran its chain despite the stale output")
+        assertNull(result.last<CalibrationRequested>(), "The occurrence was consumed by real work")
+        assertEquals(
+            "stale-victory", result.last<CalibrationCompleted>()?.id,
+            "The stale standing output survives: shadowed during the episode, never consumed",
+        )
+    }
+
+    @Agent(description = "Plain calibration whose first attempt fails")
+    inner class PlainFlakyAgent {
+
+        var attempts = 0
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            attempts++
+            context.addObject(ExecutedStep("attempt:$attempts"))
+            if (attempts == 1) {
+                throw IllegalStateException("flaky calibration")
+            }
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Test
+    fun `a failed child is contained and a later run respawns - the occurrence survives the failure`() {
+        // Failure containment is a rung upgrade: an in-process action throw
+        // fails the parent run, while a failed child leaves the parent
+        // running with the occurrence unconsumed for a fresh child
+        val agent = PlainFlakyAgent()
+        val process = dispatching(agent)
+        process.evolve(CalibrationRequested("cal-1"))
+
+        val afterFailure = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, afterFailure.status, "The parent survived the child's failure")
+        assertNotNull(afterFailure.last<CalibrationRequested>(), "A failed child must not consume the occurrence")
+        assertEquals(1, process.frameworkChildren.size, "One child was spawned and failed")
+
+        val retried = afterFailure.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, retried.status)
+        assertEquals(2, agent.attempts, "A fresh child was respawned")
+        assertNull(retried.last<CalibrationRequested>(), "The respawned child's completion consumed the occurrence")
     }
 
     @Test
@@ -220,6 +290,16 @@ class GoalEpisodeFrameworkDispatchTest {
         assertNotNull(painted.last<PaintCan>(), "The can is used, not consumed")
         val steps = painted.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("prep:job-1", "paint:job-1"), steps, "The chain ran whole in the successful child")
+
+        process.evolve(PaintRequested("job-2"))
+        val secondJob = painted.run()
+
+        assertNotNull(secondJob.last<PaintCan>(), "The can survives every child: a shared USE-resource")
+        val allSteps = secondJob.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("prep:job-1", "paint:job-1", "prep:job-2", "paint:job-2"), allSteps,
+            "The second child reused the standing can through its snapshot",
+        )
     }
 
     @Agent(description = "A chain that always evolves its follow-up - deliberately unbounded")
@@ -235,11 +315,9 @@ class GoalEpisodeFrameworkDispatchTest {
 
     @Test
     fun `the parent budget bounds framework dispatches - an unbounded chain terminates instead of spawning forever`() {
-        // Discovered by the standing-state experiment: under the rejected
-        // declared-outputs-only contract, the batch loop's stale snapshot
-        // tally made self-chaining unbounded and the dispatch loop hung.
-        // The brake is contract-independent: dispatches spend the parent's
-        // action budget exactly as in-process spins do
+        // A chain that always evolves its follow-up would spawn children
+        // forever: dispatches spend the parent's action budget exactly as
+        // in-process spins do
         val blackboard = InMemoryBlackboard()
         val agent = AgentMetadataReader().createAgentMetadata(GreedyChainAgent()) as CoreAgent
         val process = SimpleAgentProcess(

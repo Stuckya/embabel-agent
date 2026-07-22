@@ -76,10 +76,9 @@ data class BatchMissionDone(val samples: Int)
  *   rearming, and the founding episode - the mission itself - completes
  *   last, holding the process's founding percept.
  *
- * This file pins the in-process rung: episode bodies run as multi-action
- * chains inside the parent, the supported degenerate case. The same
- * composed scenario runs child-primary - each body a dispatched subagent -
- * in GoalEpisodeChildPrimaryTest, the authoring model. One contract, both
+ * This file pins the in-process rung, the declared opt-out. The same
+ * composed scenario runs on the default rung - framework-dispatched
+ * children - in GoalEpisodeFrameworkDispatchTest. One contract, both
  * rungs, deliberately pinned twice.
  */
 class GoalEpisodeBatchLoopTest {

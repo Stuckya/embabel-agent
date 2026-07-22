@@ -57,7 +57,9 @@ data class SignalArchived(val id: String)
  * was deleted, the behaviors that define the contract - serial admission,
  * identity consumption, grounding, retry, event ordering, the canRerun
  * boundary - were ported rather than lost. Occurrences arrive only through
- * evolve(); everything else is standing state.
+ * evolve(); everything else is standing state. This suite declares
+ * EpisodeExecution.IN_PROCESS: it pins the in-process rung's contract. The
+ * default child rung is pinned in GoalEpisodeFrameworkDispatchTest.
  */
 class GoalEvolvingContractTest {
 

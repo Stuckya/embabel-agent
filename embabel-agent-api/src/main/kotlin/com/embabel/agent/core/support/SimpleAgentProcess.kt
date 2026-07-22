@@ -86,11 +86,10 @@ open class SimpleAgentProcess(
         derivedScope?.rules.orEmpty()
 
     /**
-     * Rules that have admitted at least one occurrence. In evolving mode a
-     * goal's episodicity is established by its first observed occurrence:
-     * before that the goal is founding scope and behaves exactly as default
-     * mode, and after that its exclusive chain gates between episodes.
-     * Declared rules are episodic from construction and never consult this.
+     * Rules that have admitted at least one occurrence. A goal's
+     * episodicity is established by its first observed occurrence: before
+     * that the goal is founding frame, and after that its exclusive chain
+     * is the episode machinery's, not the parent planner's.
      */
     private val activatedRules = mutableSetOf<ResolvedEpisodeRule>()
 
@@ -766,7 +765,17 @@ open class SimpleAgentProcess(
         val platform = processContext.platformServices.agentPlatform
         val child = platform.createChildProcess(childAgent, this, ProcessOptions.DEFAULT)
         frameworkChildren += child
-        val completed = child.run()
+        // A failing child is contained: the parent keeps running, the
+        // occurrence stays unconsumed, and a later tick respawns
+        val completed = runCatching { child.run() }.getOrElse { failure ->
+            logger.warn(
+                "Process {} child episode for {} failed: {}",
+                id,
+                goal.name,
+                failure.message,
+            )
+            return false
+        }
         if (completed.status != AgentProcessStatusCode.COMPLETED) {
             logger.debug(
                 "Process {} child episode for {} did not complete ({}); request stays, redispatch next tick",
@@ -782,12 +791,13 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Merge-back contract, decided empirically: everything the chain wrote
-     * comes home, so accumulator patterns author identically on both
-     * rungs. Consumable-typed instances are recorded onto the episode and
-     * consumed at completion; undeclared standing writes survive as they
-     * would in-process. The strict declared-outputs-only contract was
-     * tried and rejected: it silently strands standing state in the child.
+     * Merge-back: everything the chain wrote comes home, so accumulator
+     * patterns author identically on both rungs. Consumable-typed
+     * instances are recorded onto the episode and consumed at completion;
+     * undeclared standing writes survive as they would in-process. A
+     * narrower contract would strand standing state in the child: a chain
+     * whose loop condition reads a stranded accumulator self-chains
+     * forever.
      */
     private fun mergeChildOutcome(
         rule: ResolvedEpisodeRule,

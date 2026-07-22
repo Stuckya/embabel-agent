@@ -77,6 +77,10 @@ data class AuditDone(val id: String)
  * - Fail fast survives derivation: goals that can never rearm are excluded
  *   with their reason at construction, and the reason surfaces at the
  *   evolve() call site.
+ *
+ * This suite declares EpisodeExecution.IN_PROCESS: it pins the in-process
+ * rung's mode semantics. The default child rung is pinned in
+ * GoalEpisodeFrameworkDispatchTest.
  */
 class GoalEvolvingModeTest {
 
