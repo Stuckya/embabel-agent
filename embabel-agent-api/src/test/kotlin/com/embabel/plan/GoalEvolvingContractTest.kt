@@ -25,6 +25,7 @@ import com.embabel.agent.api.event.AgentProcessFinishedEvent
 import com.embabel.agent.api.event.AgenticEventListener
 import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
+import com.embabel.agent.api.event.ObjectAddedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
@@ -42,6 +43,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+
+data class SignalReceived(val id: String)
+data class Enablement(val id: String)
+data class SignalTriaged(val id: String)
+data class SignalArchived(val id: String)
 
 /**
  * The episode contract, pinned in the derived dialect. Every pin here was
@@ -357,6 +363,176 @@ class GoalEvolvingContractTest {
         assertEquals(AgentProcessStatusCode.STUCK, rearmed.status)
         val steps = rearmed.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("calibrate:cal-1", "calibrate:cal-2"), steps)
+    }
+
+    @Test
+    fun `an occurrence reopens a frame-achieved goal`() {
+        // The goal was achieved as state, and a fresh request makes it
+        // unachieved by definition: admission clears the frame achievement
+        // so the planner can serve the new occurrence
+        val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"), CalibrationRequested("cal-1"))
+
+        val founding = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, founding.status)
+        assertEquals(
+            1, founding.objects.filterIsInstance<ExecutedStep>().size,
+            "The founding frame ran the seeded work once",
+        )
+
+        process.evolve(CalibrationRequested("cal-2"))
+        val reopened = founding.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, reopened.status, "The episode completed, then a clean park")
+        val steps = reopened.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("calibrate:cal-1@zone-9", "calibrate:cal-2@zone-9"), steps,
+            "The occurrence reopened the goal the founding frame had achieved",
+        )
+        assertEquals(
+            "cal-1", reopened.last<CalibrationRequested>()?.id,
+            "The episode consumed its own occurrence; the founding-frame fact survives",
+        )
+    }
+
+    @Agent(description = "Two request-driven goals sharing a prep step off standing zone info")
+    inner class SharedPrepAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prep(zone: ZoneInfo, context: ActionContext): CalibrationKit {
+            context.addObject(ExecutedStep("prep:${zone.name}"))
+            return CalibrationKit(zone.name)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Alpha done", value = 1.0)
+        fun finishAlpha(kit: CalibrationKit, request: AlphaRequested, context: ActionContext): AlphaDone {
+            context.addObject(ExecutedStep("alpha:${request.id}"))
+            return AlphaDone(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.8)
+        @AchievesGoal(description = "Beta done", value = 0.9)
+        fun finishBeta(kit: CalibrationKit, request: BetaRequested, context: ActionContext): BetaDone {
+            context.addObject(ExecutedStep("beta:${request.id}"))
+            return BetaDone(request.id)
+        }
+    }
+
+    @Test
+    fun `an action serving a live episode is never gated by a dormant sibling`() {
+        // Two derived rules share the prep step. After the alpha episode
+        // completes, its rule is dormant and would gate the shared prep,
+        // but the beta episode is live and needs it: liveness wins
+        val process = evolvingProcess(SharedPrepAgent(), ZoneInfo("zone-9"))
+        process.evolve(AlphaRequested("a-1"))
+
+        val afterAlpha = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, afterAlpha.status)
+        assertNull(afterAlpha.last<AlphaRequested>(), "The alpha occurrence was consumed")
+
+        process.evolve(BetaRequested("b-1"))
+        val afterBeta = afterAlpha.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, afterBeta.status, "Both episodes completed, then a clean park")
+        val steps = afterBeta.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("prep:zone-9", "alpha:a-1", "prep:zone-9", "beta:b-1"), steps,
+            "The beta episode reran the shared prep despite the dormant alpha rule",
+        )
+        assertNull(afterBeta.last<BetaRequested>(), "The beta occurrence was consumed")
+    }
+
+    @Agent(description = "A kickoff that evolves a contested signal before its enabling fact lands")
+    inner class LateEnablementAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Kickoff done", value = 1.0)
+        fun kickoff(seed: MissionReport, context: ActionContext): KickoffDone {
+            (context.agentProcess as SimpleAgentProcess).evolve(SignalReceived("s-1"))
+            context.addObject(Enablement("e-1"))
+            return KickoffDone("k-${seed.samples}")
+        }
+
+        @Action(canRerun = true, value = 0.1)
+        @AchievesGoal(description = "Signal archived", value = 0.3)
+        fun archive(signal: SignalReceived, context: ActionContext): SignalArchived {
+            context.addObject(ExecutedStep("archive:${signal.id}"))
+            return SignalArchived(signal.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Signal triaged", value = 1.0)
+        fun triage(signal: SignalReceived, e: Enablement, context: ActionContext): SignalTriaged {
+            context.addObject(ExecutedStep("triage:${signal.id}"))
+            return SignalTriaged(signal.id)
+        }
+    }
+
+    @Test
+    fun `contested ownership resolves at the next tick - the arrival's world must materialize first`() {
+        // A mid-action evolve precedes its own action's remaining effects:
+        // the enabling fact lands after the evolve call. Deciding ownership
+        // at the next planning tick lets the arrival's world settle, so the
+        // higher-value triage wins instead of the only goal plannable at
+        // call time
+        val process = evolvingProcess(LateEnablementAgent(), MissionReport(7))
+
+        val result = process.run()
+
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("triage:s-1"), steps,
+            "Ownership was decided against the settled world, not the mid-action snapshot",
+        )
+        assertNull(result.last<SignalArchived>(), "The fallback goal never ran")
+        assertNull(result.last<SignalReceived>(), "The triage episode consumed the occurrence")
+    }
+
+    @Test
+    fun `evolve publishes through the process event path`() {
+        val events = mutableListOf<AgentProcessEvent>()
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                events.add(event)
+            }
+        }
+        val process = evolvingProcess(CalibrationAgent(), listener = listener)
+        val fact = CalibrationRequested("cal-1")
+
+        process.evolve(fact)
+
+        assertTrue(
+            events.filterIsInstance<ObjectAddedEvent>().any { it.value === fact },
+            "An evolved arrival is an object addition like any other, visible to listeners",
+        )
+    }
+
+    @Test
+    fun `an ambiguous named objective fails fast`() {
+        // GoalTarget.Named promises exactly one goal; the objective must
+        // enforce it even though derivation excludes duplicate names
+        val blackboard = InMemoryBlackboard()
+        val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
+        // A distinct instance sharing the name: an identical copy would
+        // deduplicate in the goal set and no ambiguity would exist
+        val duplicated = agent.copy(goals = agent.goals + agent.goals.first().copy(value = { 0.123 }))
+
+        val exception = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "evolving-contract-ambiguous-objective",
+                null,
+                duplicated,
+                ProcessOptions.DEFAULT.withEvolving(GoalTarget.named(agent.goals.first().name)),
+                blackboard,
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue(
+            "exactly one" in exception.message!!,
+            "A named objective must identify exactly one goal: ${exception.message}",
+        )
     }
 
     @Test

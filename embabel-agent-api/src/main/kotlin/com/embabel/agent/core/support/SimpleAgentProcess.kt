@@ -164,6 +164,15 @@ open class SimpleAgentProcess(
     private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
 
     /**
+     * Standing instances shadowed for an episode's outcome window: without
+     * this, a founding-frame product of a consumable type would keep the
+     * goal satisfied and the episode would complete vacuously, consuming
+     * its occurrence without running its chain. Shadowed at admission,
+     * revealed at completion: founding products are shadowed, never consumed.
+     */
+    private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
+
+    /**
      * Publish a fact as an occurrence. The process evolves only at evolve
      * boundaries, and every evolution is handled inside an episode: the
      * instance is admitted to the rule whose chain consumes its type,
@@ -175,9 +184,11 @@ open class SimpleAgentProcess(
         }
         val candidates = routableRules(fact)
         requireRoutable(fact, candidates)
-        blackboard.addObject(fact)
-        val owner = candidates.singleOrNull() ?: routeByPlan(fact, candidates)
-        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction, owner)
+        addObject(fact)
+        // Contested ownership stays open until the next planning tick: a
+        // mid-action evolve precedes its own action's remaining effects, so
+        // the arrival's world has not materialized yet
+        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction, candidates.singleOrNull())
     }
 
     private fun routableRules(fact: Any): List<ResolvedEpisodeRule> =
@@ -238,8 +249,23 @@ open class SimpleAgentProcess(
         resolvedEpisodes.flatMap { it.evolvedEligible }.joinToString { it.simpleName }
 
     protected fun admitArrivals() {
+        resolveDeferredRouting()
         resolvedEpisodes.forEach(::admitArrivalsFor)
         admitDeferred()
+    }
+
+    /**
+     * Resolve contested ownership left open at the evolve boundary, now
+     * that the arrival's world has settled. Arrival order remains the
+     * boundary fact; ownership is decided against the materialized world.
+     */
+    private fun resolveDeferredRouting() {
+        evolvedArrivals.entries
+            .filter { it.value.owner == null }
+            .toList()
+            .forEach { (fact, origin) ->
+                evolvedArrivals[fact] = origin.copy(owner = routeByPlan(fact, routableRules(fact)))
+            }
     }
 
     /**
@@ -276,19 +302,21 @@ open class SimpleAgentProcess(
         blackboard.objects.filter { routesTo(rule, it) }
 
     /**
-     * An evolved arrival routes to its owning rule, fixed at the arrival
-     * boundary. An arrival with no recorded owner routes by eligible type.
+     * An evolved arrival routes to its owning rule. Uncontested arrivals
+     * are owned at the evolve boundary; contested ones at the next tick,
+     * before any admission scan runs.
      */
-    private fun routesTo(rule: ResolvedEpisodeRule, instance: Any): Boolean {
-        val origin = evolvedArrivals[instance] ?: return false
-        origin.owner?.let { return it == rule }
-        return rule.isEvolvedEligible(instance)
-    }
+    private fun routesTo(rule: ResolvedEpisodeRule, instance: Any): Boolean =
+        evolvedArrivals[instance]?.owner == rule
 
     private fun admitOrQueue(rule: ResolvedEpisodeRule, episode: Episode) {
         activatedRules += rule
+        // An occurrence reopens the question: the goal was achieved as
+        // state, and a fresh request makes it unachieved by definition
+        achievedFrameGoals -= rule.goalsByName.keys
         if (activeEpisodes.putIfAbsent(rule, episode) == null) {
             episode.activate()
+            groundOutcomeWindow(rule, episode)
             logger.debug("Process {} admitted {}", id, episode)
             return
         }
@@ -305,6 +333,7 @@ open class SimpleAgentProcess(
     private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
         val episode = activeEpisodes.remove(rule) ?: return false
         blackboard.hide(episode.request)
+        outcomeGroundings.remove(episode)?.forEach(blackboard::reveal)
         episode.complete()
         lastCompletedEpisode = episode
         logger.debug("Process {} completed {}", this.id, episode)
@@ -313,10 +342,28 @@ open class SimpleAgentProcess(
 
     private fun admitNext(rule: ResolvedEpisodeRule) {
         val next = pendingEpisodes[rule]?.removeFirstOrNull() ?: return
-        blackboard.reveal(next.request)
+        if (!blackboard.reveal(next.request)) {
+            logger.warn(
+                "Process {} admitted {} but its request was not hidden; queue state may be inconsistent",
+                id,
+                next,
+            )
+        }
         next.activate()
         activeEpisodes[rule] = next
+        groundOutcomeWindow(rule, next)
         logger.debug("Process {} admitted queued {}", id, next)
+    }
+
+    private fun groundOutcomeWindow(rule: ResolvedEpisodeRule, episode: Episode) {
+        val consumableTypes = rule.consumableTypesByGoal.values.flatten().toSet()
+        val shadowed = blackboard.objects.filter { instance ->
+            instance !== episode.request && consumableTypes.any { it.isInstance(instance) }
+        }
+        shadowed.forEach(blackboard::hide)
+        if (shadowed.isNotEmpty()) {
+            outcomeGroundings[episode] = shadowed
+        }
     }
 
     protected fun handlePlanNotFound(worldState: WorldState): AgentProcess {
@@ -604,10 +651,16 @@ open class SimpleAgentProcess(
      * episode, so a standing resource can never let the chain complete
      * outside an episode.
      */
-    protected fun gatedChainActions(): Set<String> =
-        resolvedEpisodes
+    protected fun gatedChainActions(): Set<String> {
+        val dormant = resolvedEpisodes
             .filter { episodicNow(it) && it !in activeEpisodes }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
+        // An action serving a live episode is never gated by a dormant
+        // sibling sharing it: liveness wins
+        val live = activeEpisodes.keys
+            .flatMapTo(mutableSetOf()) { rule -> rule.chainActionsByGoal.values.flatten() }
+        return dormant - live
+    }
 
     /**
      * A rule becomes episodic at its first observed occurrence: before that

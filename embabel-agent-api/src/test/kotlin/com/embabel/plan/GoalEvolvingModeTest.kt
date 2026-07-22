@@ -21,6 +21,7 @@ import com.embabel.agent.api.annotation.Agent
 import com.embabel.agent.api.annotation.Condition
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
+import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
@@ -28,6 +29,7 @@ import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
 import com.embabel.agent.core.support.FoundingPercept
 import com.embabel.agent.core.support.InMemoryBlackboard
+import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServices
@@ -404,6 +406,85 @@ class GoalEvolvingModeTest {
         )
         assertEquals(150, result.last<BatchMissionDone>()?.samples, "The mission ran to its own end")
         assertNotNull(result.last<DoorReattached>(), "The door achievement stands as ordinary state, never consumed")
+    }
+
+    @Test
+    fun `evolving toward the committed objective fails fast - the mission is not a game`() {
+        // The objective is the tournament, never one of its games: it is
+        // excluded from derivation, so an occurrence evolved toward it has
+        // nowhere to route and the boundary names why. Without this, the
+        // objective would become episodic, consume-and-rearm forever, and
+        // the mission could never end. The welder's tally is eligible only
+        // for the objective, so the exclusion is the whole routing story
+        val process = evolvingProcess(
+            GreedyWelderAgent(),
+            SampleTally(0),
+            objective = GoalTarget.output(BatchMissionDone::class.java),
+        )
+
+        val exception = assertThrows<IllegalArgumentException> {
+            process.evolve(SampleTally(999))
+        }
+        assertTrue("SampleTally" in exception.message!!, "Names the unroutable type: ${exception.message}")
+        assertTrue(
+            "objective" in exception.message!!,
+            "Carries the objective-exclusion reason: ${exception.message}",
+        )
+    }
+
+    @Agent(description = "Standing welds that out-value the terminal report")
+    inner class GreedyWelderAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        fun weld(tally: SampleTally, context: ActionContext): SampleTally {
+            context.addObject(ExecutedStep("weld"))
+            return SampleTally(tally.count + 1)
+        }
+
+        @Condition(name = "missionDone")
+        fun missionDone(tally: SampleTally): Boolean = tally.count >= 3
+
+        @Action(pre = ["missionDone"], value = 0.1)
+        @AchievesGoal(description = "Mission complete", value = 0.1)
+        fun report(tally: SampleTally): BatchMissionDone = BatchMissionDone(tally.count)
+    }
+
+    @Test
+    fun `standing frame work can defer the ending - the deferral guarantee covers the queue, not goal monitoring`() {
+        // Documented behavior, not a defect: deferred admission guarantees
+        // pending occurrences never outbid the terminal plan, but standing
+        // frame work competing on value is goal monitoring (AIMA 3e p. 423)
+        // and can keep deferring the ending until the budget intervenes.
+        // Whether a plannable objective should structurally preempt standing
+        // work is an open design question, pinned here so the current answer
+        // is a choice, not an accident
+        val blackboard = InMemoryBlackboard()
+        blackboard.addObject(SampleTally(0))
+        val agent = AgentMetadataReader().createAgentMetadata(GreedyWelderAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "evolving-greedy-welder",
+            null,
+            agent.copy(goals = agent.goals + NIRVANA),
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+
+        val result = process.run()
+
+        assertEquals(
+            AgentProcessStatusCode.TERMINATED, result.status,
+            "High-value standing work deferred the ending until the action budget intervened",
+        )
+        assertNull(result.last<BatchMissionDone>(), "The terminal plan never won a tick on value")
+        assertTrue(
+            (result.last<SampleTally>()?.count ?: 0) > 3,
+            "Welding continued past mission-done: goal monitoring, working as declared",
+        )
     }
 
     @Agent(description = "A goal whose satisfying output is the standing state it reads")

@@ -93,9 +93,17 @@ internal object EpisodeResolution {
      * are legal and routed by the planner at arrival.
      */
     fun deriveEvolving(agent: Agent, objective: GoalTarget?): DerivedEvolvingScope {
+        val objectiveGoals = resolveObjective(objective, agent)
         val rules = mutableListOf<ResolvedEpisodeRule>()
         val exclusions = mutableMapOf<String, String>()
         agent.goals.forEach { goal ->
+            if (goal.name in objectiveGoals) {
+                // The objective is the tournament, never one of its games: an
+                // episodic objective would consume-and-rearm forever and the
+                // mission could never end
+                exclusions[goal.name] = "the committed objective is terminal, never episodic"
+                return@forEach
+            }
             try {
                 rules += resolveRule(goal, agent)
             } catch (e: IllegalArgumentException) {
@@ -105,7 +113,7 @@ internal object EpisodeResolution {
         return DerivedEvolvingScope(
             rules = withExclusiveChainActions(rules, agent),
             exclusions = exclusions,
-            objectiveGoals = resolveObjective(objective, agent),
+            objectiveGoals = objectiveGoals,
         )
     }
 
@@ -122,6 +130,12 @@ internal object EpisodeResolution {
         require(candidates.isNotEmpty()) {
             "Evolving objective $objective resolves to no declared goal in scope. " +
                     "Available goals: ${agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
+        }
+        if (objective is GoalTarget.Named) {
+            require(candidates.size == 1) {
+                "Evolving objective $objective resolves to ${candidates.size} declared goals; " +
+                        "a named target must identify exactly one"
+            }
         }
         return candidates.mapTo(mutableSetOf()) { it.name }
     }
