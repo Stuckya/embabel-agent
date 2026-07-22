@@ -75,6 +75,12 @@ open class ConcurrentAgentProcess(
                 replanBlacklist.clear()
                 return formulateAndExecutePlan(worldState)
             }
+            if (lastDispatchProgressed) {
+                // Mirror SimpleAgentProcess: a productive dispatch wave may
+                // have queued follow-ups for the next tick
+                makeRunning()
+                return this
+            }
             return handlePlanNotFound(worldState)
         }
 

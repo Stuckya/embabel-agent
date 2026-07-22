@@ -138,10 +138,10 @@ class GoalEpisodeAimaTest {
             context.addObject(ExecutedStep("weld"))
             val next = WeldsCompleted(welds.count + 1)
             if (next.count == 2) {
-                (context.agentProcess as SimpleAgentProcess).evolve(DoorFellOff("door-7"))
+                context.agentProcess.evolve(DoorFellOff("door-7"))
             }
             if (next.count == 4) {
-                (context.agentProcess as SimpleAgentProcess).evolve(DoorFellOff("door-8"))
+                context.agentProcess.evolve(DoorFellOff("door-8"))
             }
             return next
         }
@@ -360,6 +360,24 @@ class GoalEpisodeAimaTest {
         assertNull(result.last<SupervisorNotified>())
         assertNull(result.last<RepairCompleted>())
         assertNotNull(result.last<WeldsCompleted>(), "The weld tally is standing state and survives")
+    }
+
+    @Test
+    fun `the sussman analogue still completes as founding-frame planning - excluded means not episodic, not not solvable`() {
+        // Non-serializable subgoals fall to the interleaving planner, as
+        // SS10.5 prescribes: exclusion draws the boundary of what episodes
+        // may serialize, and the planner solves what they may not
+        val process = create(
+            SharedIntermediateAgent(),
+            "aima-sussman-frame",
+            ProcessOptions.DEFAULT.withEvolving(GoalTarget.output(AlphaDone::class.java)),
+            AlphaRequested("a-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The frame planner solved what episodes exclude")
+        assertNotNull(result.last<AlphaDone>(), "Founding-frame achievement stands, unconsumed")
     }
 
     @Test

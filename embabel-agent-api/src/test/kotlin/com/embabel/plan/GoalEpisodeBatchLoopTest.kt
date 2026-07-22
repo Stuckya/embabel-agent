@@ -109,7 +109,7 @@ class GoalEpisodeBatchLoopTest {
         }
 
         private fun evolve(context: ActionContext, occurrence: Any) {
-            (context.agentProcess as SimpleAgentProcess).evolve(occurrence)
+            context.agentProcess.evolve(occurrence)
         }
 
         @Action(canRerun = true, value = 0.7)

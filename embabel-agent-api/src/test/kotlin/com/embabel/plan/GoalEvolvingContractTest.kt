@@ -451,7 +451,7 @@ class GoalEvolvingContractTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Kickoff done", value = 1.0)
         fun kickoff(seed: MissionReport, context: ActionContext): KickoffDone {
-            (context.agentProcess as SimpleAgentProcess).evolve(SignalReceived("s-1"))
+            context.agentProcess.evolve(SignalReceived("s-1"))
             context.addObject(Enablement("e-1"))
             return KickoffDone("k-${seed.samples}")
         }
@@ -535,6 +535,60 @@ class GoalEvolvingContractTest {
         assertTrue(
             "exactly one" in exception.message!!,
             "A named objective must identify exactly one goal: ${exception.message}",
+        )
+    }
+
+    @Agent(description = "Two candidates for one signal, both blocked at arrival")
+    inner class CommittedOwnershipAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Signal archived", value = 0.5)
+        fun archive(signal: SignalReceived, kit: CalibrationKit, context: ActionContext): SignalArchived {
+            context.addObject(ExecutedStep("archive:${signal.id}"))
+            return SignalArchived(signal.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Signal triaged", value = 1.0)
+        fun triage(signal: SignalReceived, e: Enablement, context: ActionContext): SignalTriaged {
+            context.addObject(ExecutedStep("triage:${signal.id}"))
+            return SignalTriaged(signal.id)
+        }
+    }
+
+    @Test
+    fun `contested ownership waits for merit - least commitment at the routing boundary`() {
+        // Least commitment (AIMA 3e p. 391): when no candidate can plan,
+        // nothing owns the occurrence - the choice stays unbound until a
+        // candidate becomes feasible, and is then decided by plan value,
+        // deterministically. No declaration-order roulette
+        val process = evolvingProcess(CommittedOwnershipAgent())
+        process.evolve(SignalReceived("s-1"))
+
+        val stalled = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "Both candidates blocked; nothing owns, nothing runs")
+        assertTrue(
+            stalled.objects.filterIsInstance<ExecutedStep>().isEmpty(),
+            "Nothing ran while ownership stayed unbound",
+        )
+
+        stalled.addObject(Enablement("e-1"))
+        val triaged = stalled.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, triaged.status)
+        val steps = triaged.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("triage:s-1"), steps,
+            "The first feasible candidate owned and handled the occurrence, by merit",
+        )
+        assertNull(triaged.last<SignalReceived>(), "The occurrence was consumed by its merited owner")
+
+        stalled.addObject(CalibrationKit("k-1"))
+        val after = stalled.run()
+        assertEquals(
+            listOf("triage:s-1"),
+            after.objects.filterIsInstance<ExecutedStep>().map { it.name },
+            "The rival's later enabler changed nothing: ownership, once committed, is permanent",
         )
     }
 

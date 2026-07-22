@@ -247,11 +247,16 @@ open class DefaultAgentPlatform(
             processOptions = processOptions,
             plannerFactory = plannerFactory,
         )
-        // evolve from inside any child of an evolving process delegates up
-        // the tower to the nearest evolving ancestor, so chain actions
-        // publish occurrences identically on both rungs
-        if (parentAgentProcess is SimpleAgentProcess && parentAgentProcess.isEvolving) {
-            childAgentProcess.evolveDelegate = parentAgentProcess::evolve
+        // evolve from inside any descendant of an evolving process
+        // delegates up the tower to the nearest evolving ancestor, at any
+        // depth: an evolving parent hands down its own evolve, and a
+        // non-evolving intermediary hands down the delegate it received
+        if (parentAgentProcess is SimpleAgentProcess) {
+            val delegate: ((Any) -> Unit)? = when {
+                parentAgentProcess.isEvolving -> parentAgentProcess::evolve
+                else -> parentAgentProcess.evolveDelegate
+            }
+            delegate?.let { childAgentProcess.evolveDelegate = it }
         }
         logger.debug("👶 Creating child process {} from {}", childAgentProcess.id, parentAgentProcess.id)
         agentProcessRepository.save(childAgentProcess)

@@ -114,10 +114,10 @@ class GoalEpisodeLadderTest {
             context.addObject(ExecutedStep("weld"))
             val next = WeldTally(tally.count + 1)
             if (next.count == 2) {
-                (context.agentProcess as SimpleAgentProcess).evolve(DoorDown("door-7"))
+                context.agentProcess.evolve(DoorDown("door-7"))
             }
             if (next.count == 4) {
-                (context.agentProcess as SimpleAgentProcess).evolve(DoorDown("door-8"))
+                context.agentProcess.evolve(DoorDown("door-8"))
             }
             return next
         }
@@ -247,7 +247,7 @@ class GoalEpisodeLadderTest {
             val next = StepTally(tally.count + 1)
             context.addObject(next)
             if (next.count < 2) {
-                (context.agentProcess as SimpleAgentProcess).evolve(StepRequested(request.id + 1))
+                context.agentProcess.evolve(StepRequested(request.id + 1))
             }
             return StepDone(request.id)
         }
@@ -283,7 +283,7 @@ class GoalEpisodeLadderTest {
                 ),
             )
             children += child
-            (child as SimpleAgentProcess).evolve(StepRequested(1))
+            child.evolve(StepRequested(1))
             val done = child.run().last<StepsDone>()
                 ?: error("Sub-mission for wave ${wave.id} produced nothing: status=${child.status}")
             context.addObject(MissionTally(missions.count + 1))

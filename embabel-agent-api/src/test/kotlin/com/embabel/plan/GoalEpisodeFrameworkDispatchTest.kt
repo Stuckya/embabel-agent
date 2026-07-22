@@ -98,7 +98,7 @@ class GoalEpisodeFrameworkDispatchTest {
             val next = SampleTally(tally.count + 50)
             context.addObject(next)
             if (next.count < 200) {
-                (context.agentProcess as SimpleAgentProcess).evolve(BatchRequested(request.id + 1))
+                context.agentProcess.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
@@ -157,10 +157,34 @@ class GoalEpisodeFrameworkDispatchTest {
 
     @Test
     fun `an evolved episode runs in a framework child - the developer never sees the platform`() {
-        val process = dispatching(PlainCalibrationAgent())
+        val added = mutableListOf<Any>()
+        val listener = object : com.embabel.agent.api.event.AgenticEventListener {
+            override fun onProcessEvent(event: com.embabel.agent.api.event.AgentProcessEvent) {
+                if (event is com.embabel.agent.api.event.ObjectAddedEvent) {
+                    added.add(event.value)
+                }
+            }
+        }
+        val blackboard = InMemoryBlackboard()
+        val agent = AgentMetadataReader().createAgentMetadata(PlainCalibrationAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "framework-dispatch-hidden",
+            null,
+            agent,
+            ProcessOptions.DEFAULT.withEvolving().withListener(listener),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
         process.evolve(CalibrationRequested("cal-1"))
 
         val result = process.run()
+
+        assertTrue(
+            added.any { it is CalibrationCompleted },
+            "Merged child outputs publish through the process event path, visible to listeners",
+        )
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
         val children = process.frameworkChildren
@@ -308,7 +332,7 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Link forged", value = 1.0)
         fun forgeLink(request: BatchRequested, context: ActionContext): BatchCollected {
-            (context.agentProcess as SimpleAgentProcess).evolve(BatchRequested(request.id + 1))
+            context.agentProcess.evolve(BatchRequested(request.id + 1))
             return BatchCollected(request.id)
         }
     }
@@ -342,6 +366,229 @@ class GoalEpisodeFrameworkDispatchTest {
         )
         assertEquals(5, process.frameworkChildren.size, "One child per budgeted action, then the brake")
         assertNotNull(result.last<BatchRequested>(), "The unbounded chain's next occurrence stayed unconsumed")
+    }
+
+    @Agent(description = "A blocked episode beside busy frame work - dispatch must not spin")
+    inner class SphexMissionAgent {
+
+        @Action(canRerun = true, value = 0.4)
+        @AchievesGoal(description = "Surface painted", value = 1.0)
+        fun paint(request: PaintRequested, can: PaintCan, context: ActionContext): SurfacePainted {
+            context.addObject(ExecutedStep("paint:${request.id}"))
+            return SurfacePainted(request.id)
+        }
+
+        @Condition(name = "collecting")
+        fun collecting(tally: SampleTally): Boolean = tally.count < 3
+
+        @Action(pre = ["collecting"], canRerun = true, value = 0.6)
+        fun weld(tally: SampleTally, context: ActionContext): SampleTally {
+            context.addObject(ExecutedStep("weld"))
+            return SampleTally(tally.count + 1)
+        }
+
+        @Condition(name = "missionDone")
+        fun missionDone(tally: SampleTally): Boolean = tally.count >= 3
+
+        @Action(pre = ["missionDone"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun report(tally: SampleTally): BatchMissionDone = BatchMissionDone(tally.count)
+    }
+
+    @Agent(description = "Batches beside capped standing welds - waves must interleave")
+    inner class InterleavedMissionAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Batch collected", value = 1.0)
+        fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
+            context.addObject(ExecutedStep("batch:${request.id}"))
+            val next = SampleTally(tally.count + 50)
+            context.addObject(next)
+            if (next.count < 150) {
+                context.agentProcess.evolve(BatchRequested(request.id + 1))
+            }
+            return BatchCollected(request.id)
+        }
+
+        @Condition(name = "welding")
+        fun welding(missions: MissionTally): Boolean = missions.count < 2
+
+        @Action(pre = ["welding"], canRerun = true, value = 0.6)
+        fun weld(missions: MissionTally, context: ActionContext): MissionTally {
+            context.addObject(ExecutedStep("weld"))
+            return MissionTally(missions.count + 1)
+        }
+
+        @Condition(name = "missionDone")
+        fun missionDone(tally: SampleTally): Boolean = tally.count >= 150
+
+        @Action(pre = ["missionDone"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun report(tally: SampleTally): BatchMissionDone = BatchMissionDone(tally.count)
+    }
+
+    @Test
+    fun `standing work interleaves between framework children - one dispatch wave per tick`() {
+        // Episodes are atomic; the mission is not. The spot-welding robot
+        // resumes its standing work between repairs (AIMA 3e p. 422), so a
+        // self-chained sequence must not drain to exhaustion before frame
+        // work gets a tick
+        val process = dispatching(
+            InterleavedMissionAgent(),
+            SampleTally(0),
+            MissionTally(0),
+            objective = GoalTarget.output(BatchMissionDone::class.java),
+            hybrid = true,
+        )
+        process.evolve(BatchRequested(1))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("batch:1", "weld", "batch:2", "weld", "batch:3"), steps,
+            "Standing welds slotted between child episodes, never starved behind the chain",
+        )
+        assertEquals(150, result.last<BatchMissionDone>()?.samples)
+    }
+
+    @Agent(description = "Batches with an evolved hazard - cross-rule dispatch on the default rung")
+    inner class HazardousMissionAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Batch collected", value = 1.0)
+        fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
+            context.addObject(ExecutedStep("batch:${request.id}"))
+            val next = SampleTally(tally.count + 50)
+            context.addObject(next)
+            if (next.count == 100) {
+                context.agentProcess.evolve(HazardDetected("spill-1"))
+            }
+            if (next.count < 150) {
+                context.agentProcess.evolve(BatchRequested(request.id + 1))
+            }
+            return BatchCollected(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.7)
+        fun assess(hazard: HazardDetected, context: ActionContext): HazardAssessed {
+            context.addObject(ExecutedStep("assess:${hazard.id}"))
+            return HazardAssessed(hazard.id)
+        }
+
+        @Action(canRerun = true, value = 0.8)
+        @AchievesGoal(description = "Hazard cleared", value = 1.0)
+        fun clear(assessed: HazardAssessed, context: ActionContext): HazardCleared {
+            context.addObject(ExecutedStep("clear:${assessed.id}"))
+            return HazardCleared(assessed.id)
+        }
+
+        @Condition(name = "missionDone")
+        fun missionDone(tally: SampleTally): Boolean = tally.count >= 150
+
+        @Action(pre = ["missionDone"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun report(tally: SampleTally): BatchMissionDone = BatchMissionDone(tally.count)
+    }
+
+    @Test
+    fun `an evolved hazard runs as its own framework child between batches`() {
+        val process = dispatching(
+            HazardousMissionAgent(),
+            SampleTally(0),
+            objective = GoalTarget.output(BatchMissionDone::class.java),
+            hybrid = true,
+        )
+        process.evolve(BatchRequested(1))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        assertEquals(4, process.frameworkChildren.size, "Three batch children and one hazard child")
+        assertEquals(150, result.last<BatchMissionDone>()?.samples)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue("assess:spill-1" in steps && "clear:spill-1" in steps, "The hazard chain ran and merged: $steps")
+        assertNull(result.last<HazardDetected>(), "The evolved hazard occurrence was consumed")
+        assertNull(result.last<HazardCleared>(), "The hazard result was consumed")
+    }
+
+    @Test
+    fun `evolve delegates through non-evolving levels - the tower's plumbing is transitive`() {
+        val root = dispatching(PlainCalibrationAgent())
+        val platform = root.processContext.platformServices.agentPlatform
+        val crew = AgentMetadataReader().createAgentMetadata(PlainPaintingAgent()) as CoreAgent
+        val child = platform.createChildProcess(crew, root, ProcessOptions.DEFAULT)
+        val grandchild = platform.createChildProcess(crew, child, ProcessOptions.DEFAULT)
+
+        grandchild.evolve(CalibrationRequested("cal-1"))
+        val result = root.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
+        assertNull(result.last<CalibrationRequested>(), "The grandchild's occurrence reached the evolving root")
+    }
+
+    @Test
+    fun `a blocked episode never spawns a child the parent can predict will stall`() {
+        // The sphex-wasp hazard (AIMA 3e p. 425, note 5): futile repetition.
+        // A busy parent ticks every action, and each tick must not spawn a
+        // doomed child that spends the budget stalling. The parent checks
+        // the chain's feasibility in the episode's world first - the
+        // stall-before-work principle lifted to the dispatch boundary
+        val blackboard = InMemoryBlackboard()
+        blackboard.addObject(SampleTally(0))
+        val agent = AgentMetadataReader().createAgentMetadata(SphexMissionAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "framework-dispatch-sphex",
+            null,
+            agent.copy(goals = agent.goals + NIRVANA),
+            ProcessOptions.DEFAULT
+                .withPlannerType(PlannerType.HYBRID)
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+        process.evolve(PaintRequested("job-1"))
+
+        val result = process.run()
+
+        assertEquals(
+            AgentProcessStatusCode.COMPLETED, result.status,
+            "The mission completed; doomed dispatches did not exhaust the budget",
+        )
+        assertEquals(3, result.last<BatchMissionDone>()?.samples, "Frame work proceeded past the blocked episode")
+        assertTrue(
+            process.frameworkChildren.isEmpty(),
+            "No child was spawned for a chain the parent could predict would stall",
+        )
+        assertNotNull(result.last<PaintRequested>(), "The blocked occurrence waits intact for its enabler")
+    }
+
+    @Test
+    fun `child retention is bounded - a long mission keeps a window, not a hoard`() {
+        val blackboard = InMemoryBlackboard()
+        val agent = AgentMetadataReader().createAgentMetadata(GreedyChainAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "framework-dispatch-retention",
+            null,
+            agent,
+            ProcessOptions.DEFAULT
+                .withBudget(com.embabel.agent.core.Budget().withActions(35))
+                .withEvolving(),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+        process.evolve(BatchRequested(1))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.TERMINATED, result.status)
+        assertEquals(35, process.frameworkChildCount, "Every dispatch counted")
+        assertEquals(32, process.frameworkChildren.size, "Inspection sees a bounded window of recent children")
     }
 
     @Test

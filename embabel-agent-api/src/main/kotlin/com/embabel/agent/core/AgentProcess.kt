@@ -261,6 +261,18 @@ interface AgentProcess : Blackboard, Timestamped, Timed, OperationStatus<AgentPr
     fun run(): AgentProcess
 
     /**
+     * Publish a fact as an occurrence to this process's evolving contract.
+     * Supported by processes declared with [ProcessOptions.withEvolving]
+     * and by their children at any depth, which delegate to the nearest
+     * evolving ancestor. Fails fast everywhere else.
+     */
+    fun evolve(fact: Any) {
+        throw UnsupportedOperationException(
+            "This process does not support evolve: declare withEvolving() on the process options",
+        )
+    }
+
+    /**
      * How long this process has been running
      */
     override val runningTime

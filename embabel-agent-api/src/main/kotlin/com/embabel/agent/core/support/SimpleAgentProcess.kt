@@ -31,6 +31,8 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
 import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Goal
+import com.embabel.agent.core.IoBinding
+import com.embabel.agent.core.JvmType
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
 import com.embabel.agent.spi.PlannerFactory
@@ -40,9 +42,13 @@ import com.embabel.plan.Planner
 import com.embabel.plan.PlanningSystem
 import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
+import com.embabel.agent.api.common.PlannerType
 import java.time.Instant
 import java.util.Collections
 import java.util.IdentityHashMap
+
+/** Bounded inspection window for framework-dispatched children */
+private const val RETAINED_CHILDREN = 32
 
 open class SimpleAgentProcess(
     id: String,
@@ -51,7 +57,7 @@ open class SimpleAgentProcess(
     processOptions: ProcessOptions,
     blackboard: Blackboard,
     platformServices: PlatformServices,
-    plannerFactory: PlannerFactory,
+    private val plannerFactory: PlannerFactory,
     timestamp: Instant = Instant.now(),
 ) : AbstractAgentProcess(
     id = id,
@@ -112,6 +118,35 @@ open class SimpleAgentProcess(
     private val achievedFrameGoals = mutableSetOf<String>()
 
     /**
+     * The founding shadow: a construction-time instance of the objective's
+     * satisfying type is an ungrounded leftover - the mission's satisfying
+     * instance must be its own product (AIMA 3e SS10.1) - and would
+     * otherwise strand the mission, unsatisfied yet unplannable. Shadowed
+     * here, revealed at founding completion.
+     */
+    private val foundingShadow: List<Any> = shadowFoundingObjective()
+
+    private fun shadowFoundingObjective(): List<Any> {
+        val scope = derivedScope ?: return emptyList()
+        if (scope.objectiveGoals.isEmpty()) {
+            return emptyList()
+        }
+        val satisfyingClasses = agent.goals
+            .filter { it.name in scope.objectiveGoals }
+            .mapNotNull { goal ->
+                (goal.outputType as? JvmType)?.let { IoBinding(it.className).resolveJvmType()?.clazz }
+            }
+        if (satisfyingClasses.isEmpty()) {
+            return emptyList()
+        }
+        val shadowed = blackboard.objects.filter { instance ->
+            satisfyingClasses.any { it.isInstance(instance) }
+        }
+        shadowed.forEach(blackboard::hide)
+        return shadowed
+    }
+
+    /**
      * Actions to exclude from the next planning cycle.
      * Used to prevent infinite loops when an action requests replan but
      * would be the only applicable action again.
@@ -170,10 +205,34 @@ open class SimpleAgentProcess(
     private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
 
     /**
-     * Children the framework spawned to execute episodes, in dispatch
-     * order, retained for inspection and observability.
+     * Recent children the framework spawned to execute episodes, in
+     * dispatch order. Retention is bounded: a recurring mission must not
+     * hoard process objects, so inspection sees the most recent
+     * [RETAINED_CHILDREN] and [frameworkChildCount] for the total.
      */
-    internal val frameworkChildren = mutableListOf<AgentProcess>()
+    internal val frameworkChildren: List<AgentProcess> get() = recentChildren.toList()
+
+    private val recentChildren = ArrayDeque<AgentProcess>()
+
+    /** Total children ever dispatched by this process */
+    internal var frameworkChildCount = 0
+        private set
+
+    private fun recordFrameworkChild(child: AgentProcess) {
+        recentChildren.addLast(child)
+        if (recentChildren.size > RETAINED_CHILDREN) {
+            recentChildren.removeFirst()
+        }
+        frameworkChildCount++
+    }
+
+    /**
+     * The full-path planner children run under, used to check a chain's
+     * feasibility before dispatch regardless of the parent's planner type.
+     */
+    private val childFeasibilityPlanner: Planner<*, *, *> by lazy {
+        plannerFactory.createPlanner(ProcessOptions.DEFAULT, worldStateDeterminer)
+    }
 
     /**
      * Publish a fact as an occurrence. The process evolves only at evolve
@@ -192,7 +251,7 @@ open class SimpleAgentProcess(
      */
     internal var evolveDelegate: ((Any) -> Unit)? = null
 
-    fun evolve(fact: Any) {
+    override fun evolve(fact: Any) {
         if (derivedScope == null) {
             val delegate = evolveDelegate
             require(delegate != null) {
@@ -223,11 +282,19 @@ open class SimpleAgentProcess(
      * stable ordering. Same-class competitors are hidden during the
      * competition, mirroring request grounding.
      */
-    private fun routeByPlan(fact: Any, candidates: List<ResolvedEpisodeRule>): ResolvedEpisodeRule {
+    private fun routeByPlan(fact: Any, candidates: List<ResolvedEpisodeRule>): ResolvedEpisodeRule? {
         val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
         competitors.forEach(blackboard::hide)
         try {
-            return candidates.maxByOrNull(::bestPlanValue) ?: candidates.first()
+            val scored = candidates.map { it to bestPlanValue(it) }
+            val best = scored.maxByOrNull { it.second } ?: return null
+            if (best.second == Double.NEGATIVE_INFINITY) {
+                // Least commitment: no candidate can plan, so nothing owns
+                // the occurrence yet - the choice stays unbound and is
+                // retried when the world changes, then decided by merit
+                return null
+            }
+            return best.first
         } finally {
             competitors.forEach(blackboard::reveal)
         }
@@ -283,7 +350,9 @@ open class SimpleAgentProcess(
             .filter { it.value.owner == null }
             .toList()
             .forEach { (fact, origin) ->
-                evolvedArrivals[fact] = origin.copy(owner = routeByPlan(fact, routableRules(fact)))
+                routeByPlan(fact, routableRules(fact))?.let { owner ->
+                    evolvedArrivals[fact] = origin.copy(owner = owner)
+                }
             }
     }
 
@@ -528,6 +597,7 @@ open class SimpleAgentProcess(
 
     private fun completeFoundingEpisode() {
         val founding = foundingEpisode ?: return
+        foundingShadow.forEach(blackboard::reveal)
         founding.complete()
         lastCompletedEpisode = founding
     }
@@ -712,31 +782,30 @@ open class SimpleAgentProcess(
     }
 
     /**
-     * Framework dispatch: run every active episode's chain in a child
-     * process synthesized from the derived rule. The developer writes one
-     * ordinary agent and calls evolve; dispatch, isolation, and merge-back
-     * are the framework's. Drains self-chained sequences within one parent
-     * tick: a completing child's delegated evolve queues the follow-up,
-     * and the loop admits and dispatches it until nothing progresses.
+     * True when the most recent dispatch wave completed at least one
+     * episode: more child work may be pending, so the tick loop must not
+     * park even if no frame plan exists this tick.
+     */
+    protected var lastDispatchProgressed = false
+        private set
+
+    /**
+     * Framework dispatch: one wave per tick. Each active episode's chain
+     * runs in a child process synthesized from the derived rule; the
+     * developer writes one ordinary agent and calls evolve, and dispatch,
+     * isolation, and merge-back are the framework's. Episodes are atomic;
+     * the mission is not: frame work planned after the wave interleaves
+     * between children, and a completing child's delegated evolve queues
+     * the follow-up for the next tick's wave.
      */
     protected fun dispatchChildEpisodes() {
+        lastDispatchProgressed = false
         if (!childExecution) {
             return
         }
-        while (true) {
-            admitArrivals()
-            val active = activeEpisodes.entries.toList()
-            if (active.isEmpty()) {
-                return
-            }
-            var progressed = false
-            active.forEach { (rule, episode) ->
-                if (dispatchChildEpisode(rule, episode)) {
-                    progressed = true
-                }
-            }
-            if (!progressed) {
-                return
+        activeEpisodes.entries.toList().forEach { (rule, episode) ->
+            if (dispatchChildEpisode(rule, episode)) {
+                lastDispatchProgressed = true
             }
         }
     }
@@ -745,7 +814,7 @@ open class SimpleAgentProcess(
         // The parent's action budget bounds dispatches: an unboundedly
         // self-chaining agent terminates like an in-process spin would,
         // instead of spawning children forever
-        if (frameworkChildren.size >= processOptions.budget.actions) {
+        if (frameworkChildCount >= processOptions.budget.actions) {
             logger.warn(
                 "Process {} reached its action budget ({}) dispatching child episodes; terminating",
                 id,
@@ -754,17 +823,40 @@ open class SimpleAgentProcess(
             setStatus(AgentProcessStatusCode.TERMINATED)
             return false
         }
-        val goal = rule.goalsByName.values.first()
+        // Derived rules are per goal by construction; single() fails loudly
+        // if that invariant ever changes
+        val goal = rule.goalsByName.values.single()
         val chainNames = rule.chainActionsFor(goal.name)
+        val chainActions = agent.actions.filter { it.name in chainNames }
+        // Stall-before-work at the dispatch boundary: a chain the parent
+        // can predict will stall never becomes a child, so a blocked
+        // episode costs one plan check per tick instead of a doomed
+        // process and a budget unit. Feasibility is a full-path question,
+        // asked of the planner the child will actually run
+        if (childFeasibilityPlanner.planToGoal(chainActions, goal) == null) {
+            logger.debug(
+                "Process {} episode for {} is not yet feasible; awaiting a world change",
+                id,
+                goal.name,
+            )
+            return false
+        }
         val childAgent = agent.copy(
-            actions = agent.actions.filter { it.name in chainNames },
+            actions = chainActions,
             goals = setOf(goal),
         )
         val parentVisible: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
         parentVisible.addAll(blackboard.objects)
         val platform = processContext.platformServices.agentPlatform
-        val child = platform.createChildProcess(childAgent, this, ProcessOptions.DEFAULT)
-        frameworkChildren += child
+        // The child inherits the parent's options - budget limits,
+        // identities, context - minus the evolving declaration, with the
+        // full-path planner episodes require
+        val child = platform.createChildProcess(
+            childAgent,
+            this,
+            processOptions.copy(evolving = null, plannerType = PlannerType.GOAP),
+        )
+        recordFrameworkChild(child)
         // A failing child is contained: the parent keeps running, the
         // occurrence stays unconsumed, and a later tick respawns
         val completed = runCatching { child.run() }.getOrElse { failure ->
@@ -811,7 +903,9 @@ open class SimpleAgentProcess(
         child.objects
             .filter { it !in parentVisible && it !in blackboard.objects.toIdentitySet() }
             .forEach { instance ->
-                blackboard.addObject(instance)
+                // Through the process path, so merged outputs emit
+                // ObjectAddedEvent like any other addition
+                addObject(instance)
                 if (attributedTypes.any { it.isInstance(instance) }) {
                     episode.record(anchor, instance)
                 }
@@ -859,6 +953,12 @@ open class SimpleAgentProcess(
                 )
                 replanBlacklist.clear()
                 return formulateAndExecutePlan(worldState)
+            }
+            if (lastDispatchProgressed) {
+                // A wave just completed episode work: follow-ups may be
+                // queued for the next tick, so do not park yet
+                makeRunning()
+                return this
             }
             return handlePlanNotFound(worldState)
         }

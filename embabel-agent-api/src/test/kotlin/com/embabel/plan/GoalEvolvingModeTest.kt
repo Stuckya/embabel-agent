@@ -267,7 +267,7 @@ class GoalEvolvingModeTest {
             val next = SampleTally(tally.count + 50)
             context.addObject(next)
             if (next.count <= 500) {
-                (context.agentProcess as SimpleAgentProcess).evolve(BatchRequested(request.id + 1))
+                context.agentProcess.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
@@ -316,7 +316,7 @@ class GoalEvolvingModeTest {
         @AchievesGoal(description = "Kickoff done", value = 1.0)
         fun kickoff(seed: MissionReport, context: ActionContext): KickoffDone {
             context.addObject(ExecutedStep("kickoff:${seed.samples}"))
-            (context.agentProcess as SimpleAgentProcess).evolve(CalibrationRequested("cal-1"))
+            context.agentProcess.evolve(CalibrationRequested("cal-1"))
             return KickoffDone("k-${seed.samples}")
         }
 
@@ -364,7 +364,7 @@ class GoalEvolvingModeTest {
                 context.addObject(DoorFellOff("door-7"))
             }
             if (next.count < 150) {
-                (context.agentProcess as SimpleAgentProcess).evolve(BatchRequested(request.id + 1))
+                context.agentProcess.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
@@ -489,6 +489,49 @@ class GoalEvolvingModeTest {
         assertTrue(
             (result.last<SampleTally>()?.count ?: 0) > 3,
             "Welding continued past mission-done: goal monitoring, working as declared",
+        )
+    }
+
+    @Agent(description = "A mission whose end-state is already true - the agent still cannot go home early")
+    inner class ReportOnlyAgent {
+
+        @Condition(name = "missionDone")
+        fun missionDone(tally: SampleTally): Boolean = tally.count >= 3
+
+        @Action(pre = ["missionDone"], value = 0.9)
+        @AchievesGoal(description = "Mission complete", value = 0.5)
+        fun report(tally: SampleTally): BatchMissionDone = BatchMissionDone(tally.count)
+    }
+
+    @Test
+    fun `the founding shadow grounds the objective - a stale end-state artifact cannot strand the mission`() {
+        // A construction-time instance of the objective's satisfying type
+        // is an ungrounded leftover: the mission's satisfying instance must
+        // be its own product (AIMA 3e SS10.1). Unshadowed, it strands the
+        // mission - unsatisfied because hasRun is sticky, unplannable
+        // because the planner prunes actions whose typed output exists
+        // (contra the relevance definition, p. 376, which admits any action
+        // contributing an unsatisfied goal literal). Shadowed at
+        // construction and revealed at founding completion, the mission
+        // runs to its own fresh artifact. Deliberately not serendipity
+        // (p. 424): we do not go home early on a stale artifact, we run
+        val process = evolvingProcess(
+            ReportOnlyAgent(),
+            SampleTally(3),
+            BatchMissionDone(999),
+            objective = GoalTarget.output(BatchMissionDone::class.java),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The shadowed artifact could not strand the mission")
+        assertEquals(
+            3, result.last<BatchMissionDone>()?.samples,
+            "The objective's action ran and produced the mission's own artifact",
+        )
+        assertEquals(
+            2, result.objects.filterIsInstance<BatchMissionDone>().size,
+            "The stale artifact was shadowed, never consumed, and revealed at completion",
         )
     }
 
