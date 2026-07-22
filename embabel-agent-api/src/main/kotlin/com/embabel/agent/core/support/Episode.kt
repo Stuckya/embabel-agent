@@ -35,6 +35,8 @@ import com.embabel.agent.core.EpisodeRule
  */
 internal class Episode(
     val request: Any,
+    val causedBy: Episode? = null,
+    val publishedBy: String? = null,
 ) {
 
     var state: EpisodeState = EpisodeState.PENDING
@@ -58,8 +60,12 @@ internal class Episode(
     fun consumablesFrom(chainActionNames: Set<String>): List<Any> =
         consumables.filter { it.actionName in chainActionNames }.map { it.instance }
 
+    /** Everything recorded on this episode, in production order */
+    fun allConsumables(): List<Any> = consumables.map { it.instance }
+
     override fun toString(): String =
-        "Episode(state=$state, request=$request, consumables=${consumables.size})"
+        "Episode(state=$state, request=$request, consumables=${consumables.size}" +
+                (causedBy?.let { ", causedBy=${it.request}" } ?: "") + ")"
 
 }
 

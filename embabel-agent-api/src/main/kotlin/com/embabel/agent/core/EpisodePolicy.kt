@@ -78,6 +78,7 @@ sealed interface GoalTarget {
 data class EpisodeRule @JvmOverloads constructor(
     val target: GoalTarget,
     val consumes: Class<*>? = null,
+    val evolved: Boolean = false,
 )
 
 /**
@@ -117,10 +118,32 @@ class EpisodePolicy @JvmOverloads constructor(
         require(episodes.isNotEmpty()) {
             "consumeOnCompletion requires an episode: call episode(target) first"
         }
+        require(!episodes.last().evolved) {
+            "consumeOnCompletion and evolved are exclusive for the episode targeting ${episodes.last().target}"
+        }
         require(episodes.last().consumes == null) {
             "consumeOnCompletion is already set for the episode targeting ${episodes.last().target}"
         }
         return EpisodePolicy(episodes.dropLast(1) + episodes.last().copy(consumes = requestType))
+    }
+
+    /**
+     * Make the most recently added episode evolved-only: it admits only
+     * occurrences published through the process's evolve entry point,
+     * routed by eligible off-chain input type. No driver mapping exists;
+     * designation rides each instance at publication.
+     */
+    fun evolved(): EpisodePolicy {
+        require(episodes.isNotEmpty()) {
+            "evolved requires an episode: call episode(target) first"
+        }
+        require(episodes.last().consumes == null) {
+            "evolved and consumeOnCompletion are exclusive for the episode targeting ${episodes.last().target}"
+        }
+        require(!episodes.last().evolved) {
+            "evolved is already set for the episode targeting ${episodes.last().target}"
+        }
+        return EpisodePolicy(episodes.dropLast(1) + episodes.last().copy(evolved = true))
     }
 
     override fun equals(other: Any?): Boolean =

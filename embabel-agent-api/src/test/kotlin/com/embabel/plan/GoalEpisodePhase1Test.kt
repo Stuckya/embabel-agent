@@ -98,7 +98,9 @@ data class PongTally(val count: Int)
  *    picks one and completion consumes once.
  * 7. A bare episode infers the consumed request when the goal path has exactly
  *    one off-chain input, across a multi-step path.
- * 8. Inference fails fast when the path has more than one off-chain input.
+ * 8. Inference fails fast when the path has more than one off-chain input,
+ *    offering the explicit evolved() form as the mapping-free alternative.
+ *    Admission mode is declared, never inferred from input count.
  * 9. Two episodes consuming the same request type fail fast.
  * 10. Overlapping occurrences are admitted serially in arrival order: one
  *     active occurrence per episode, later arrivals queued FIFO and hidden
@@ -183,7 +185,22 @@ data class PongTally(val count: Int)
  * 47. A blocked active episode stalls its queue: head-of-line blocking is
  *     the accepted cost of serial admission (AIMA 3e p. 405, "provided
  *     that each action is feasible by itself").
+ * 48. An action shared between a mission chain and an episode chain is
+ *     never gated: the mission proceeds with the episode rule dormant.
+ * 50. An action serving the mission plan is never attributed to a blocked
+ *     episode: attribution follows the plan being served, not membership.
+ * 49. A shared action executed for the episode's plan has its output
+ *     attributed and consumed with the episode. Consumption can then
+ *     retro-unsatisfy an unrelated goal that binds the same input type,
+ *     forcing bounded rework: the mission rescans to restore its input.
  */
+data class ScanSeed(val id: String)
+data class ResponseKit(val id: String)
+data class ScanData(val id: String)
+data class AlertRaised(val id: String)
+data class AlertHandled(val id: String)
+data class PatrolDone(val id: String)
+
 class GoalEpisodePhase1Test {
 
     @Agent(description = "Standing collection with calibration episodes and a terminal mission goal")
@@ -819,6 +836,142 @@ class GoalEpisodePhase1Test {
         assertNull(result.last<CalibrationCompleted>())
     }
 
+    @Agent(description = "A scan action shared by the mission chain and an alert episode chain")
+    inner class SharedScanAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun scan(seed: ScanSeed, context: ActionContext): ScanData {
+            context.addObject(ExecutedStep("scan"))
+            return ScanData(seed.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Alert handled", value = 1.0)
+        fun handleAlert(alert: AlertRaised, scan: ScanData, context: ActionContext): AlertHandled {
+            context.addObject(ExecutedStep("handleAlert:${alert.id}"))
+            return AlertHandled(alert.id)
+        }
+
+        @Action(canRerun = true, value = 0.8)
+        @AchievesGoal(description = "Patrol done", value = 0.9)
+        fun report(scan: ScanData, context: ActionContext): PatrolDone {
+            context.addObject(ExecutedStep("report"))
+            return PatrolDone(scan.id)
+        }
+    }
+
+    private fun sharedScanPolicy() = EpisodePolicy
+        .episode(GoalTarget.output(AlertHandled::class.java))
+        .consumeOnCompletion(AlertRaised::class.java)
+
+    @Agent(description = "A blocked alert chain sharing scan with the patrol mission")
+    inner class SharedScanBlockedAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun scan(seed: ScanSeed, context: ActionContext): ScanData {
+            context.addObject(ExecutedStep("scan"))
+            return ScanData(seed.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Alert handled", value = 1.0)
+        fun handleAlert(alert: AlertRaised, kit: ResponseKit, scan: ScanData, context: ActionContext): AlertHandled {
+            context.addObject(ExecutedStep("handleAlert:${alert.id}"))
+            return AlertHandled(alert.id)
+        }
+
+        @Action(canRerun = true, value = 0.8)
+        @AchievesGoal(description = "Patrol done", value = 0.9)
+        fun report(scan: ScanData, context: ActionContext): PatrolDone {
+            context.addObject(ExecutedStep("report"))
+            return PatrolDone(scan.id)
+        }
+    }
+
+    @Test
+    fun `an action serving the mission plan is not attributed to a blocked episode`() {
+        // Plan-ownership: scan executes for the PATROL plan while the alert
+        // episode is active but blocked on its missing kit. Attribution by
+        // chain membership would hand patrol's ScanData to the blocked
+        // episode, whose eventual completion would consume mission data.
+        // Ownership comes from the plan being served (AIMA SS10.2.2:
+        // relevance is goal-relative), so nothing is attributed here
+        val process = create(
+            SharedScanBlockedAgent(),
+            "phase1-plan-ownership",
+            ProcessOptions.DEFAULT.withEpisodes(
+                EpisodePolicy
+                    .episode(GoalTarget.output(AlertHandled::class.java))
+                    .consumeOnCompletion(AlertRaised::class.java)
+            ),
+            ScanSeed("s-1"),
+            AlertRaised("a-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The patrol completed; the alert stayed blocked")
+        val blocked = process.episodeFor("${SharedScanBlockedAgent::class.java.name}.handleAlert")
+        assertNotNull(blocked, "The alert episode is still active, blocked on its kit")
+        assertEquals(
+            emptyList(), blocked.allConsumables(),
+            "Nothing executed for the alert plan, so nothing is attributed to it",
+        )
+    }
+
+    @Test
+    fun `a shared chain action is never gated - the mission proceeds with the episode dormant`() {
+        // scan serves both the patrol chain and the alert chain, so the
+        // gate must not exclude it while the alert rule has no episode.
+        // If exclusivity were computed wrongly, this process would be STUCK
+        val process = create(
+            SharedScanAgent(),
+            "phase1-shared-not-gated",
+            ProcessOptions.DEFAULT.withEpisodes(sharedScanPolicy()),
+            ScanSeed("s-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The mission completed through the shared action")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(listOf("scan", "report"), steps, "The shared action ran; the exclusive alert action never did")
+    }
+
+    @Test
+    fun `a shared action run for the episode's plan is attributed with it - the mission reruns it`() {
+        // When the alert episode's plan routes through scan, the ScanData it
+        // makes belongs to the episode and is consumed at completion. Two
+        // legitimate subtleties compose here. First, the planner's value
+        // arithmetic may interleave mission work before recognizing the
+        // satisfied episode goal, so report binds the still-visible ScanData.
+        // Second, reader-built goals include their action's inputs in their
+        // preconditions, so consuming the episode's ScanData retro-unsatisfies
+        // the already-achieved patrol goal, and the planner reruns scan just
+        // to restore the input fact. Bounded rework, correct attribution:
+        // PatrolDone, made outside the episode, survives throughout
+        val process = create(
+            SharedScanAgent(),
+            "phase1-shared-attributed",
+            ProcessOptions.DEFAULT.withEpisodes(sharedScanPolicy()),
+            ScanSeed("s-1"),
+            AlertRaised("a-1"),
+        )
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("scan", "handleAlert:a-1", "report", "scan"), steps,
+            "The episode consumed the ScanData its plan made; the mission rescanned to restore its input",
+        )
+        assertNull(result.last<AlertRaised>(), "The alert occurrence was consumed")
+        assertNull(result.last<AlertHandled>(), "The episode's output was consumed")
+        assertNotNull(result.last<PatrolDone>(), "The mission's output, made outside the episode, survived")
+        assertNotNull(result.last<ScanData>(), "The rework scan's data is standing, unattributed")
+    }
+
     @Test
     fun `a blocked active episode stalls its queue - the serial admission fine print`() {
         // AIMA 3e p. 405: a nonoverlapping sequence avoids all conflicts
@@ -855,6 +1008,9 @@ class GoalEpisodePhase1Test {
 
     @Test
     fun `inference fails fast when the goal path has more than one off-chain input`() {
+        // Admission mode is declared, never inferred from input count: a bare
+        // rule stays type-subscribed, and ambiguity remains a loud error.
+        // The mapping-free alternative is the explicit evolved() form
         val exception = assertThrows<IllegalArgumentException> {
             create(
                 AmbiguousInputAgent(),
@@ -866,6 +1022,7 @@ class GoalEpisodePhase1Test {
         }
         assertTrue("CalibrationRequested" in exception.message!!, "Error lists the candidates: ${exception.message}")
         assertTrue("ZoneInfo" in exception.message!!, "Error lists the candidates: ${exception.message}")
+        assertTrue("evolved" in exception.message!!, "Error offers the mapping-free fix: ${exception.message}")
     }
 
     @Test

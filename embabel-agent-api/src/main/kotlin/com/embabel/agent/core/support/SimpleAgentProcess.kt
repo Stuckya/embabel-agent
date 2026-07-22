@@ -91,17 +91,91 @@ open class SimpleAgentProcess(
      */
     private val admissionSeen: MutableSet<Any> =
         Collections.newSetFromMap(IdentityHashMap())
+
+    /**
+     * Instances published as occurrences, each mapped to the episode whose
+     * chain action published it, if any: lineage captured at publication.
+     * Designation rides the instance: an evolved fact is admitted to drive
+     * an episode, while a plain addObject fact of the same type is
+     * standing state.
+     */
+    private val evolvedArrivals: MutableMap<Any, EvolveOrigin> = IdentityHashMap()
+
+    private data class EvolveOrigin(val causedBy: Episode?, val publishedBy: String?)
+
+    /** The episode whose chain action is currently executing, if any */
+    private var executingEpisode: Episode? = null
+
+    /** The name of the action currently executing, if any */
+    private var executingAction: String? = null
+
+    /**
+     * The most recently completed episode, retained for lineage inspection.
+     * Completed episodes are otherwise discarded.
+     */
+    internal var lastCompletedEpisode: Episode? = null
+        private set
+
+    /** The active episode for the rule owning the given goal, for inspection */
+    internal fun episodeFor(goalName: String): Episode? =
+        resolvedEpisodes.firstOrNull { it.matches(goalName) }?.let { activeEpisodes[it] }
     private val pendingEpisodes = mutableMapOf<ResolvedEpisodeRule, ArrayDeque<Episode>>()
     private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
+
+    /**
+     * Publish a fact as an occurrence. The process evolves only at evolve
+     * boundaries, and every evolution is handled inside an episode: the
+     * instance is admitted to the rule whose chain consumes its type,
+     * serially, and consumed by identity on completion.
+     */
+    fun evolve(fact: Any) {
+        requireRoutable(fact)
+        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction)
+        blackboard.addObject(fact)
+    }
+
+    /**
+     * Fail fast at the boundary: an evolving process's evolvable types are
+     * its enforced contract. Without this, a mis-deployed publisher would
+     * believe work was scheduled while nothing ever admits the fact.
+     */
+    private fun requireRoutable(fact: Any) {
+        val routable = resolvedEpisodes.any { rule ->
+            rule.consumes?.isInstance(fact) == true || rule.isEvolvedEligible(fact)
+        }
+        require(routable) {
+            "${fact.javaClass.simpleName} cannot evolve this process: no episodic rule consumes it. " +
+                    "Evolvable types: ${evolvableTypeNames().ifEmpty { "none" }}"
+        }
+    }
+
+    private fun evolvableTypeNames(): String =
+        resolvedEpisodes
+            .flatMap { rule -> rule.consumes?.let { listOf(it) }.orEmpty() + rule.evolvedEligible }
+            .joinToString { it.simpleName }
 
     protected fun admitArrivals() {
         resolvedEpisodes.forEach(::admitArrivalsFor)
     }
 
     private fun admitArrivalsFor(rule: ResolvedEpisodeRule) {
-        blackboard.objectsOfType(rule.consumes)
+        arrivalsFor(rule)
             .filter { admissionSeen.add(it) }
-            .forEach { arrival -> admitOrQueue(rule, Episode(arrival)) }
+            .forEach { arrival ->
+                val origin = evolvedArrivals[arrival]
+                admitOrQueue(rule, Episode(arrival, origin?.causedBy, origin?.publishedBy))
+            }
+    }
+
+    /**
+     * Type-subscribed rules admit every visible instance of their consumed
+     * type. Evolved-only rules admit only instances published through
+     * [evolve], routed by eligible type.
+     */
+    private fun arrivalsFor(rule: ResolvedEpisodeRule): List<Any> {
+        val consumes = rule.consumes
+            ?: return blackboard.objects.filter { evolvedArrivals.containsKey(it) && rule.isEvolvedEligible(it) }
+        return blackboard.objectsOfType(consumes)
     }
 
     private fun admitOrQueue(rule: ResolvedEpisodeRule, episode: Episode) {
@@ -124,6 +198,7 @@ open class SimpleAgentProcess(
         val episode = activeEpisodes.remove(rule) ?: return false
         blackboard.hide(episode.request)
         episode.complete()
+        lastCompletedEpisode = episode
         logger.debug("Process {} completed {}", this.id, episode)
         admitNext(rule)
         return true
@@ -209,7 +284,7 @@ open class SimpleAgentProcess(
                         "no {} occurrence was admitted for this completion",
                 this.id,
                 plan.goal.name,
-                rule.consumes.name,
+                rule.consumes?.name ?: "evolved occurrence",
             )
         }
         if (!consumedRequest && consumedConsumables == 0) {
@@ -260,17 +335,71 @@ open class SimpleAgentProcess(
      * types to the active episode whose chain it belongs to. Attribution is
      * by identity, so completion consumes exactly what the occurrence made.
      */
-    protected fun executeActionAttributingConsumables(action: Action): ActionStatus {
-        val owner = activeEpisodeOwning(action.name) ?: return executeAction(action)
-        val (rule, episode) = owner
-        val before: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
-        before.addAll(blackboard.objects)
-        val status = executeAction(action)
-        blackboard.objects
-            .filter { it !in before }
-            .filter { instance -> rule.attributedTypesFor(action.name).any { it.isInstance(instance) } }
-            .forEach { instance -> episode.record(action.name, instance) }
-        return status
+    protected fun executeActionAttributingConsumables(action: Action, servedGoal: String): ActionStatus {
+        val owner = attributionOwner(servedGoal, action.name)
+        executingEpisode = owner?.second
+        executingAction = action.name
+        try {
+            if (owner == null) {
+                return executeAction(action)
+            }
+            val (rule, episode) = owner
+            val grounded = groundRequestBinding(rule, episode)
+            try {
+                val before: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
+                before.addAll(blackboard.objects)
+                val status = executeAction(action)
+                blackboard.objects
+                    .filter { it !in before }
+                    .filter { instance -> rule.attributedTypesFor(action.name).any { it.isInstance(instance) } }
+                    .forEach { instance -> episode.record(action.name, instance) }
+                return status
+            } finally {
+                grounded.forEach(blackboard::reveal)
+            }
+        } finally {
+            executingEpisode = null
+            executingAction = null
+        }
+    }
+
+    /**
+     * Ground the request binding for an evolved episode's chain execution:
+     * while the action runs, the episode's request is the only visible
+     * instance of its own class, so binding by type resolves the occurrence
+     * the episode holds. Standard ground-action semantics, per occurrence.
+     * Type-subscribed rules need no grounding: their queues already hide
+     * every competitor.
+     */
+    private fun groundRequestBinding(rule: ResolvedEpisodeRule, episode: Episode): List<Any> {
+        if (rule.consumes != null) {
+            return emptyList()
+        }
+        val requestClass = episode.request.javaClass
+        val shadowing = blackboard.objects
+            .filter { it !== episode.request && requestClass.isInstance(it) }
+        shadowing.forEach(blackboard::hide)
+        return shadowing
+    }
+
+    /**
+     * Ownership follows the plan being served, not chain membership: an
+     * action executing for an episode goal's plan is attributed to that
+     * rule's active episode, and an action serving another business goal
+     * attributes nothing, however many chains it appears in. Relevance is
+     * goal-relative (AIMA SS10.2.2). Per-tick value selection returns the
+     * unsatisfiable pairing goal for opportunistic steps, where no served
+     * goal exists; membership remains the documented fallback there.
+     */
+    private fun attributionOwner(servedGoal: String, actionName: String): Pair<ResolvedEpisodeRule, Episode>? {
+        val servedRule = resolvedEpisodes.firstOrNull { it.matches(servedGoal) }
+        if (servedRule != null) {
+            return activeEpisodes[servedRule]?.let { servedRule to it }
+        }
+        if (servedGoal != NIRVANA.name) {
+            return null
+        }
+        return activeEpisodeOwning(actionName)
     }
 
     private fun activeEpisodeOwning(actionName: String): Pair<ResolvedEpisodeRule, Episode>? =
@@ -336,7 +465,7 @@ open class SimpleAgentProcess(
 
             val action = resolveActionFromPlan(plan)
             try {
-                val actionStatus = executeActionAttributingConsumables(action)
+                val actionStatus = executeActionAttributingConsumables(action, plan.goal.name)
                 setStatus(actionStatusToAgentProcessStatus(actionStatus))
             } catch (rpe: ReplanRequestedException) {
                 handleReplanRequest(action, rpe)

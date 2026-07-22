@@ -54,9 +54,11 @@ data class BatchMissionDone(val samples: Int)
  * plan-execute-replan, rather than by an explicit loop in a plan."
  *
  * What it pins, composed in one scenario:
- * - Self-chaining: the completing action publishes the next request. Each
- *   follow-up is queued at arrival and admitted after its predecessor's
- *   request is consumed, exactly once per occurrence.
+ * - Self-chaining through evolve(): the completing action publishes the
+ *   next occurrence at the evolve boundary. Each follow-up is queued at
+ *   arrival and admitted after its predecessor's request is consumed,
+ *   exactly once per occurrence. Designation rides the instance: the tally
+ *   is a plain fact and is never admitted, though its type is eligible.
  * - The tally is standing state, advanced by addObject rather than declared
  *   as an output, so it is never attributed and survives every completion.
  *   Episodes are independent, not idempotent: the mission accumulates.
@@ -74,9 +76,11 @@ class GoalEpisodeBatchLoopTest {
     inner class BatchMissionAgent {
 
         /**
-         * The batch chain is one action that drives itself: it publishes
-         * the next request while its own episode is still active. The
+         * The batch chain is one action that drives itself: it evolves the
+         * next occurrence while its own episode is still active. The
          * follow-up queues and admits only after this occurrence completes.
+         * ctx.evolve() is the proposed surface; the spike reaches the
+         * process directly.
          */
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Batch collected", value = 1.0)
@@ -85,12 +89,16 @@ class GoalEpisodeBatchLoopTest {
             val next = SampleTally(tally.count + 50)
             context.addObject(next)
             if (next.count == 100) {
-                context.addObject(HazardDetected("spill-1"))
+                evolve(context, HazardDetected("spill-1"))
             }
             if (next.count < 500) {
-                context.addObject(BatchRequested(request.id + 1))
+                evolve(context, BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
+        }
+
+        private fun evolve(context: ActionContext, occurrence: Any) {
+            (context.agentProcess as SimpleAgentProcess).evolve(occurrence)
         }
 
         @Action(canRerun = true, value = 0.7)
@@ -117,7 +125,6 @@ class GoalEpisodeBatchLoopTest {
     @Test
     fun `ten batch episodes chain to 500 samples with a hazard episode slotting between batches`() {
         val blackboard = InMemoryBlackboard()
-        blackboard.addObject(BatchRequested(1))
         blackboard.addObject(SampleTally(0))
         val reader = AgentMetadataReader()
         val agent = reader.createAgentMetadata(BatchMissionAgent()) as CoreAgent
@@ -128,18 +135,18 @@ class GoalEpisodeBatchLoopTest {
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
                 .withEpisodes(
+                    // Both rules evolved: no driver mappings anywhere.
+                    // Occurrences are whatever arrives through evolve()
                     EpisodePolicy
-                        .episode(GoalTarget.output(BatchCollected::class.java))
-                        .consumeOnCompletion(BatchRequested::class.java)
-                        // Bare rule: HazardDetected is the hazard chain's only
-                        // off-chain input, so consumption is inferred
-                        .episode(GoalTarget.output(HazardCleared::class.java))
+                        .episode(GoalTarget.output(BatchCollected::class.java)).evolved()
+                        .episode(GoalTarget.output(HazardCleared::class.java)).evolved()
                 ),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
             Instant.now(),
         )
+        process.evolve(BatchRequested(1))
 
         val result = process.run()
 
