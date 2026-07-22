@@ -87,7 +87,7 @@ open class SimpleAgentProcess(
      * at most one Episode per rule is ACTIVE. Later arrivals wait PENDING,
      * hidden and queued FIFO, admitted when the active episode completes.
      * A pending request never changes type-level conditions because the
-     * active driver of the same type stays visible.
+     * active request of the same type stays visible.
      */
     private val admissionSeen: MutableSet<Any> =
         Collections.newSetFromMap(IdentityHashMap())
@@ -110,19 +110,19 @@ open class SimpleAgentProcess(
             logger.debug("Process {} admitted {}", id, episode)
             return
         }
-        blackboard.hide(episode.driver)
+        blackboard.hide(episode.request)
         pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
         logger.debug("Process {} queued {}", id, episode)
     }
 
     /**
-     * Complete the active episode: consume its driver by identity, then
+     * Complete the active episode: consume its request by identity, then
      * admit the next pending episode so a fresh chain can begin at the
      * next tick.
      */
     private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
         val episode = activeEpisodes.remove(rule) ?: return false
-        blackboard.hide(episode.driver)
+        blackboard.hide(episode.request)
         episode.complete()
         logger.debug("Process {} completed {}", this.id, episode)
         admitNext(rule)
@@ -131,7 +131,7 @@ open class SimpleAgentProcess(
 
     private fun admitNext(rule: ResolvedEpisodeRule) {
         val next = pendingEpisodes[rule]?.removeFirstOrNull() ?: return
-        blackboard.reveal(next.driver)
+        blackboard.reveal(next.request)
         next.activate()
         activeEpisodes[rule] = next
         logger.debug("Process {} admitted queued {}", id, next)
@@ -186,7 +186,7 @@ open class SimpleAgentProcess(
 
     /**
      * Completes a goal episode without completing the process: consumes the
-     * active episode's driver and its attributed consumables (satisfying
+     * active episode's request and its attributed consumables (satisfying
      * output and any intermediates this occurrence made) by identity, then keeps the process running so ordinary
      * selection resumes at the next planning tick. The next pending episode,
      * if any, is admitted and replans the entire chain fresh.
@@ -282,7 +282,7 @@ open class SimpleAgentProcess(
      * Everything episodic happens inside an episode: a rule's exclusive
      * chain actions are plannable only while the rule has an active
      * episode, so a standing resource can never let the chain complete
-     * driverless.
+     * outside an episode.
      */
     protected fun gatedChainActions(): Set<String> =
         resolvedEpisodes

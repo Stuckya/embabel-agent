@@ -18,21 +18,23 @@ package com.embabel.agent.core.support
 import com.embabel.agent.core.EpisodeRule
 
 /**
- * One occurrence of a goal episode at runtime: the request that drives it,
+ * One occurrence of a goal episode at runtime: the request that begins it,
  * the consumables its chain has made, and where it stands in the
- * serial-admission lifecycle. An [EpisodeRule] declares which goals are
- * episodic at construction; each arriving occurrence becomes an Episode.
- * At most one Episode per rule is ACTIVE. Later arrivals wait PENDING,
- * hidden until admitted, so each chain binds exactly its own driver.
+ * serial-admission lifecycle. The request is the episode's percept in the
+ * sense of AIMA 3e chapter 2: its arrival begins the episode, and its
+ * consumption ends it. An [EpisodeRule] declares which goals are episodic
+ * at construction; each arriving occurrence becomes an Episode. At most
+ * one Episode per rule is ACTIVE. Later arrivals wait PENDING, hidden
+ * until admitted, so each chain binds exactly its own request.
  *
  * Consumables follow AIMA's consumable-resource idea: instances a chain
  * action made for this occurrence, recorded by identity as they appear.
- * Completion consumes the driver and the completed candidate's consumables,
+ * Completion consumes the request and the completed candidate's consumables,
  * exactly what this occurrence made and nothing else. Off-chain inputs and
  * standing state are used, not consumed, and survive.
  */
 internal class Episode(
-    val driver: Any,
+    val request: Any,
 ) {
 
     var state: EpisodeState = EpisodeState.PENDING
@@ -57,7 +59,7 @@ internal class Episode(
         consumables.filter { it.actionName in chainActionNames }.map { it.instance }
 
     override fun toString(): String =
-        "Episode(state=$state, driver=$driver, consumables=${consumables.size})"
+        "Episode(state=$state, request=$request, consumables=${consumables.size})"
 
 }
 

@@ -90,7 +90,7 @@ internal object EpisodeResolution {
      * An episode chain is plannable only while one of its episodes is
      * active, so a chain action serving no other goal is excluded from
      * planning when its rule has no active episode. Without the gate a
-     * standing resource could let the chain complete driverless. Actions
+     * standing resource could let the chain complete with no admitted episode. Actions
      * shared with non-episode goals are never gated.
      */
     private fun withExclusiveChainActions(
@@ -402,12 +402,12 @@ internal object EpisodeResolution {
     }
 
     /**
-     * The driving request must be an off-chain input required on every
+     * The consumed request must be an off-chain input required on every
      * completion path of every candidate, must match the binding type exactly,
      * and must use the default binding. Serial admission pairs completions
-     * with the active driver by identity, so mis-pairing is impossible; this
-     * rule guards attribution instead: a goal reachable without the driver
-     * could complete and consume an active driver whose work never ran.
+     * with the active request by identity, so mis-pairing is impossible; this
+     * rule guards attribution instead: a goal reachable without the request
+     * could complete and consume an admitted request whose work never ran.
      */
     private fun validateExplicitConsumes(
         rule: EpisodeRule,

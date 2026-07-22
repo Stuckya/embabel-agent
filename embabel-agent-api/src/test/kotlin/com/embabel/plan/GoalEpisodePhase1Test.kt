@@ -102,7 +102,7 @@ data class PongTally(val count: Int)
  * 9. Two episodes consuming the same request type fail fast.
  * 10. Overlapping occurrences are admitted serially in arrival order: one
  *     active occurrence per episode, later arrivals queued FIFO and hidden
- *     until admission, each chain binding its own driver.
+ *     until admission, each chain binding its own request.
  * 11. Episode rerun rides existing canRerun: a non-rerunnable completing action
  *     does not re-fire for a second occurrence.
  * 12. A repeatable multi-step episode reruns the whole chain fresh: intermediates
@@ -126,7 +126,7 @@ data class PongTally(val count: Int)
  * 20. A named target matching duplicate goal identities fails fast.
  * 21. The consumed request must be required on every candidate's completion
  *     path: candidates driven by different request types are rejected.
- * 22. A goal reachable through paths with different drivers cannot consume a
+ * 22. A goal reachable through paths with different requests cannot consume a
  *     request that only some paths observe.
  * 23. Explicit consumption must match the off-chain binding type exactly:
  *     consuming a subtype of what the action accepts is rejected.
@@ -172,7 +172,7 @@ data class PongTally(val count: Int)
  *     event; the terminal goal emits both (pin).
  * 42. A failing completing action leaves the request unconsumed for retry.
  * 43. A completing action that publishes the next request chains cleanly:
- *     the follow-up is queued at arrival, admitted after the driver is
+ *     the follow-up is queued at arrival, admitted after its request is
  *     consumed by identity, and handled exactly once. Serial admission
  *     cures the old self-rearming livelock.
  * 44. ConcurrentAgentProcess shares the episode contract: park and rearm.
@@ -404,7 +404,7 @@ class GoalEpisodePhase1Test {
             FullCalibration(zone.name)
     }
 
-    @Agent(description = "One goal reachable through two paths with different drivers")
+    @Agent(description = "One goal reachable through two paths with different requests")
     inner class OrPathAgent {
 
         @Action(canRerun = true, value = 0.5)
@@ -843,7 +843,7 @@ class GoalEpisodePhase1Test {
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No ZoneInfo, so the chain cannot start")
         val visible = stalled.objects.filterIsInstance<CalibrationRequested>()
-        assertEquals(listOf("cal-1"), visible.map { it.id }, "Only the active driver is visible; cal-2 waits hidden")
+        assertEquals(listOf("cal-1"), visible.map { it.id }, "Only the active request is visible; cal-2 waits hidden")
 
         stalled.addObject(ZoneInfo("zone-9"))
         val resumed = stalled.run()
@@ -905,7 +905,7 @@ class GoalEpisodePhase1Test {
         assertEquals(
             listOf("calibrate:cal-A", "calibrate:cal-B"), calibrated,
             "One occurrence is active at a time; later arrivals queue FIFO and are " +
-                    "hidden until admission, so each chain binds its own driver",
+                    "hidden until admission, so each chain binds its own request",
         )
         assertNull(result.last<CalibrationRequested>(), "Both occurrences consumed")
     }
@@ -1174,7 +1174,7 @@ class GoalEpisodePhase1Test {
     @Test
     fun `explicit consumption must match the off-chain binding type exactly`() {
         // The action accepts RequestBase; the planner may bind any implementation,
-        // so consuming only SpecialRequest could leave the real driver visible
+        // so consuming only SpecialRequest could leave the real request visible
         val exception = assertThrows<IllegalArgumentException> {
             create(
                 SupertypeRequestAgent(),
@@ -1707,7 +1707,7 @@ class GoalEpisodePhase1Test {
     fun `a completing action that publishes the next request chains cleanly`() {
         // Serial admission cures the old self-rearming livelock. The
         // follow-up published by the completing action is queued and hidden,
-        // completion consumes the active driver by identity, and the
+        // completion consumes the active request by identity, and the
         // follow-up is admitted for exactly one fresh chain. Before the
         // queue, consumption took the latest visible occurrence, the
         // follow-up was eaten in the driver's place, and the driver re-ran
