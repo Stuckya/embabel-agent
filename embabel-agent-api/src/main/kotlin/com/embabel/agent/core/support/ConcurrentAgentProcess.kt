@@ -131,7 +131,7 @@ open class ConcurrentAgentProcess(
                                 platformServices.asyncer.async {
                                     try {
                                         callbacks.forEach { it.onActionLaunched(process, action) }
-                                        executeFrameAction(action)
+                                        executeTrackedAction(action)
                                     } catch (rpe: ReplanRequestedException) {
                                         // Capture for post-execution handling; return TERMINATED so
                                         // the status aggregation loop doesn't fail on a missing value.

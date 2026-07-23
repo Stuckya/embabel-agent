@@ -30,7 +30,7 @@ private const val RETAINED_CHILDREN = 32
 
 /** One valued, dispatchable episode: the planner's selection input */
 internal data class EpisodeChoice(
-    val rule: ResolvedEpisodeRule,
+    val rule: DerivedEpisodeRule,
     val episode: Episode,
     val goal: Goal,
     val chainActions: List<Action>,
@@ -80,7 +80,7 @@ internal class EpisodeExecutor(
      * world would just block it again.
      */
     fun choices(
-        active: Map<ResolvedEpisodeRule, Episode>,
+        active: Map<DerivedEpisodeRule, Episode>,
         agent: Agent,
         worldState: WorldState,
     ): List<EpisodeChoice> {
@@ -97,7 +97,7 @@ internal class EpisodeExecutor(
         }
     }
 
-    private fun chainActions(rule: ResolvedEpisodeRule, goal: Goal, agent: Agent): List<Action> {
+    private fun chainActions(rule: DerivedEpisodeRule, goal: Goal, agent: Agent): List<Action> {
         val chainNames = rule.chainActionsFor(goal.name)
         return agent.actions.filter { it.name in chainNames }
     }

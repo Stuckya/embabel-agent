@@ -28,7 +28,7 @@ import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
-import com.embabel.agent.core.support.FoundingPercept
+import com.embabel.agent.core.support.FoundingFacts
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -194,7 +194,7 @@ class GoalEvolvingModeTest {
         assertNotNull(result.last<CalibrationCompleted>(), "The satisfying output survives the terminal completion")
 
         val founding = process.lastCompletedEpisode
-        val percept = founding?.request as? FoundingPercept
+        val percept = founding?.request as? FoundingFacts
         assertNotNull(percept, "The founding episode completed last, holding the process's founding percept")
         assertEquals(
             "cal-1", percept.seeds.filterIsInstance<CalibrationRequested>().single().id,
@@ -318,7 +318,7 @@ class GoalEvolvingModeTest {
         assertEquals(500, result.last<BatchMissionDone>()?.samples, "The terminal goal ran on the post-consumption world")
 
         val founding = process.lastCompletedEpisode
-        val percept = founding?.request as? FoundingPercept
+        val percept = founding?.request as? FoundingFacts
         assertNotNull(percept, "The founding episode completes last: the mission itself was the outermost episode")
         assertEquals(
             0, percept.seeds.filterIsInstance<SampleTally>().single().count,
@@ -363,7 +363,7 @@ class GoalEvolvingModeTest {
         val episode = process.lastCompletedEpisode
         assertEquals("cal-1", (episode?.request as? CalibrationRequested)?.id, "The evolved occurrence completed")
         assertNotNull(
-            episode?.causedBy?.request as? FoundingPercept,
+            episode?.causedBy?.request as? FoundingFacts,
             "The occurrence records the founding episode as its cause",
         )
     }

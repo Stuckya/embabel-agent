@@ -41,7 +41,7 @@ import com.embabel.plan.common.condition.EffectSpec
  * goal, gated from planning whenever the activated rule has no active
  * episode
  */
-internal data class ResolvedEpisodeRule(
+internal data class DerivedEpisodeRule(
     val goalsByName: Map<String, Goal>,
     val evolvedEligible: List<Class<*>> = emptyList(),
     val consumableTypesByGoal: Map<String, List<Class<*>>>,
@@ -65,7 +65,7 @@ internal data class ResolvedEpisodeRule(
  * evolve call site that needed the goal to be evolvable.
  */
 internal data class DerivedEvolvingScope(
-    val rules: List<ResolvedEpisodeRule>,
+    val rules: List<DerivedEpisodeRule>,
     val exclusions: Map<String, String>,
     val objectiveGoals: Set<String>,
 )
@@ -75,7 +75,7 @@ internal data class DerivedEvolvingScope(
  * A goal with a scoped producer that is currently blocked by missing facts
  * remains a planner concern and derives normally here.
  */
-internal object EpisodeResolution {
+internal object EpisodeDerivation {
 
     /**
      * Derive an episode rule for every declared goal whose graph supports
@@ -87,7 +87,7 @@ internal object EpisodeResolution {
      */
     fun deriveEvolving(agent: Agent, objective: GoalTarget?): DerivedEvolvingScope {
         val objectiveGoals = resolveObjective(objective, agent)
-        val rules = mutableListOf<ResolvedEpisodeRule>()
+        val rules = mutableListOf<DerivedEpisodeRule>()
         val exclusions = mutableMapOf<String, String>()
         agent.goals.forEach { goal ->
             if (goal.name in objectiveGoals) {
@@ -98,7 +98,7 @@ internal object EpisodeResolution {
                 return@forEach
             }
             try {
-                rules += resolveRule(goal, agent)
+                rules += deriveRule(goal, agent)
             } catch (e: UnderivableGoalException) {
                 exclusions[goal.name] = e.message ?: "underivable"
             }
@@ -147,9 +147,9 @@ internal object EpisodeResolution {
      * shared with non-episode goals are never gated.
      */
     private fun withExclusiveChainActions(
-        resolved: List<ResolvedEpisodeRule>,
+        resolved: List<DerivedEpisodeRule>,
         agent: Agent,
-    ): List<ResolvedEpisodeRule> {
+    ): List<DerivedEpisodeRule> {
         val episodeGoalNames = resolved.flatMapTo(mutableSetOf()) { it.goalsByName.keys }
         val nonEpisodeChain = agent.goals
             .filterNot { it.name in episodeGoalNames }
@@ -162,7 +162,7 @@ internal object EpisodeResolution {
         }
     }
 
-    private fun resolveRule(goal: Goal, agent: Agent): ResolvedEpisodeRule {
+    private fun deriveRule(goal: Goal, agent: Agent): DerivedEpisodeRule {
         requireNamesUniqueInScope(listOf(goal), agent)
         val chains = mapOf(goal.name to analyzeGoalChain(goal, agent))
         val requiredOnEveryPath = chains.values
@@ -175,7 +175,7 @@ internal object EpisodeResolution {
                 .filterNot { isSelfMaintained(it, agent) }
                 .map { loadConsumableClass(goalName, it) }
         }
-        return ResolvedEpisodeRule(
+        return DerivedEpisodeRule(
             goalsByName = mapOf(goal.name to goal),
             evolvedEligible = evolvedEligible,
             consumableTypesByGoal = consumableTypesByGoal,

@@ -72,7 +72,7 @@ internal class Episode(
  * has an episode to answer for it, and a parent process can treat this
  * entire process as a single episode of its own.
  */
-internal data class FoundingPercept(val seeds: List<Any>)
+internal data class FoundingFacts(val seeds: List<Any>)
 
 /**
  * A consumable attributed to the chain action that made it, so completion

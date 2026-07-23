@@ -60,13 +60,13 @@ internal class EpisodeRuntime(
      * for the evolve call site. Null outside evolving mode.
      */
     private val derivedScope: DerivedEvolvingScope? =
-        process.processOptions.evolving?.let { EpisodeResolution.deriveEvolving(agent, it.objective) }
+        process.processOptions.evolving?.let { EpisodeDerivation.deriveEvolving(agent, it.objective) }
 
     /**
      * Episode rules derived from the goal graph in evolving mode. Empty
      * outside evolving mode, where no episode machinery engages.
      */
-    private val resolvedEpisodes: List<ResolvedEpisodeRule> =
+    private val derivedRules: List<DerivedEpisodeRule> =
         derivedScope?.rules.orEmpty()
 
     init {
@@ -84,7 +84,7 @@ internal class EpisodeRuntime(
      * that the goal is founding frame, and after that its exclusive chain
      * is the episode machinery's, not the parent planner's.
      */
-    private val activatedRules = mutableSetOf<ResolvedEpisodeRule>()
+    private val activatedRules = mutableSetOf<DerivedEpisodeRule>()
 
     /**
      * In evolving mode the whole process is treated as one outermost
@@ -94,7 +94,7 @@ internal class EpisodeRuntime(
      * through evolve, this episode is recorded as the publisher.
      */
     private val foundingEpisode: Episode? =
-        derivedScope?.let { Episode(FoundingPercept(blackboard.objects.toList())).also(Episode::activate) }
+        derivedScope?.let { Episode(FoundingFacts(blackboard.objects.toList())).also(Episode::activate) }
 
     /**
      * Goals outside any episode that were already achieved: recorded and
@@ -166,7 +166,7 @@ internal class EpisodeRuntime(
     private data class EvolveOrigin(
         val causedBy: Episode?,
         val publishedBy: String?,
-        val owner: ResolvedEpisodeRule? = null,
+        val owner: DerivedEpisodeRule? = null,
     )
 
     /**
@@ -187,8 +187,8 @@ internal class EpisodeRuntime(
     var lastCompletedEpisode: Episode? = null
         private set
 
-    private val pendingEpisodes = mutableMapOf<ResolvedEpisodeRule, ArrayDeque<Episode>>()
-    private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
+    private val pendingEpisodes = mutableMapOf<DerivedEpisodeRule, ArrayDeque<Episode>>()
+    private val activeEpisodes = mutableMapOf<DerivedEpisodeRule, Episode>()
 
     /**
      * Pre-existing instances hidden for the length of an episode: without
@@ -255,8 +255,8 @@ internal class EpisodeRuntime(
         evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction, candidates.singleOrNull())
     }
 
-    private fun routableRules(fact: Any): List<ResolvedEpisodeRule> =
-        resolvedEpisodes.filter { it.isEvolvedEligible(fact) }
+    private fun routableRules(fact: Any): List<DerivedEpisodeRule> =
+        derivedRules.filter { it.isEvolvedEligible(fact) }
 
     /**
      * When more than one rule could take an arriving fact, the rule whose
@@ -267,7 +267,7 @@ internal class EpisodeRuntime(
      * values are read, so a value function that inspects the world sees
      * only the arriving fact.
      */
-    private fun routeByPlan(fact: Any, candidates: List<ResolvedEpisodeRule>): ResolvedEpisodeRule? {
+    private fun routeByPlan(fact: Any, candidates: List<DerivedEpisodeRule>): DerivedEpisodeRule? {
         val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
         competitors.forEach(blackboard::hide)
         try {
@@ -285,7 +285,7 @@ internal class EpisodeRuntime(
      * declared value in the current world. Nothing is proven at routing
      * time - the owning rule's child run is the verdict on the chain.
      */
-    private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
+    private fun bestPlanValue(rule: DerivedEpisodeRule): Double =
         rule.goalsByName.values.maxOfOrNull { goal -> goal.value(planner.worldState()) }
             ?: Double.NEGATIVE_INFINITY
 
@@ -296,7 +296,7 @@ internal class EpisodeRuntime(
      * evolving mode the message also carries why derivation excluded goals,
      * so the publisher learns what the graph could not support.
      */
-    private fun requireRoutable(fact: Any, candidates: List<ResolvedEpisodeRule>) {
+    private fun requireRoutable(fact: Any, candidates: List<DerivedEpisodeRule>) {
         require(candidates.isNotEmpty()) {
             "${fact.javaClass.simpleName} cannot evolve this process: no episodic rule consumes it. " +
                     "Evolvable types: ${evolvableTypeNames().ifEmpty { "none" }}" +
@@ -314,11 +314,11 @@ internal class EpisodeRuntime(
     }
 
     private fun evolvableTypeNames(): String =
-        resolvedEpisodes.flatMap { it.evolvedEligible }.joinToString { it.simpleName }
+        derivedRules.flatMap { it.evolvedEligible }.joinToString { it.simpleName }
 
     fun admitArrivals() {
         resolveDeferredRouting()
-        resolvedEpisodes.forEach(::admitArrivalsFor)
+        derivedRules.forEach(::admitArrivalsFor)
         admitDeferred()
     }
 
@@ -347,7 +347,7 @@ internal class EpisodeRuntime(
         if (derivedScope == null) {
             return
         }
-        val idleWithPending = resolvedEpisodes.filter {
+        val idleWithPending = derivedRules.filter {
             activeEpisodes[it] == null && !pendingEpisodes[it].isNullOrEmpty()
         }
         if (idleWithPending.isEmpty() || foundingWorkPlannable()) {
@@ -356,7 +356,7 @@ internal class EpisodeRuntime(
         idleWithPending.forEach(::admitNext)
     }
 
-    private fun admitArrivalsFor(rule: ResolvedEpisodeRule) {
+    private fun admitArrivalsFor(rule: DerivedEpisodeRule) {
         arrivalsFor(rule)
             .filter { admissionSeen.add(it) }
             .forEach { arrival ->
@@ -369,7 +369,7 @@ internal class EpisodeRuntime(
      * A rule admits only instances published through [evolve], routed to
      * their owning rule fixed at the arrival boundary.
      */
-    private fun arrivalsFor(rule: ResolvedEpisodeRule): List<Any> =
+    private fun arrivalsFor(rule: DerivedEpisodeRule): List<Any> =
         blackboard.objects.filter { routesTo(rule, it) }
 
     /**
@@ -377,10 +377,10 @@ internal class EpisodeRuntime(
      * are owned at the evolve boundary; contested ones at the next tick,
      * before any admission scan runs.
      */
-    private fun routesTo(rule: ResolvedEpisodeRule, instance: Any): Boolean =
+    private fun routesTo(rule: DerivedEpisodeRule, instance: Any): Boolean =
         evolvedArrivals[instance]?.owner == rule
 
-    private fun admitOrQueue(rule: ResolvedEpisodeRule, episode: Episode) {
+    private fun admitOrQueue(rule: DerivedEpisodeRule, episode: Episode) {
         activatedRules += rule
         // An occurrence reopens the question: the goal was achieved as
         // state, and a fresh request makes it unachieved by definition
@@ -409,7 +409,7 @@ internal class EpisodeRuntime(
      * the next waiting episode starts is the caller's decision, because
      * work that could end the process gets its chance first.
      */
-    private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
+    private fun completeActiveEpisode(rule: DerivedEpisodeRule): Boolean {
         val episode = activeEpisodes.remove(rule) ?: return false
         blackboard.hide(episode.request)
         outcomeGroundings.remove(episode)?.forEach(blackboard::reveal)
@@ -424,7 +424,7 @@ internal class EpisodeRuntime(
         return true
     }
 
-    private fun admitNext(rule: ResolvedEpisodeRule) {
+    private fun admitNext(rule: DerivedEpisodeRule) {
         val next = pendingEpisodes[rule]?.removeFirstOrNull() ?: return
         if (!blackboard.reveal(next.request)) {
             logger.warn(
@@ -439,7 +439,7 @@ internal class EpisodeRuntime(
         logger.debug("Process {} admitted queued {}", id, next)
     }
 
-    private fun groundOutcomeWindow(rule: ResolvedEpisodeRule, episode: Episode) {
+    private fun groundOutcomeWindow(rule: DerivedEpisodeRule, episode: Episode) {
         val consumableTypes = rule.consumableTypesByGoal.values.flatten().toSet()
         val shadowed = blackboard.objects.filter { instance ->
             instance !== episode.request && consumableTypes.any { it.isInstance(instance) }
@@ -459,7 +459,7 @@ internal class EpisodeRuntime(
      * from scratch.
      */
     private fun completeEpisode(
-        rule: ResolvedEpisodeRule,
+        rule: DerivedEpisodeRule,
         goal: Goal,
         worldState: WorldState,
     ) {
@@ -559,7 +559,7 @@ internal class EpisodeRuntime(
         }
 
     private fun ownedByActivatedRule(goalName: String): Boolean =
-        resolvedEpisodes.any { it.matches(goalName) && it in activatedRules }
+        derivedRules.any { it.matches(goalName) && it in activatedRules }
 
     /**
      * A process completing with occurrences still queued abandons them:
@@ -590,7 +590,7 @@ internal class EpisodeRuntime(
      * made elsewhere. A failed child never merges, so a failed attempt
      * leaves nothing behind to sweep.
      */
-    private fun consumeAttributed(rule: ResolvedEpisodeRule, goalName: String): Int {
+    private fun consumeAttributed(rule: DerivedEpisodeRule, goalName: String): Int {
         val episode = activeEpisodes[rule] ?: return 0
         val consumed = episode.consumablesFrom(rule.chainActionsFor(goalName))
         consumed.forEach(blackboard::hide)
@@ -611,7 +611,7 @@ internal class EpisodeRuntime(
      * a fact this action publishes records the outermost episode as its
      * publisher.
      */
-    fun executingInFrame(action: Action, execute: () -> ActionStatus): ActionStatus {
+    fun runTrackingPublisher(action: Action, execute: () -> ActionStatus): ActionStatus {
         executingEpisode = foundingEpisode
         executingAction = action.name
         try {
@@ -633,7 +633,7 @@ internal class EpisodeRuntime(
         // the framework dispatches it. The exclusion also holds against
         // value-driven planners, which pick any runnable action by value
         // without needing a goal to justify it
-        resolvedEpisodes
+        derivedRules
             .filter { episodicNow(it) }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
 
@@ -641,7 +641,7 @@ internal class EpisodeRuntime(
      * A rule becomes episodic at its first observed occurrence: before that
      * the goal is founding frame, and its chain runs ungated.
      */
-    private fun episodicNow(rule: ResolvedEpisodeRule): Boolean =
+    private fun episodicNow(rule: DerivedEpisodeRule): Boolean =
         rule in activatedRules
 
     /**

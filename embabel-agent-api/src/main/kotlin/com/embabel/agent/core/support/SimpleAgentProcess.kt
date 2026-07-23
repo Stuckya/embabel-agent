@@ -132,8 +132,8 @@ open class SimpleAgentProcess(
      * long-running work - the runtime just tracks which episode any
      * published fact came from.
      */
-    protected fun executeFrameAction(action: Action): ActionStatus =
-        episodes.executingInFrame(action) { executeAction(action) }
+    protected fun executeTrackedAction(action: Action): ActionStatus =
+        episodes.runTrackingPublisher(action) { executeAction(action) }
 
     protected fun handlePlanNotFound(worldState: WorldState): AgentProcess {
         logger.debug(
@@ -230,7 +230,7 @@ open class SimpleAgentProcess(
 
             val action = resolveActionFromPlan(plan)
             try {
-                val actionStatus = executeFrameAction(action)
+                val actionStatus = executeTrackedAction(action)
                 setStatus(actionStatusToAgentProcessStatus(actionStatus))
             } catch (rpe: ReplanRequestedException) {
                 handleReplanRequest(action, rpe)

@@ -27,7 +27,7 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
-import com.embabel.agent.core.support.FoundingPercept
+import com.embabel.agent.core.support.FoundingFacts
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -184,6 +184,6 @@ class GoalEpisodeBatchLoopTest {
         assertNull(result.last<HazardCleared>(), "The hazard output was consumed")
 
         val founding = process.lastCompletedEpisode
-        assertNotNull(founding?.request as? FoundingPercept, "The mission itself completed last")
+        assertNotNull(founding?.request as? FoundingFacts, "The mission itself completed last")
     }
 }
