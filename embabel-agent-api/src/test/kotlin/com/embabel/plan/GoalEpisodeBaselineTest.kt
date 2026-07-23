@@ -44,6 +44,8 @@ import kotlin.test.assertNotNull
 data class SampleTally(val count: Int)
 data class MissionReport(val samples: Int)
 data class CalibrationRequested(val id: String)
+data class SurveyDraft(val id: String)
+data class SurveyFiled(val id: String)
 data class CalibrationCompleted(val id: String)
 data class CalibrationArchived(val id: String)
 data class CalibrationKit(val id: String)

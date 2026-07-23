@@ -56,6 +56,12 @@ open class ConcurrentAgentProcess(
     timestamp = timestamp,
 ) {
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
+        if (isEvolving) {
+            // Evolving mode executes serially in phase 1: episode attribution
+            // diffs the board around each action, which concurrent fan-out
+            // would corrupt. Concurrent width is phase 2's admission-width work
+            return super.formulateAndExecutePlan(worldState)
+        }
         admitArrivals()
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(

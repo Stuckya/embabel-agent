@@ -32,6 +32,9 @@ import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
+import com.embabel.agent.core.Action as CoreAction
+import com.embabel.agent.core.AgentProcess
+import com.embabel.agent.core.AgentProcessCallback
 import com.embabel.agent.core.last
 import com.embabel.agent.core.support.ConcurrentAgentProcess
 import com.embabel.agent.core.support.InMemoryBlackboard
@@ -47,17 +50,16 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 data class SignalReceived(val id: String)
+data class PartA(val id: String)
+data class PartB(val id: String)
 data class Enablement(val id: String)
 data class SignalTriaged(val id: String)
 data class SignalArchived(val id: String)
 
 /**
- * The episode contract, pinned in the derived dialect. Every pin here was
- * proven under the declared EpisodePolicy dialect first; when that surface
- * was deleted, the behaviors that define the contract - serial admission,
- * identity consumption, grounding, retry, event ordering, the canRerun
- * boundary - were ported rather than lost. Occurrences arrive only through
- * evolve(); everything else is standing state. This suite declares
+ * The episode contract: serial admission, identity consumption, grounding,
+ * retry, event ordering, and the canRerun boundary. Occurrences arrive only
+ * through evolve(); everything else is standing state. This suite declares
  * EpisodeExecution.IN_PROCESS: it pins the in-process rung's contract. The
  * default child rung is pinned in GoalEpisodeFrameworkDispatchTest.
  */
@@ -127,6 +129,120 @@ class GoalEvolvingContractTest {
         fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
             context.addObject(ExecutedStep("calibrate:${request.id}"))
             return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Agent(description = "Two independently achievable chain steps feeding one goal")
+    inner class ParallelStepAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun makePartA(request: CalibrationRequested, context: ActionContext): PartA {
+            context.addObject(ExecutedStep("partA:${request.id}"))
+            return PartA(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        fun makePartB(request: CalibrationRequested, context: ActionContext): PartB {
+            context.addObject(ExecutedStep("partB:${request.id}"))
+            return PartB(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun assemble(a: PartA, b: PartB, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("assemble:${a.id}"))
+            return CalibrationCompleted(a.id)
+        }
+    }
+
+    @Test
+    fun `completed occurrences leave no retained arrival bookkeeping`() {
+        // An intentionally infinite process ingests occurrences forever:
+        // bookkeeping retained past completion is a leak, not a record
+        val process = evolvingProcess(CalibrationAgent())
+        repeat(3) { n ->
+            process.evolve(CalibrationRequested("cal-$n"))
+            process.run()
+        }
+        assertNull(process.last<CalibrationRequested>(), "Every occurrence was consumed")
+        assertEquals(
+            0, process.retainedArrivalBookkeeping,
+            "A completed occurrence releases its arrival bookkeeping",
+        )
+    }
+
+    @Test
+    fun `an evolving concurrent process executes one action per tick - attribution is single-threaded bookkeeping`() {
+        // Episode attribution diffs the board around each action and tracks
+        // the executing episode in shared state: concurrent fan-out would
+        // cross-attribute consumables. Evolving mode is serial in phase 1;
+        // concurrent width is phase 2's admission-width work
+        val batches = mutableListOf<MutableList<String>>()
+        val callback = object : AgentProcessCallback {
+            override fun beforeActionLaunched(process: AgentProcess) {
+                batches.add(mutableListOf())
+            }
+
+            override fun onActionLaunched(process: AgentProcess, action: CoreAction) {
+                batches.last().add(action.name)
+            }
+
+            override fun onActionCompleted(process: AgentProcess, action: CoreAction) {}
+        }
+        val blackboard = InMemoryBlackboard()
+        val agent = AgentMetadataReader().createAgentMetadata(ParallelStepAgent()) as CoreAgent
+        val process = ConcurrentAgentProcess(
+            "evolving-contract-serial",
+            null,
+            agent,
+            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+            callbacks = listOf(callback),
+        )
+        process.evolve(CalibrationRequested("cal-1"))
+
+        val result = process.run()
+
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            setOf("partA:cal-1", "partB:cal-1", "assemble:cal-1"), steps.toSet(),
+            "The whole chain ran",
+        )
+        assertNull(result.last<CalibrationRequested>(), "The occurrence was consumed")
+        assertTrue(
+            batches.all { it.size <= 1 },
+            "An evolving process executes one action per tick, never a concurrent batch: got $batches",
+        )
+    }
+
+    @Test
+    fun `derivation survives a null thread context classloader`() {
+        // Type resolution must use the defining classloader: a null or
+        // foreign TCCL silently dropping goals from derivation would turn
+        // a deployment detail into missing capability
+        val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
+        val thread = Thread.currentThread()
+        val original = thread.contextClassLoader
+        thread.contextClassLoader = null
+        try {
+            val process = SimpleAgentProcess(
+                "evolving-contract-tccl",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+            process.evolve(CalibrationRequested("cal-1"))
+            val result = process.run()
+            assertNull(result.last<CalibrationRequested>(), "The goal derived and the occurrence was consumed")
+        } finally {
+            thread.contextClassLoader = original
         }
     }
 

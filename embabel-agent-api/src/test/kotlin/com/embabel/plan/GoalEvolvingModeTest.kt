@@ -63,7 +63,7 @@ data class AuditDone(val id: String)
  * occurrences.
  *
  * What it pins:
- * - evolve() is the whole consumer surface: no EpisodePolicy anywhere.
+ * - evolve() is the whole consumer surface: no policy declarations anywhere.
  * - Activation is observation: a derived rule gates its exclusive chain
  *   only after its first occurrence arrives. Before that the goal is
  *   founding scope and behaves exactly as default mode, so a seeded
@@ -92,6 +92,23 @@ class GoalEvolvingModeTest {
         fun calibrate(request: CalibrationRequested, zone: ZoneInfo, context: ActionContext): CalibrationCompleted {
             context.addObject(ExecutedStep("calibrate:${request.id}@${zone.name}"))
             return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Test
+    fun `a named objective matching no declared goal fails at construction`() {
+        val agent = AgentMetadataReader().createAgentMetadata(DerivedCalibrationAgent()) as CoreAgent
+        assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "evolving-mode-no-such-objective",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEvolving(GoalTarget.named("no-such-goal")),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
         }
     }
 

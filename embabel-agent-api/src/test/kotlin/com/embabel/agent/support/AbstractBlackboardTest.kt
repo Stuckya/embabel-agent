@@ -41,6 +41,41 @@ abstract class AbstractBlackboardTest {
     protected abstract fun createBlackboard(): Blackboard
 
     @Nested
+    inner class RevealHandling {
+
+        @Test
+        fun `reveal returns a hidden object to visibility`() {
+            val bb = createBlackboard()
+            val fact = UserInput("hidden then revealed")
+            bb.addObject(fact)
+            bb.hide(fact)
+            assertTrue(bb.objects.none { it === fact }, "Hidden objects are invisible")
+            assertTrue(bb.reveal(fact), "Revealing a hidden object reports success")
+            assertTrue(bb.objects.any { it === fact }, "Revealed objects are visible again")
+        }
+
+        @Test
+        fun `reveal of a never-hidden object reports failure`() {
+            val bb = createBlackboard()
+            val fact = UserInput("never hidden")
+            bb.addObject(fact)
+            assertEquals(false, bb.reveal(fact), "Nothing was hidden, so nothing was revealed")
+        }
+
+        @Test
+        fun `hide and reveal are per identity`() {
+            val bb = createBlackboard()
+            val hidden = UserInput("same content")
+            val visible = UserInput("same content")
+            bb.addObject(hidden)
+            bb.addObject(visible)
+            bb.hide(hidden)
+            assertTrue(bb.objects.any { it === visible }, "Hiding one instance leaves its twin visible")
+            assertTrue(bb.reveal(hidden), "The hidden instance itself reveals")
+        }
+    }
+
+    @Nested
     inner class AggregationHandling {
         @Test
         fun `empty blackboard`() {

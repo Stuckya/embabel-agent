@@ -50,7 +50,7 @@ data class BatchMissionDone(val samples: Int)
 
 /**
  * The batch loop in the derived shape: collect 500 samples in batches of
- * 50, each batch one episode, no EpisodePolicy anywhere. RepeatUntil for a
+ * 50, each batch one episode, no policy declarations anywhere. RepeatUntil for a
  * group of actions is emergent, not a construct: every rule derives from
  * the goal graph under withEvolving(), each evolved occurrence runs once
  * and is consumed, and the until is the committed objective. AIMA 3e

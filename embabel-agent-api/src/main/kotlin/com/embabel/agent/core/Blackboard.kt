@@ -141,7 +141,7 @@ interface Blackboard : Bindable, MayHaveLastResult, HasInfoString {
      * Returns true if this exact instance was hidden and is now visible.
      * Implementations that do not support hiding may return false.
      */
-    fun reveal(what: Any): Boolean = false
+    fun reveal(what: Any): Boolean
 
     /**
      * Threadsafe get or put

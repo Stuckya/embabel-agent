@@ -44,10 +44,12 @@ internal class Episode(
     private val consumables = mutableListOf<AttributedConsumable>()
 
     fun activate() {
+        check(state == EpisodeState.PENDING) { "Only a PENDING episode can activate, not $state" }
         state = EpisodeState.ACTIVE
     }
 
     fun complete() {
+        check(state == EpisodeState.ACTIVE) { "Only an ACTIVE episode can complete, not $state" }
         state = EpisodeState.COMPLETED
     }
 

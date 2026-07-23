@@ -61,8 +61,13 @@ data class JvmType @JsonCreator constructor(
     val clazz: Class<*> by lazy {
         if (className == "void") {
             Void.TYPE
-        } else
-            Class.forName(className, false, Thread.currentThread().getContextClassLoader())
+        } else {
+            // The context classloader sees app classes under restart and
+            // container loaders; a null TCCL falls back to the defining
+            // classloader, never to bootstrap
+            val loader = Thread.currentThread().contextClassLoader ?: JvmType::class.java.classLoader
+            Class.forName(className, false, loader)
+        }
     }
 
     @get:JsonIgnore

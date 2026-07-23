@@ -41,7 +41,8 @@ import java.util.IdentityHashMap
  * completion bookkeeping. The process owns the tick loop and its status;
  * the runtime owns every episode decision inside it, borrowing exactly the
  * two process powers it declares - status and rearming. Outside evolving
- * mode every path degrades to the default-mode no-op.
+ * mode evolve delegates up the tower or fails fast, and every other path
+ * is inert.
  */
 internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
@@ -72,6 +73,16 @@ internal class EpisodeRuntime(
      */
     private val resolvedEpisodes: List<ResolvedEpisodeRule> =
         derivedScope?.rules.orEmpty()
+
+    init {
+        // Child dispatch would reject an ephemeral parent only at first
+        // dispatch, mid-mission: the conflicting declarations fail here
+        require(derivedScope == null || !childExecution || !process.processOptions.ephemeral) {
+            "An ephemeral process cannot use child episode execution: child processes " +
+                    "require the persistence the ephemeral declaration disclaims. " +
+                    "Declare EpisodeExecution.IN_PROCESS to evolve an ephemeral process"
+        }
+    }
 
     /**
      * Rules that have admitted at least one occurrence. A goal's
@@ -116,7 +127,17 @@ internal class EpisodeRuntime(
         val satisfyingClasses = agent.goals
             .filter { it.name in scope.objectiveGoals }
             .mapNotNull { goal ->
-                (goal.outputType as? JvmType)?.let { IoBinding(it.className).resolveJvmType()?.clazz }
+                val resolved = (goal.outputType as? JvmType)
+                    ?.let { IoBinding(it.className).resolveJvmType()?.clazz }
+                if (resolved == null) {
+                    logger.warn(
+                        "Process {} cannot resolve the satisfying type of objective goal {}: " +
+                                "construction-time instances of it will not be shadowed",
+                        id,
+                        goal.name,
+                    )
+                }
+                resolved
             }
         if (satisfyingClasses.isEmpty()) {
             return emptyList()
@@ -197,6 +218,13 @@ internal class EpisodeRuntime(
     val isEvolving: Boolean get() = derivedScope != null
 
     /**
+     * Arrival bookkeeping still held, for inspection: an intentionally
+     * infinite process ingests occurrences forever, so bookkeeping retained
+     * past completion is a leak, not a record.
+     */
+    val retainedArrivalBookkeeping: Int get() = evolvedArrivals.size + admissionSeen.size
+
+    /**
      * Set by the platform on children of an evolving process: evolve from
      * inside a child delegates up the tower to the nearest evolving
      * ancestor, so chain actions publish occurrences identically on both
@@ -207,8 +235,8 @@ internal class EpisodeRuntime(
     /**
      * Publish a fact as an occurrence. The process evolves only at evolve
      * boundaries, and every evolution is handled inside an episode: the
-     * instance is admitted to the rule whose chain consumes its type,
-     * serially, and consumed by identity on completion.
+     * instance is admitted to the rule that names its type as a required
+     * off-chain input, serially, and consumed by identity on completion.
      */
     fun evolve(fact: Any) {
         if (derivedScope == null) {
@@ -260,11 +288,24 @@ internal class EpisodeRuntime(
     }
 
     private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
-        rule.goalsByName.values.maxOfOrNull { goal ->
-            planner.planToGoal(agent.planningSystem.actions, goal)
-                ?.netValue(planner.worldState())
-                ?: Double.NEGATIVE_INFINITY
-        } ?: Double.NEGATIVE_INFINITY
+        rule.goalsByName.values.maxOfOrNull { goal -> routingValue(rule, goal) }
+            ?: Double.NEGATIVE_INFINITY
+
+    /**
+     * Routing shares dispatch's planning view: under child execution a
+     * candidate is valued by the full-path plan its child would run, so a
+     * parent planner with no full-path guarantee can never strand a
+     * contested occurrence the child rung could execute. An in-process
+     * candidate is valued by the parent planner that would walk it.
+     */
+    private fun routingValue(rule: ResolvedEpisodeRule, goal: Goal): Double {
+        if (childExecution) {
+            return childExecutor.chainValue(rule, goal, agent)
+        }
+        return planner.planToGoal(agent.planningSystem.actions, goal)
+            ?.netValue(planner.worldState())
+            ?: Double.NEGATIVE_INFINITY
+    }
 
     /**
      * Fail fast at the boundary: an evolving process's evolvable types are
@@ -381,6 +422,11 @@ internal class EpisodeRuntime(
         val episode = activeEpisodes.remove(rule) ?: return false
         blackboard.hide(episode.request)
         outcomeGroundings.remove(episode)?.forEach(blackboard::reveal)
+        // The consumed occurrence releases its arrival bookkeeping: an
+        // intentionally infinite process must not accumulate per-occurrence
+        // state past completion
+        admissionSeen.remove(episode.request)
+        evolvedArrivals.remove(episode.request)
         episode.complete()
         lastCompletedEpisode = episode
         logger.debug("Process {} completed {}", id, episode)
@@ -433,7 +479,8 @@ internal class EpisodeRuntime(
      * active episode's request and its attributed consumables (satisfying
      * output and any intermediates this occurrence made) by identity, then keeps the process running so ordinary
      * selection resumes at the next planning tick. The next pending episode,
-     * if any, is admitted and replans the entire chain fresh.
+     * if any, is admitted once no founding-scope work is plannable - terminal
+     * evaluation precedes rearming - and replans the entire chain fresh.
      */
     private fun completeEpisode(
         rule: ResolvedEpisodeRule,
@@ -546,9 +593,17 @@ internal class EpisodeRuntime(
         val abandoned = pendingEpisodes.values.sumOf { it.size }
         if (abandoned > 0) {
             logger.info(
-                "Process {} completed with {} pending occurrence(s) abandoned in queue",
+                "Process {} finished with {} pending occurrence(s) abandoned in queue",
                 id,
                 abandoned,
+            )
+        }
+        val unowned = evolvedArrivals.count { it.value.owner == null }
+        if (unowned > 0) {
+            logger.info(
+                "Process {} finished with {} evolved occurrence(s) that never found an owner",
+                id,
+                unowned,
             )
         }
     }
@@ -718,11 +773,16 @@ internal class EpisodeRuntime(
                 // intact and the next tick re-selects by value
             }
             ChildExecution.BUDGET_EXHAUSTED -> {
+                reportAbandonedOccurrences()
                 setStatus(AgentProcessStatusCode.TERMINATED)
                 return true
             }
         }
-        if (process.status != AgentProcessStatusCode.TERMINATED) {
+        // FAILED is terminal here too: the anti-spin failsafe must never be
+        // resurrected to RUNNING by the tail of its own dispatch
+        if (process.status != AgentProcessStatusCode.TERMINATED &&
+            process.status != AgentProcessStatusCode.FAILED
+        ) {
             makeRunning()
         }
         return true

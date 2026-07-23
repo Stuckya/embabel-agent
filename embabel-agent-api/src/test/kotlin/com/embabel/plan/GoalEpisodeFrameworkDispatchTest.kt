@@ -24,6 +24,8 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -33,6 +35,7 @@ import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServices
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.time.Instant
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -126,6 +129,93 @@ class GoalEpisodeFrameworkDispatchTest {
             context.addObject(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
+    }
+
+    @Agent(description = "Two rules contest one request type through multi-step chains")
+    inner class ContestedMissionAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun draftSurvey(request: PaintRequested, context: ActionContext): SurveyDraft {
+            context.addObject(ExecutedStep("draft:${request.id}"))
+            return SurveyDraft(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Survey filed", value = 1.0)
+        fun fileSurvey(draft: SurveyDraft, context: ActionContext): SurveyFiled {
+            context.addObject(ExecutedStep("file:${draft.id}"))
+            return SurveyFiled(draft.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
+            context.addObject(ExecutedStep("prep:${request.id}"))
+            return PreparedSurface(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Surface painted", value = 0.5)
+        fun paint(surface: PreparedSurface, context: ActionContext): SurfacePainted {
+            context.addObject(ExecutedStep("paint:${surface.id}"))
+            return SurfacePainted(surface.id)
+        }
+    }
+
+    @Test
+    fun `a contested arrival routes by the chain's own planner - no frame leakage before ownership`() {
+        // Routing and dispatch must share one planning view: a HYBRID
+        // parent's single-step lookahead cannot value a multi-step chain,
+        // and an unowned occurrence is never admitted - so its ungated
+        // chain leaks into founding-frame work. Under child execution the
+        // contest is valued by the same full-path planner the child runs
+        val process = dispatching(ContestedMissionAgent(), hybrid = true)
+        process.evolve(PaintRequested("job-1"))
+
+        val result = process.run()
+
+        assertNull(result.last<PaintRequested>(), "The contested occurrence was owned, admitted, and consumed")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("draft:job-1", "file:job-1"), steps,
+            "The higher-value survey rule won on the merits and its chain ran once, whole, in its child",
+        )
+        assertEquals(1, process.frameworkChildCount, "One child for the one occurrence")
+    }
+
+    @Test
+    fun `an ephemeral process cannot declare child execution - the conflict fails at construction`() {
+        // Child dispatch would reject the ephemeral parent only at first
+        // dispatch, mid-mission and outside containment. Fail at the
+        // declaration instead, naming the declared opt-out
+        val agent = AgentMetadataReader().createAgentMetadata(PlainCalibrationAgent()) as CoreAgent
+        val rejection = assertThrows<IllegalArgumentException> {
+            SimpleAgentProcess(
+                "framework-dispatch-ephemeral",
+                null,
+                agent,
+                ProcessOptions.DEFAULT.withEphemeral(true).withEvolving(),
+                InMemoryBlackboard(),
+                dummyPlatformServices(),
+                DefaultPlannerFactory,
+                Instant.now(),
+            )
+        }
+        assertTrue(
+            rejection.message!!.contains("IN_PROCESS"),
+            "The rejection names EpisodeExecution.IN_PROCESS as the opt-out: ${rejection.message}",
+        )
+        // Ephemeral with in-process execution spawns nothing and stays legal
+        SimpleAgentProcess(
+            "framework-dispatch-ephemeral-in-process",
+            null,
+            agent,
+            ProcessOptions.DEFAULT.withEphemeral(true)
+                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            InMemoryBlackboard(),
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
     }
 
     private fun dispatching(

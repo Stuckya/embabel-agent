@@ -17,6 +17,7 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Action
+import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Goal
@@ -78,6 +79,9 @@ internal class ChildEpisodeExecutor(
     var childCount = 0
         private set
 
+    /** Dispatches that failed or threw, for the budget brake's diagnosis */
+    private var failedDispatches = 0
+
     /** Recent children, bounded: inspection sees a window, not a hoard */
     val recentChildrenView: List<AgentProcess> get() = recentChildren.toList()
 
@@ -86,17 +90,32 @@ internal class ChildEpisodeExecutor(
      * unplannable chain has no value and is never a candidate, so a
      * blocked episode costs one plan check per tick, never a doomed child.
      */
-    fun choices(active: Map<ResolvedEpisodeRule, Episode>, agent: com.embabel.agent.core.Agent): List<EpisodeChoice> =
+    fun choices(active: Map<ResolvedEpisodeRule, Episode>, agent: Agent): List<EpisodeChoice> =
         active.entries.mapNotNull { (rule, episode) ->
             // Derived rules are per goal by construction; single() fails
             // loudly if that invariant ever changes
             val goal = rule.goalsByName.values.single()
-            val chainNames = rule.chainActionsFor(goal.name)
-            val chainActions = agent.actions.filter { it.name in chainNames }
-            childPlanner.planToGoal(chainActions, goal)?.let { plan ->
-                EpisodeChoice(rule, episode, goal, chainActions, plan.netValue(childPlanner.worldState()))
+            val value = chainValue(rule, goal, agent)
+            if (value == Double.NEGATIVE_INFINITY) {
+                return@mapNotNull null
             }
+            EpisodeChoice(rule, episode, goal, chainActions(rule, goal, agent), value)
         }
+
+    /**
+     * The full-path value of the chain a child would run for this rule's
+     * goal. Dispatch selection and contested routing both rank by it, so
+     * the two decisions share one planning view.
+     */
+    fun chainValue(rule: ResolvedEpisodeRule, goal: Goal, agent: Agent): Double =
+        childPlanner.planToGoal(chainActions(rule, goal, agent), goal)
+            ?.netValue(childPlanner.worldState())
+            ?: Double.NEGATIVE_INFINITY
+
+    private fun chainActions(rule: ResolvedEpisodeRule, goal: Goal, agent: Agent): List<Action> {
+        val chainNames = rule.chainActionsFor(goal.name)
+        return agent.actions.filter { it.name in chainNames }
+    }
 
     /**
      * Execute the selected episode in a synthesized child. The parent's
@@ -105,10 +124,13 @@ internal class ChildEpisodeExecutor(
      */
     fun execute(choice: EpisodeChoice): ChildExecution {
         if (childCount >= process.processOptions.budget.actions) {
+            // A persistent crash burns to this brake: name the failures so
+            // exhaustion by failure never masquerades as ordinary spend
             logger.warn(
-                "Process {} reached its action budget ({}) dispatching child episodes; terminating",
+                "Process {} reached its action budget ({}) dispatching child episodes, {} of them failed; terminating",
                 process.id,
                 process.processOptions.budget.actions,
+                failedDispatches,
             )
             return ChildExecution.BUDGET_EXHAUSTED
         }
@@ -131,11 +153,22 @@ internal class ChildEpisodeExecutor(
         // A failing child is contained: the parent keeps running, the
         // occurrence stays unconsumed, and a later selection respawns
         val completed = runCatching { child.run() }.getOrElse { failure ->
+            failedDispatches++
             logger.warn(
-                "Process {} child episode for {} failed: {}",
+                "Process {} child episode for {} failed; the occurrence stays for a later selection",
                 process.id,
                 choice.goal.name,
-                failure.message,
+                failure,
+            )
+            return ChildExecution.NOT_COMPLETED
+        }
+        if (completed.status == AgentProcessStatusCode.FAILED) {
+            failedDispatches++
+            logger.warn(
+                "Process {} child episode for {} FAILED{}; the occurrence stays for a later selection",
+                process.id,
+                choice.goal.name,
+                completed.failureInfo?.let { ": $it" } ?: "",
             )
             return ChildExecution.NOT_COMPLETED
         }

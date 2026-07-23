@@ -321,7 +321,7 @@ data class ProcessOptions @JvmOverloads constructor(
      * it.
      */
     fun withEvolving(objective: GoalTarget): ProcessOptions =
-        withEvolving().copy(evolving = Evolving(objective))
+        this.copy(evolving = Evolving(objective))
 
     /**
      * Full-control form: declare the objective and the episode execution

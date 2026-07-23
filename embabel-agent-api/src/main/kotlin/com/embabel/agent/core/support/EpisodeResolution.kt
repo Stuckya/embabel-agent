@@ -26,7 +26,11 @@ import com.embabel.plan.common.condition.EffectSpec
 
 /**
  * An episode rule derived from a declared goal's graph at process creation.
- * @param goalsByName the candidate declared goals, keyed by name
+ * Rules are per goal by construction: one goal, one rule.
+ * @param goalsByName the rule's goal, keyed by name
+ * @param evolvedEligible the loaded types an evolved instance may arrive
+ * under for this rule: the default-binding off-chain inputs required on
+ * every completion path
  * @param consumableTypesByGoal for each candidate goal, the validated consumable types
  * its chain can manufacture: the satisfying output and any intermediates,
  * loaded and consumable. Standing state an action maintains for itself (its
@@ -39,6 +43,9 @@ import com.embabel.plan.common.condition.EffectSpec
  * chain by identity, so an occurrence consumes exactly what it made: a stale
  * intermediate of its own cannot shortcut the next occurrence's plan, and
  * instances made elsewhere are used, not consumed.
+ * @param exclusiveChainActions the chain actions serving no non-episode
+ * goal, gated from planning whenever the activated rule has no active
+ * episode
  */
 internal data class ResolvedEpisodeRule(
     val goalsByName: Map<String, Goal>,
@@ -84,10 +91,9 @@ internal data class DerivedEvolvingScope(
 internal object EpisodeResolution {
 
     /**
-     * Derive an evolved rule for every declared goal whose graph supports one:
-     * the declaration razor keeps only declarations that add facts the goal
-     * graph lacks, and target, consumes and evolved all restate it. The same
-     * validations that reject a declared rule decide derivability here, so
+     * Derive an episode rule for every declared goal whose graph supports
+     * one: everything the goal graph can state is derived, never declared,
+     * and the validations that decide derivability run at construction, so
      * evolving mode keeps construction-time fail-fast without a declared
      * policy. Cross-rule routing checks do not apply: contested arrival types
      * are legal and routed by the planner at arrival.
@@ -106,7 +112,7 @@ internal object EpisodeResolution {
             }
             try {
                 rules += resolveRule(goal, agent)
-            } catch (e: IllegalArgumentException) {
+            } catch (e: UnderivableGoalException) {
                 exclusions[goal.name] = e.message ?: "underivable"
             }
         }
@@ -225,12 +231,12 @@ internal object EpisodeResolution {
             .filter { IoBinding(it).name == IoBinding.DEFAULT_BINDING }
             .map { binding ->
                 IoBinding(binding).resolveJvmType()?.clazz
-                    ?: throw IllegalArgumentException(
+                    ?: throw UnderivableGoalException(
                         "Goal ${goal.name} cannot load off-chain input " +
                                 "${IoBinding(binding).type}: evolved occurrences must be loadable JVM types"
                     )
             }
-        require(eligible.isNotEmpty()) {
+        requireDerivable(eligible.isNotEmpty()) {
             "Goal ${goal.name} has no default-binding off-chain input: " +
                     "nothing can be evolved for it"
         }
@@ -239,7 +245,7 @@ internal object EpisodeResolution {
 
     private fun loadConsumableClass(goalName: String, typeName: String): Class<*> =
         IoBinding(typeName).resolveJvmType()?.clazz
-            ?: throw IllegalArgumentException(
+            ?: throw UnderivableGoalException(
                 "Episode candidate $goalName produces $typeName, which cannot be loaded: " +
                         "every consumable must be a loadable JVM type"
             )
@@ -251,7 +257,7 @@ internal object EpisodeResolution {
      */
     private fun requireNamesUniqueInScope(candidates: List<Goal>, agent: Agent) {
         candidates.forEach { candidate ->
-            require(agent.goals.count { it.name == candidate.name } == 1) {
+            requireDerivable(agent.goals.count { it.name == candidate.name } == 1) {
                 "Episode candidate ${candidate.name} shares its name with another scoped goal; " +
                         "goal names must be unique in scope to participate in an episode"
             }
@@ -266,11 +272,13 @@ internal object EpisodeResolution {
      */
     private fun requireConsumableOutput(goal: Goal, agent: Agent) {
         val outputType = goal.outputType
-        require(outputType is JvmType) {
-            "Episode candidate ${goal.name} does not produce a JVM output type: " +
-                    "its instances could never be consumed, so the episode could not rearm"
+        if (outputType !is JvmType) {
+            throw UnderivableGoalException(
+                "Episode candidate ${goal.name} does not produce a JVM output type: " +
+                        "its instances could never be consumed, so the episode could not rearm"
+            )
         }
-        require(!isSelfMaintained(outputType.className, agent)) {
+        requireDerivable(!isSelfMaintained(outputType.className, agent)) {
             "Episode candidate ${goal.name} is satisfied by ${outputType.className}, which is standing state " +
                     "an action maintains for itself: a satisfying output must be a per-occurrence " +
                     "consumable. Return a distinct completion type"
@@ -432,4 +440,18 @@ internal object EpisodeResolution {
         }
     }
 
+}
+
+/**
+ * The derivation protocol's rejection: thrown when a goal's graph cannot
+ * support an episode rule, caught by derivation and surfaced as the goal's
+ * exclusion reason at the evolve boundary. A plain IllegalArgumentException
+ * from deeper code is a bug and propagates out of construction.
+ */
+internal class UnderivableGoalException(message: String) : IllegalArgumentException(message)
+
+private inline fun requireDerivable(condition: Boolean, message: () -> String) {
+    if (!condition) {
+        throw UnderivableGoalException(message())
+    }
 }

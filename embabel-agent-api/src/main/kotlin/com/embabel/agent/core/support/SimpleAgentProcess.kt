@@ -115,6 +115,9 @@ open class SimpleAgentProcess(
     /** Total framework children ever dispatched */
     internal val frameworkChildCount: Int get() = episodes.frameworkChildCount
 
+    /** Arrival bookkeeping still held, for leak inspection */
+    internal val retainedArrivalBookkeeping: Int get() = episodes.retainedArrivalBookkeeping
+
     override fun evolve(fact: Any) = episodes.evolve(fact)
 
     protected fun admitArrivals() = episodes.admitArrivals()
@@ -267,7 +270,7 @@ open class SimpleAgentProcess(
         return this
     }
 
-    private fun resolveActionFromPlan(plan: Plan): com.embabel.agent.core.Action =
+    private fun resolveActionFromPlan(plan: Plan): Action =
         agent.actions.singleOrNull { it.name == plan.actions.first().name }
             ?: error(
                 "No unique action found for ${plan.actions.first().name} in ${agent.actions.map { it.name }}"

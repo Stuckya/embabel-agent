@@ -67,8 +67,11 @@ value class IoBinding(val value: String) {
     fun resolveJvmType(): JvmType? {
         return try {
             // Reference, never initialize: static initializers must not
-            // run during metadata resolution
-            val clazz = Class.forName(type, false, Thread.currentThread().contextClassLoader)
+            // run during metadata resolution. The context classloader sees
+            // app classes under restart and container loaders; a null TCCL
+            // falls back to the defining classloader, never to bootstrap
+            val loader = Thread.currentThread().contextClassLoader ?: IoBinding::class.java.classLoader
+            val clazz = Class.forName(type, false, loader)
             return JvmType(clazz)
         } catch (_: ClassNotFoundException) {
             null

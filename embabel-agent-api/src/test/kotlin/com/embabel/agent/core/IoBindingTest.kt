@@ -16,6 +16,7 @@
 package com.embabel.agent.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -33,6 +34,23 @@ import org.junit.jupiter.api.assertThrows
  * - Support for custom types and fully qualified names
  */
 class IoBindingTest {
+
+    @Test
+    fun `resolveJvmType does not depend on the thread context classloader`() {
+        // A null or foreign TCCL (bare threads, containers) must not lose
+        // application classes: resolution uses the defining classloader
+        val thread = Thread.currentThread()
+        val original = thread.contextClassLoader
+        thread.contextClassLoader = null
+        try {
+            assertNotNull(
+                IoBinding("com.embabel.agent.core.IoBinding").resolveJvmType(),
+                "Resolution survives a null thread context classloader",
+            )
+        } finally {
+            thread.contextClassLoader = original
+        }
+    }
 
     @Test
     fun `test IoBinding extracts name and type correctly`() {

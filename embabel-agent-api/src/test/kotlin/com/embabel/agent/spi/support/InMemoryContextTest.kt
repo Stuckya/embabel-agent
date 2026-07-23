@@ -329,6 +329,8 @@ class InMemoryContextTest {
             // No-op for testing
         }
 
+        override fun reveal(what: Any): Boolean = false
+
         override fun <V : Any> getOrPut(name: String, creator: () -> V): V {
             @Suppress("UNCHECKED_CAST")
             return map.getOrPut(name) { creator() } as V
