@@ -303,11 +303,12 @@ class GoalEpisodeAimaTest {
     }
 
     @Test
-    fun `the painting problem under hybrid - a blocked chain never spins its rerunnable prefix`() {
+    fun `the painting problem under hybrid - a blocked chain spends one child, never the budget`() {
         // In the parent's walk, a rerunnable prep would re-run every tick
         // toward a completion that never comes, burning the budget - the
-        // sphex loop. Structurally foreclosed: the chain is never a
-        // candidate while unplannable, so nothing spins and nothing spends
+        // sphex loop. The observational defense: the chain gets one child
+        // in this world, its litter dies with its board, and the block is
+        // recorded friction awaiting new facts - or, one day, an author
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-hybrid-spin",
@@ -323,7 +324,10 @@ class GoalEpisodeAimaTest {
         val preps = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "prep:job-1" }
         assertEquals(0, preps, "The prefix never ran: no child, no spin, no spend")
         assertNotNull(result.last<PaintRequested>(), "The block never consumed the request")
-        assertEquals(0, process.frameworkChildCount, "No doomed child was ever spawned")
+        assertEquals(
+            1, process.frameworkChildCount,
+            "One observed attempt, contained by its boundary - the block is recorded, never re-spun",
+        )
     }
 
     @Test

@@ -275,28 +275,22 @@ internal class EpisodeRuntime(
         val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
         competitors.forEach(blackboard::hide)
         try {
+            // Declared values always bind: ownership resolves at the first
+            // settled tick, never earlier than the arrival's world
             val scored = candidates.map { it to bestPlanValue(it) }
-            val best = scored.maxByOrNull { it.second } ?: return null
-            if (best.second == Double.NEGATIVE_INFINITY) {
-                // Least commitment: no candidate can plan, so nothing owns
-                // the occurrence yet - the choice stays unbound and is
-                // retried when the world changes, then decided by merit
-                return null
-            }
-            return best.first
+            return scored.maxByOrNull { it.second }?.first
         } finally {
             competitors.forEach(blackboard::reveal)
         }
     }
 
     /**
-     * Routing shares dispatch's planning view: a candidate is valued by the
-     * full-path plan its child would run, so a parent planner with no
-     * full-path guarantee can never strand a contested occurrence the
-     * dispatch could execute.
+     * Routing shares dispatch's view: a candidate is worth its goal's
+     * declared value in the current world. Nothing is proven at routing
+     * time - the owning rule's child run is the verdict on the chain.
      */
     private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
-        rule.goalsByName.values.maxOfOrNull { goal -> executor.chainValue(rule, goal, agent) }
+        rule.goalsByName.values.maxOfOrNull { goal -> goal.value(planner.worldState()) }
             ?: Double.NEGATIVE_INFINITY
 
     /**
@@ -683,7 +677,7 @@ internal class EpisodeRuntime(
      * doomed child.
      */
     fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean {
-        val choice = executor.choices(activeEpisodes, agent).maxByOrNull { it.value } ?: return false
+        val choice = executor.choices(activeEpisodes, agent, worldState).maxByOrNull { it.value } ?: return false
         if (plan != null && plan.netValue(worldState) > choice.value) {
             return false
         }

@@ -32,6 +32,7 @@ import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
 import com.embabel.agent.test.integration.IntegrationTestUtils.dummyPlatformServices
+import com.embabel.plan.utility.HybridUtilityPlanner
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import java.time.Instant
@@ -60,13 +61,16 @@ import kotlin.test.assertTrue
  *   queued arrivals hidden in the parent stay hidden in the snapshot.
  * - A stale satisfying output cannot vacuously complete a child: hasRun
  *   is process-scoped, so a fresh child must run its chain.
- * - A blocked child consumes nothing and a later tick redispatches; a
- *   failed child is contained - the parent keeps running - and the next
- *   run respawns a fresh one with the occurrence intact.
+ * - A blocked child consumes nothing and waits for the world to change; a
+ *   crashed child is contained - the parent keeps running - and retries
+ *   freely under the budget with the occurrence intact.
  * - Standing USE-resources share across children through snapshots,
  *   consumed by none (AIMA 3e SS11.1).
- * - A HYBRID parent's framework children plan under GOAP: full-path
- *   planning inside episodes, no pairing goal anywhere.
+ * - Children inherit the declared planner: the framework never overrides
+ *   a declaration, and the pairing goal travels with the chain.
+ * - Nothing is proven before dispatch: a blocked episode costs one
+ *   observed child per changed world, its litter dies with its board, and
+ *   the block is recorded friction - Open Evolving's future input.
  * - The parent's action budget bounds the dispatch loop.
  */
 class GoalEpisodeFrameworkDispatchTest {
@@ -591,9 +595,11 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(150, result.last<BatchMissionDone>()?.samples)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertTrue("assess:spill-1" in steps && "clear:spill-1" in steps, "The hazard chain ran and merged: $steps")
+        // Selection ranks by declared goal value: the hazard slots into the
+        // batch run exactly where its declared worth places it
         assertTrue(
-            steps.indexOf("clear:spill-1") < steps.indexOf("batch:3"),
-            "The higher-value hazard episode dispatched before the remaining batch: $steps",
+            steps.indexOf("clear:spill-1") > steps.indexOf("batch:1"),
+            "The hazard episode slotted between batches by declared value: $steps",
         )
         assertNull(result.last<HazardDetected>(), "The evolved hazard occurrence was consumed")
         assertNull(result.last<HazardCleared>(), "The hazard result was consumed")
@@ -615,12 +621,13 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `a blocked episode never spawns a child the parent can predict will stall`() {
+    fun `a blocked episode costs one observed child per world - friction is recorded, never predicted`() {
         // The sphex-wasp hazard (AIMA 3e p. 425, note 5): futile repetition.
-        // A busy parent ticks every action, and each tick must not spawn a
-        // doomed child that spends the budget stalling. The parent checks
-        // the chain's feasibility in the episode's world first - the
-        // stall-before-work principle lifted to the dispatch boundary
+        // Nothing is proven before dispatch - failure is welcome, and the
+        // blocked child is the record an author will one day consume. The
+        // defense is observational: a chain that blocked is not re-attempted
+        // into a world that has not changed, so a busy parent ticking every
+        // action spends exactly one child on the block, never the budget
         val blackboard = InMemoryBlackboard()
         blackboard.addObject(SampleTally(0))
         val agent = AgentMetadataReader().createAgentMetadata(SphexMissionAgent()) as CoreAgent
@@ -645,9 +652,17 @@ class GoalEpisodeFrameworkDispatchTest {
             "The mission completed; doomed dispatches did not exhaust the budget",
         )
         assertEquals(3, result.last<BatchMissionDone>()?.samples, "Frame work proceeded past the blocked episode")
+        // Observation is type-blind: every weld wrote a new tally, so each
+        // of the three world changes earned the blocked episode one fresh
+        // attempt. Four children across a dozen ticks is the defense
+        // working - one per world, never one per tick
+        assertEquals(
+            4, process.frameworkChildCount,
+            "One observed attempt per changed world for the blocked episode, never a per-tick spin",
+        )
         assertTrue(
-            process.frameworkChildren.isEmpty(),
-            "No child was spawned for a chain the parent could predict would stall",
+            result.objects.filterIsInstance<ExecutedStep>().none { it.name.startsWith("paint") },
+            "The blocked child's litter died with its board: the parent stays clean",
         )
         assertNotNull(result.last<PaintRequested>(), "The blocked occurrence waits intact for its enabler")
     }
@@ -678,7 +693,10 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `a HYBRID parent's framework children plan under GOAP - no pairing goal anywhere`() {
+    fun `a child inherits the declared planner - the framework never overrides a declaration`() {
+        // A HYBRID parent's children run HYBRID, pairing goal and all: the
+        // developer declared a planning philosophy and it travels down the
+        // tower untouched
         val process = dispatching(
             PlainBatchMissionAgent(),
             SampleTally(0),
@@ -693,8 +711,16 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(200, result.last<BatchMissionDone>()?.samples)
         val children = process.frameworkChildren
         assertEquals(4, children.size)
-        children.forEach {
-            assertEquals(AgentProcessStatusCode.COMPLETED, it.status, "Every GOAP child completed whole")
+        children.forEach { child ->
+            assertEquals(AgentProcessStatusCode.COMPLETED, child.status, "Every child completed whole")
+            assertTrue(
+                child.planner is HybridUtilityPlanner,
+                "The child inherited the parent's declared planner",
+            )
+            assertTrue(
+                child.agent.goals.any { it.name == NIRVANA.name },
+                "The declared pairing goal traveled with the chain",
+            )
         }
     }
 }

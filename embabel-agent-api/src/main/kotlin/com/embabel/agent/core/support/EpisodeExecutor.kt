@@ -15,7 +15,6 @@
  */
 package com.embabel.agent.core.support
 
-import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
@@ -23,7 +22,7 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.spi.PlannerFactory
-import com.embabel.plan.Planner
+import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import org.slf4j.LoggerFactory
 import java.util.Collections
@@ -53,9 +52,9 @@ internal enum class DispatchOutcome {
  * episode and runs it: synthesizes the child from the derived chain,
  * spawns it with the parent's options minus the evolving declaration,
  * contains failure, and merges the outcome home. It never chooses which
- * episode wins - selection belongs to the planner - but it does supply
- * the values selection ranks, through the same full-path planner its
- * children run.
+ * episode wins - selection belongs to the planner - and it proves nothing
+ * ahead of the run: the child's own execution is the only verdict on a
+ * chain.
  */
 internal class EpisodeExecutor(
     private val process: SimpleAgentProcess,
@@ -64,14 +63,6 @@ internal class EpisodeExecutor(
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
-
-    /**
-     * The full-path planner children run under, used to value and check
-     * each candidate chain before dispatch regardless of the parent's
-     * planner type.
-     */
-    private val childPlanner: Planner<*, *, *> =
-        plannerFactory.createPlanner(ProcessOptions.DEFAULT, worldStateDeterminer)
 
     private val recentChildren = ArrayDeque<AgentProcess>()
 
@@ -86,35 +77,47 @@ internal class EpisodeExecutor(
     val recentChildrenView: List<AgentProcess> get() = recentChildren.toList()
 
     /**
-     * Value each active episode by the plan its child would run. An
-     * unplannable chain has no value and is never a candidate, so a
-     * blocked episode costs one plan check per tick, never a doomed child.
+     * Nothing is proven before dispatch: an active episode is a candidate
+     * at its goal's declared value, and the child's own run is the only
+     * verdict on the chain. The one exclusion is observational, the sphex
+     * defense: an episode whose child ran and blocked is not re-attempted
+     * into a world that has not changed since.
      */
-    fun choices(active: Map<ResolvedEpisodeRule, Episode>, agent: Agent): List<EpisodeChoice> =
-        active.entries.mapNotNull { (rule, episode) ->
+    fun choices(
+        active: Map<ResolvedEpisodeRule, Episode>,
+        agent: Agent,
+        worldState: WorldState,
+    ): List<EpisodeChoice> {
+        val visible = visibleNow()
+        return active.entries.mapNotNull { (rule, episode) ->
+            if (blockedAttempts[episode] == visible) {
+                // The world it blocked in is the world it would block in
+                return@mapNotNull null
+            }
             // Derived rules are per goal by construction; single() fails
             // loudly if that invariant ever changes
             val goal = rule.goalsByName.values.single()
-            val value = chainValue(rule, goal, agent)
-            if (value == Double.NEGATIVE_INFINITY) {
-                return@mapNotNull null
-            }
-            EpisodeChoice(rule, episode, goal, chainActions(rule, goal, agent), value)
+            EpisodeChoice(rule, episode, goal, chainActions(rule, goal, agent), goal.value(worldState))
         }
-
-    /**
-     * The full-path value of the chain a child would run for this rule's
-     * goal. Dispatch selection and contested routing both rank by it, so
-     * the two decisions share one planning view.
-     */
-    fun chainValue(rule: ResolvedEpisodeRule, goal: Goal, agent: Agent): Double =
-        childPlanner.planToGoal(chainActions(rule, goal, agent), goal)
-            ?.netValue(childPlanner.worldState())
-            ?: Double.NEGATIVE_INFINITY
+    }
 
     private fun chainActions(rule: ResolvedEpisodeRule, goal: Goal, agent: Agent): List<Action> {
         val chainNames = rule.chainActionsFor(goal.name)
         return agent.actions.filter { it.name in chainNames }
+    }
+
+    /**
+     * Episodes whose last child ran and blocked, keyed to the visible
+     * parent world it blocked in. A crashed child is deliberately absent:
+     * transient faults do not change boards, so crashes retry freely under
+     * the budget while blocks wait for new facts.
+     */
+    private val blockedAttempts: MutableMap<Episode, Set<Any>> = IdentityHashMap()
+
+    private fun visibleNow(): Set<Any> {
+        val visible: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
+        visible.addAll(process.objects)
+        return visible
     }
 
     /**
@@ -134,20 +137,26 @@ internal class EpisodeExecutor(
             )
             return DispatchOutcome.BUDGET_EXHAUSTED
         }
+        blockedAttempts.remove(choice.episode)
+        // Nothing was proven before this dispatch: the child's run is the
+        // verdict, and the boundary contains whatever happens. The declared
+        // pairing goal travels with the chain so a value-walking planner
+        // keeps its documented configuration
         val childAgent = process.agent.copy(
             actions = choice.chainActions,
-            goals = setOf(choice.goal),
+            goals = setOf(choice.goal) + process.agent.goals.filter { it.name == NIRVANA.name },
         )
         val parentVisible: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
         parentVisible.addAll(process.objects)
         val platform = process.processContext.platformServices.agentPlatform
         // The child inherits the parent's options - budget limits,
-        // identities, context - minus the evolving declaration, with the
-        // full-path planner episodes require
+        // identities, context, and the declared planner - minus the
+        // evolving declaration. The framework never overrides a declared
+        // planner: the child runs what the developer chose
         val child = platform.createChildProcess(
             childAgent,
             process,
-            process.processOptions.copy(evolving = null, plannerType = PlannerType.GOAP),
+            process.processOptions.copy(evolving = null),
         )
         groundRequestWindow(choice, child)
         recordChild(child)
@@ -174,8 +183,9 @@ internal class EpisodeExecutor(
             return DispatchOutcome.NOT_COMPLETED
         }
         if (completed.status != AgentProcessStatusCode.COMPLETED) {
+            blockedAttempts[choice.episode] = visibleNow()
             logger.debug(
-                "Process {} child episode for {} did not complete ({}); request stays for a later selection",
+                "Process {} child episode for {} blocked ({}); it waits for the world to change",
                 process.id,
                 choice.goal.name,
                 completed.status,
