@@ -346,6 +346,46 @@ class GoalEpisodeFrameworkDispatchTest {
         assertNotNull(result.last<CalibrationRequested>(), "The occurrence was never consumed")
     }
 
+    @Agent(description = "Standing state maintained by a two-action cycle, read by a chain")
+    inner class CycleStateAgent {
+
+        @Action(canRerun = true, value = 0.4)
+        fun ping(pong: PongState, context: ActionContext): PingState {
+            context.addObject(ExecutedStep("ping"))
+            return PingState(pong.id)
+        }
+
+        @Action(canRerun = true, value = 0.4)
+        fun pong(ping: PingState, context: ActionContext): PongState {
+            context.addObject(ExecutedStep("pong"))
+            return PongState(ping.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Work done", value = 1.0)
+        fun work(request: CalibrationRequested, ping: PingState, context: ActionContext): CalibrationCompleted {
+            context.addObject(ExecutedStep("work:${request.id}"))
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Test
+    fun `state a cycle maintains survives every completion - the chain that reads it keeps running`() {
+        // Two actions feeding each other maintain a type no single action
+        // maintains alone. That state must never be treated as an episode's
+        // product: consumed or hidden, the next run could not start
+        val process = dispatching(CycleStateAgent(), PingState("seed"))
+        process.evolve(CalibrationRequested("cal-1"))
+        process.run()
+        process.evolve(CalibrationRequested("cal-2"))
+        val result = process.run()
+
+        assertNull(result.last<CalibrationRequested>(), "Both occurrences completed and were consumed")
+        assertNotNull(result.last<PingState>(), "Cycle-maintained state was never consumed nor hidden")
+        val works = result.objects.filterIsInstance<ExecutedStep>().count { it.name.startsWith("work") }
+        assertEquals(2, works, "Both runs read the cycle-maintained state")
+    }
+
     private fun dispatching(
         agentInstance: Any,
         vararg seeds: Any,

@@ -387,23 +387,23 @@ class GoalEpisodeAimaTest {
     }
 
     @Test
-    fun `the sussman analogue - goals sharing an intermediate are excluded and an evolve toward them fails at the boundary`() {
-        // Neither request is on every path to the shared kit, so derivation
-        // excludes both goals; the interference class is unreachable, and
-        // the boundary names why
+    fun `the sussman analogue - goals sharing an intermediate contest each arrival, and value decides`() {
+        // The declared graph says either request can reach either goal
+        // through the shared kit, so both goals are derivable and every
+        // arrival is a contest: the highest-valued goal owns it, exactly
+        // as shared input types route in default mode. The child's run
+        // decides which path actually serves the winner
         val process = create(
             SharedIntermediateAgent(),
             "aima-sussman-analogue",
             ProcessOptions.DEFAULT.withEvolving(),
         )
+        process.evolve(BetaRequested("b-1"))
 
-        val exception = assertThrows<IllegalArgumentException> {
-            process.evolve(AlphaRequested("a-1"))
-        }
-        assertTrue("AlphaRequested" in exception.message!!, "Names the unroutable type: ${exception.message}")
-        assertTrue(
-            "no required input that its own chain does not produce" in exception.message!!,
-            "Carries the derivation exclusion reason: ${exception.message}",
-        )
+        val result = process.run()
+
+        assertNull(result.last<BetaRequested>(), "The arrival was owned and consumed")
+        assertNull(result.last<AlphaDone>(), "The higher-valued goal won the contest and its output was consumed")
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
     }
 }

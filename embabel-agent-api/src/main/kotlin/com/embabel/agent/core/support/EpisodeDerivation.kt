@@ -164,41 +164,41 @@ internal object EpisodeDerivation {
 
     private fun deriveRule(goal: Goal, agent: Agent): DerivedEpisodeRule {
         requireNamesUniqueInScope(listOf(goal), agent)
-        val chains = mapOf(goal.name to analyzeGoalChain(goal, agent))
-        val requiredOnEveryPath = chains.values
-            .map { it.requiredOffChainBindings }
-            .reduce { a, b -> a intersect b }
-        val evolvedEligible = evolvedEligibleTypes(goal, requiredOnEveryPath)
+        val chain = chainActions(goal, agent)
+        val evolvedEligible = evolvedEligibleTypes(goal, chain)
         requireConsumableOutput(goal, agent)
-        val consumableTypesByGoal = chains.mapValues { (goalName, chain) ->
-            chain.outputTypes
-                .filterNot { isSelfMaintained(it, agent) }
-                .map { loadConsumableClass(goalName, it) }
-        }
+        val consumables = chain
+            .flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } }
+            .filterNot { isSelfMaintained(it, agent) }
+            .map { loadConsumableClass(goal.name, it) }
         return DerivedEpisodeRule(
             goalsByName = mapOf(goal.name to goal),
             evolvedEligible = evolvedEligible,
-            consumableTypesByGoal = consumableTypesByGoal,
-            chainActionsByGoal = chains.mapValues { (_, chain) ->
-                chain.chainActions.mapTo(linkedSetOf()) { it.name }
-            },
+            consumableTypesByGoal = mapOf(goal.name to consumables),
+            chainActionsByGoal = mapOf(goal.name to chain.mapTo(linkedSetOf()) { it.name }),
         )
     }
 
     /**
-     * The types an evolved instance may arrive under for this rule: the
-     * input types every path to the goal needs but no chain action
-     * produces, loaded. An evolved fact of any other type never goes to
-     * this rule.
+     * The types an evolved fact may arrive under for this rule: the input
+     * types the goal's chain reads but cannot make itself, loaded. Some
+     * path through the chain needs each of them; whether the path chosen
+     * at run time does is the run's business. An evolved fact of any other
+     * type never goes to this rule.
      */
-    private fun evolvedEligibleTypes(goal: Goal, requiredOnEveryPath: Set<String>): List<Class<*>> {
-        val eligible = requiredOnEveryPath
-            .filter { IoBinding(it).name == IoBinding.DEFAULT_BINDING }
-            .map { binding ->
-                IoBinding(binding).resolveJvmType()?.clazz
+    private fun evolvedEligibleTypes(goal: Goal, chain: Set<Action>): List<Class<*>> {
+        val produced = chain.flatMapTo(mutableSetOf()) { action -> action.outputs.map { it.type } }
+        val eligible = chain
+            .flatMap { it.inputs }
+            .filter { it.name == IoBinding.DEFAULT_BINDING }
+            .map { it.type }
+            .distinct()
+            .filterNot { it in produced }
+            .map { type ->
+                IoBinding(type).resolveJvmType()?.clazz
                     ?: throw UnderivableGoalException(
                         "Goal ${goal.name} cannot load required input " +
-                                "${IoBinding(binding).type}: evolved occurrences must be loadable JVM types"
+                                "$type: evolved occurrences must be loadable JVM types"
                     )
             }
         requireDerivable(eligible.isNotEmpty()) {
@@ -254,84 +254,6 @@ internal object EpisodeDerivation {
     private fun satisfiesOutputTarget(goal: Goal, target: GoalTarget.Output): Boolean =
         goal.outputType?.isAssignableTo(target.satisfiedByType) == true
 
-    private data class GoalChain(
-        /** Inputs every path to the goal needs but no chain action produces */
-        val requiredOffChainBindings: Set<String>,
-        /** The actions the planner can route toward the goal */
-        val chainActions: Set<Action>,
-    ) {
-        /** Output types the chain's actions declare, satisfying output included */
-        val outputTypes: Set<String>
-            get() = chainActions.flatMapTo(linkedSetOf()) { action -> action.outputs.map { it.type } }
-    }
-
-    /**
-     * Analyze the condition graph the planner searches: from the goal's
-     * preconditions to the actions whose effects satisfy them, then those
-     * actions' preconditions, transitively — a static regression over the
-     * goal's relevant conditions, the backward analogue of the planner's
-     * forward search. Action effects already encode the planner's
-     * assignability rules (subtype and supertype outputs), so chain
-     * membership here matches what the planner can actually route. An
-     * input-binding condition no scoped action's effects satisfy is an
-     * off-chain input: an observation the planner cannot manufacture. Named
-     * conditions without producers are current truth and belong to neither set.
-     */
-    private fun analyzeGoalChain(goal: Goal, agent: Agent): GoalChain =
-        GoalChain(
-            requiredOffChainBindings = requiredBindings(
-                requiredConditions(goal.preconditions), agent, mutableMapOf(), mutableSetOf(),
-            ),
-            chainActions = chainActions(goal, agent),
-        )
-
-    /**
-     * Off-chain input bindings required on every completion path. A condition
-     * satisfiable by any of several producers requires only what all producers
-     * require (intersection); a producer requires everything its preconditions
-     * require (union). Cycles contribute nothing: a self-produced type is
-     * standing state, not a required observation.
-     */
-    private fun requiredBindings(
-        conditions: Collection<String>,
-        agent: Agent,
-        memo: MutableMap<String, Set<String>>,
-        inProgress: MutableSet<String>,
-    ): Set<String> =
-        conditions.flatMapTo(linkedSetOf()) { requiredBindingsFor(it, agent, memo, inProgress) }
-
-    private fun requiredBindingsFor(
-        condition: String,
-        agent: Agent,
-        memo: MutableMap<String, Set<String>>,
-        inProgress: MutableSet<String>,
-    ): Set<String> {
-        memo[condition]?.let { return it }
-        if (!inProgress.add(condition)) return emptySet()
-        val required = computeRequiredBindings(condition, agent, memo, inProgress)
-        inProgress.remove(condition)
-        memo[condition] = required
-        return required
-    }
-
-    private fun computeRequiredBindings(
-        condition: String,
-        agent: Agent,
-        memo: MutableMap<String, Set<String>>,
-        inProgress: MutableSet<String>,
-    ): Set<String> {
-        val producers = agent.actions.filter { producesCondition(it, condition) }
-        if (producers.isEmpty()) return offChainBinding(condition)
-        return producers
-            .map { requiredBindings(requiredConditions(it.preconditions), agent, memo, inProgress) }
-            .reduce { a, b -> a intersect b }
-    }
-
-    private fun offChainBinding(condition: String): Set<String> {
-        if (":" !in condition) return emptySet()
-        return setOf(condition)
-    }
-
     private fun chainActions(goal: Goal, agent: Agent): Set<Action> {
         val chainActions = linkedSetOf<Action>()
         val visited = mutableSetOf<String>()
@@ -354,13 +276,13 @@ internal object EpisodeDerivation {
         spec.filterValues { it == ConditionDetermination.TRUE }.keys.toList()
 
     /**
-     * A chain action's output is standing state, never a per-occurrence
-     * consumable, when some producer of it can sustain the type without a
-     * fresh occurrence: either the producer's effects satisfy one of its own
-     * required inputs (an accumulator, exact or subtype), or the producer
-     * transitively requires no off-chain input at all (a multi-action cycle
-     * such as a ping-pong pair). Both checks use the planner's own matching
-     * rules.
+     * A chain action's output is standing state, never a per-run
+     * consumable, when some producer of it sustains the type without a
+     * fresh occurrence: either the producer's effects satisfy one of its
+     * own required inputs, as with a running total, or a cycle of actions
+     * regenerates the type with no outside input at all, as with a pair
+     * feeding each other. Deleting the cycle check was tried: hiding
+     * cycle-maintained state blocked every chain that reads it.
      */
     private fun isSelfMaintained(type: String, agent: Agent): Boolean =
         agent.actions
@@ -374,11 +296,11 @@ internal object EpisodeDerivation {
         requiredConditions(action.preconditions).any { producesCondition(action, it) }
 
     /**
-     * Can this producer run using only what the scope regenerates on its own?
-     * Any-path semantics: a producer is regenerable when some way of satisfying
-     * each of its inputs needs no off-chain occurrence. Cycles sustain
-     * themselves; named conditions are current truth; an off-chain binding is
-     * an occurrence and blocks regeneration.
+     * Can this producer run using only what the scope regenerates on its
+     * own? A producer is regenerable when some way of satisfying each of
+     * its inputs needs no outside occurrence: cycles sustain themselves,
+     * named conditions are current truth, and an input no action produces
+     * is an occurrence and blocks regeneration.
      */
     private fun regenerableWithoutOffChainInput(action: Action, agent: Agent): Boolean =
         requiredConditions(action.preconditions).all { canRegenerate(it, agent, mutableSetOf()) }
