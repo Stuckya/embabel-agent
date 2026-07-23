@@ -27,13 +27,14 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
+import com.embabel.agent.core.Bindable
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.ReplanRequestedException
 import com.embabel.agent.spi.PlannerFactory
 import com.embabel.common.util.indentLines
 import com.embabel.plan.Plan
 import com.embabel.plan.Planner
-import com.embabel.plan.PlanningSystem
+import com.embabel.plan.PlanningDirective
 import com.embabel.plan.WorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import java.time.Instant
@@ -65,12 +66,7 @@ open class SimpleAgentProcess(
 
     override val planner: Planner<*, *, *> = plannerFactory.createPlanner(processOptions, worldStateDeterminer)
 
-    /**
-     * The episode machinery: derivation, admission, routing, visibility
-     * windows, attribution, dispatch selection, and completion bookkeeping.
-     * This process owns the tick loop and its status; the runtime owns
-     * every episode decision inside it.
-     */
+    /** Occurrence and child lifecycle; all planning decisions stay in the planner session. */
     private val episodes = EpisodeRuntime(
         process = this,
         setStatus = ::setStatus,
@@ -94,10 +90,16 @@ open class SimpleAgentProcess(
      * however deep the nesting, so an action publishes the same way
      * whether it runs in the parent or in a child.
      */
-    internal var evolveDelegate: ((Any) -> Unit)?
+    internal var evolveDelegate: ((Any, String?) -> com.embabel.agent.core.OccurrenceId)?
         get() = episodes.evolveDelegate
         set(value) {
             episodes.evolveDelegate = value
+        }
+
+    internal var shareDelegate: ((Any) -> Unit)?
+        get() = episodes.shareDelegate
+        set(value) {
+            episodes.shareDelegate = value
         }
 
     /**
@@ -115,16 +117,24 @@ open class SimpleAgentProcess(
     /** Arrival bookkeeping still held, for leak inspection */
     internal val retainedArrivalBookkeeping: Int get() = episodes.retainedArrivalBookkeeping
 
+    /** Active ledger record for contract tests and process observability. */
+    internal fun activeEpisode(id: com.embabel.agent.core.OccurrenceId): Episode? =
+        episodes.activeEpisode(id)
+
     override fun evolve(fact: Any) = episodes.evolve(fact)
 
-    protected fun admitArrivals() = episodes.admitArrivals()
+    override fun evolve(fact: Any, publishingActionName: String?) =
+        episodes.evolve(fact, publishingActionName)
 
-    protected fun gatedChainActions(): Set<String> = episodes.gatedChainActions()
+    override fun share(fact: Any) = episodes.share(fact)
 
-    protected fun planningSystem(): PlanningSystem = episodes.planningSystem()
+    override fun signalWorldChange() = episodes.onStandingStateChanged()
 
-    protected fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean =
-        episodes.dispatchIfEpisodeWins(plan, worldState)
+    override fun addObject(value: Any): Bindable {
+        val result = super.addObject(value)
+        episodes.onStandingStateChanged()
+        return result
+    }
 
     /**
      * Execute an action in this process. Episode chains only run in child
@@ -157,12 +167,6 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
-        if (!episodes.completesProcess(plan.goal.name)) {
-            episodes.recordFrameAchievement(plan.goal.name)
-            return
-        }
-        episodes.reportAbandonedOccurrences()
-        episodes.completeFoundingEpisode()
         logger.debug(
             "✅ Process {} completed, achieving goal {} in {} seconds",
             this.id,
@@ -177,6 +181,27 @@ open class SimpleAgentProcess(
             )
         )
         logger.debug("Final blackboard: {}", blackboard.infoString())
+        setStatus(AgentProcessStatusCode.COMPLETED)
+    }
+
+    private fun handleEvolvingProcessCompletion(
+        directive: PlanningDirective.CompleteProcess,
+        worldState: WorldState,
+    ) {
+        episodes.reportAbandonedOccurrences()
+        logger.debug(
+            "✅ Evolving process {} completed by planner directive for goal {} in {} seconds",
+            id,
+            directive.goal.name,
+            runningTime.seconds,
+        )
+        processContext.onProcessEvent(
+            GoalAchievedEvent(
+                agentProcess = this,
+                worldState = worldState,
+                goal = directive.goal,
+            )
+        )
         setStatus(AgentProcessStatusCode.COMPLETED)
     }
 
@@ -195,15 +220,14 @@ open class SimpleAgentProcess(
     }
 
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
-        admitArrivals()
+        if (isEvolving) {
+            return formulateAndExecuteEvolving(worldState)
+        }
         // Use blacklist to exclude actions that just triggered replan
         val plan = planner.bestValuePlanToAnyGoal(
-            system = planningSystem(),
-            excludedActionNames = replanBlacklist + gatedChainActions(),
+            system = agent.planningSystem,
+            excludedActionNames = replanBlacklist,
         )
-        if (dispatchIfEpisodeWins(plan, worldState)) {
-            return this
-        }
         if (plan == null) {
             // If no plan found with blacklist, try without it as a fallback
             // This handles the case where the blacklisted action is the only option
@@ -226,34 +250,86 @@ open class SimpleAgentProcess(
         if (plan.isComplete()) {
             handleProcessCompletion(plan, worldState)
         } else {
-            sendProcessRunningEvent(plan, worldState)
-
-            val action = resolveActionFromPlan(plan)
-            try {
-                val actionStatus = executeTrackedAction(action)
-                setStatus(actionStatusToAgentProcessStatus(actionStatus))
-            } catch (rpe: ReplanRequestedException) {
-                handleReplanRequest(action, rpe)
-            } catch (e: TerminateActionException) {
-                // Action requested early termination - continue with next action
-                logger.info(
-                    "Action {} terminated early: {}",
-                    action.name,
-                    e.reason,
-                )
-                // Keep status as RUNNING to continue with next action
-                setStatus(AgentProcessStatusCode.RUNNING)
-            } catch (e: TerminateAgentException) {
-                // Agent termination requested - stop the entire process
-                logger.info(
-                    "Agent process terminated by action {}: {}",
-                    action.name,
-                    e.reason,
-                )
-                setStatus(AgentProcessStatusCode.TERMINATED)
-            }
+            executePlanStep(plan, worldState)
         }
         return this
+    }
+
+    private fun formulateAndExecuteEvolving(worldState: WorldState): AgentProcess {
+        return when (val directive = episodes.nextDirective(replanBlacklist)) {
+            is PlanningDirective.RunRoot -> {
+                check(!directive.execution.plan.isComplete()) {
+                    "A planner session must use CompleteProcess for root completion"
+                }
+                replanBlacklist.clear()
+                _goal = directive.execution.plan.goal
+                executePlanStep(directive.execution.plan, worldState)
+                this
+            }
+
+            is PlanningDirective.RunEpisode -> {
+                replanBlacklist.clear()
+                episodes.runEpisode(directive)
+                this
+            }
+
+            is PlanningDirective.AwaitEpisode -> {
+                episodes.awaitEpisode(directive)
+                this
+            }
+
+            is PlanningDirective.CompleteEpisode -> {
+                episodes.completeEpisode(directive, worldState)
+                this
+            }
+
+            is PlanningDirective.CancelEpisode -> {
+                episodes.cancelEpisode(directive)
+                this
+            }
+
+            PlanningDirective.AwaitProcess -> {
+                if (replanBlacklist.isNotEmpty()) {
+                    replanBlacklist.clear()
+                    formulateAndExecuteEvolving(worldState)
+                } else {
+                    handlePlanNotFound(worldState)
+                }
+            }
+
+            is PlanningDirective.CompleteProcess -> {
+                handleEvolvingProcessCompletion(directive, worldState)
+                this
+            }
+        }
+    }
+
+    private fun executePlanStep(
+        plan: Plan,
+        worldState: WorldState,
+    ) {
+        sendProcessRunningEvent(plan, worldState)
+        val action = resolveActionFromPlan(plan)
+        try {
+            val actionStatus = executeTrackedAction(action)
+            setStatus(actionStatusToAgentProcessStatus(actionStatus))
+        } catch (rpe: ReplanRequestedException) {
+            handleReplanRequest(action, rpe)
+        } catch (e: TerminateActionException) {
+            logger.info(
+                "Action {} terminated early: {}",
+                action.name,
+                e.reason,
+            )
+            setStatus(AgentProcessStatusCode.RUNNING)
+        } catch (e: TerminateAgentException) {
+            logger.info(
+                "Agent process terminated by action {}: {}",
+                action.name,
+                e.reason,
+            )
+            setStatus(AgentProcessStatusCode.TERMINATED)
+        }
     }
 
     private fun resolveActionFromPlan(plan: Plan): Action =

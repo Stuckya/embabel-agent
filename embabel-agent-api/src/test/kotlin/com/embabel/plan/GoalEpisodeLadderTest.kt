@@ -86,14 +86,14 @@ class GoalEpisodeLadderTest {
 
         @Action(value = 0.5)
         fun equipGripper(door: DoorDown, context: ActionContext): GripperOn {
-            context.addObject(ExecutedStep("child-equip:${door.id}"))
+            context.share(ExecutedStep("child-equip:${door.id}"))
             return GripperOn(door.id)
         }
 
         @Action(value = 0.9)
         @AchievesGoal(description = "Door fixed", value = 1.0)
         fun reattachDoor(gripper: GripperOn, context: ActionContext): DoorFixed {
-            context.addObject(ExecutedStep("child-reattach:${gripper.id}"))
+            context.share(ExecutedStep("child-reattach:${gripper.id}"))
             return DoorFixed(gripper.id)
         }
     }
@@ -109,13 +109,13 @@ class GoalEpisodeLadderTest {
 
         @Action(canRerun = true, value = 0.2)
         fun weld(tally: WeldTally, context: ActionContext): WeldTally {
-            context.addObject(ExecutedStep("weld"))
+            context.share(ExecutedStep("weld"))
             val next = WeldTally(tally.count + 1)
             if (next.count == 2) {
-                context.agentProcess.evolve(DoorDown("door-7"))
+                context.evolve(DoorDown("door-7"))
             }
             if (next.count == 4) {
-                context.agentProcess.evolve(DoorDown("door-8"))
+                context.evolve(DoorDown("door-8"))
             }
             return next
         }
@@ -135,7 +135,7 @@ class GoalEpisodeLadderTest {
         @Action(canRerun = true, value = 0.8)
         @AchievesGoal(description = "Door repair completed", value = 1.0)
         fun dispatchRepair(door: DoorDown, context: ActionContext): DoorFixed {
-            context.addObject(ExecutedStep("dispatch:${door.id}"))
+            context.share(ExecutedStep("dispatch:${door.id}"))
             val platform = context.processContext.platformServices.agentPlatform
             // Declared child options: the crew plans under GOAP regardless
             // of the parent's HYBRID declaration
@@ -202,13 +202,19 @@ class GoalEpisodeLadderTest {
         // parent planner arbitrates the dispatch like any other action
         val parentSteps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
-            listOf("weld", "weld", "dispatch:door-7", "weld", "weld", "dispatch:door-8", "weld", "weld"),
+            listOf(
+                "weld", "weld",
+                "dispatch:door-7", "child-equip:door-7", "child-reattach:door-7",
+                "weld", "weld",
+                "dispatch:door-8", "child-equip:door-8", "child-reattach:door-8",
+                "weld", "weld",
+            ),
             parentSteps,
-            "Welds continue between episodes; each repair is atomic from the parent's view",
+            "Welds continue between episodes; children explicitly share their repair trace",
         )
 
-        // Isolation: the child's steps and intermediates never reach the parent
-        assertTrue(parentSteps.none { it.startsWith("child-") }, "Child steps stay in the child")
+        // Isolation: ordinary child intermediates remain local. Only the
+        // trace explicitly published with ctx.share crosses the boundary.
         assertNull(result.last<GripperOn>(), "Child intermediates never touch the parent blackboard")
 
         // The parent-level episode contract held: both occurrences consumed
@@ -228,17 +234,16 @@ class GoalEpisodeLadderTest {
                 "The manual child's parent is the framework child that ran the dispatch action",
             )
         }
-        val childSteps = parentAgent.children.map { child ->
-            child.objects.filterIsInstance<ExecutedStep>().map { it.name }.filter { it.startsWith("child-") }
+        val childActions = parentAgent.children.map { child ->
+            child.history.map { it.actionName.substringAfterLast('.') }
         }
         assertEquals(
             listOf(
-                listOf("child-equip:door-7", "child-reattach:door-7"),
-                listOf("child-equip:door-8", "child-reattach:door-8"),
+                listOf("equipGripper", "reattachDoor"),
+                listOf("equipGripper", "reattachDoor"),
             ),
-            childSteps,
-            "Each door ran its own two-step chain in its own process; " +
-                    "the second child's snapshot excluded the first consumed request",
+            childActions,
+            "Each door ran its own two-step chain in its own process",
         )
     }
 
@@ -248,11 +253,11 @@ class GoalEpisodeLadderTest {
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Step collected", value = 1.0)
         fun collectStep(request: StepRequested, tally: StepTally, context: ActionContext): StepDone {
-            context.addObject(ExecutedStep("child-step:${request.id}"))
+            context.share(ExecutedStep("child-step:${request.id}"))
             val next = StepTally(tally.count + 1)
-            context.addObject(next)
+            context.share(next)
             if (next.count < 2) {
-                context.agentProcess.evolve(StepRequested(request.id + 1))
+                context.evolve(StepRequested(request.id + 1))
             }
             return StepDone(request.id)
         }
@@ -277,7 +282,7 @@ class GoalEpisodeLadderTest {
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Wave done", value = 1.0)
         fun dispatchWave(wave: WaveRequested, missions: MissionTally, context: ActionContext): WaveDone {
-            context.addObject(ExecutedStep("wave:${wave.id}"))
+            context.share(ExecutedStep("wave:${wave.id}"))
             context.addObject(StepTally(0))
             val platform = context.processContext.platformServices.agentPlatform
             val child = platform.createChildProcess(
@@ -289,7 +294,7 @@ class GoalEpisodeLadderTest {
             child.evolve(StepRequested(1))
             val done = child.run().last<StepsDone>()
                 ?: error("Sub-mission for wave ${wave.id} produced nothing: status=${child.status}")
-            context.addObject(MissionTally(missions.count + 1))
+            context.share(MissionTally(missions.count + 1))
             return WaveDone(done.steps)
         }
 

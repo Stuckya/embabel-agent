@@ -266,10 +266,35 @@ interface AgentProcess : Blackboard, Timestamped, Timed, OperationStatus<AgentPr
      * and by their children at any depth, which delegate to the nearest
      * evolving ancestor. Fails fast everywhere else.
      */
-    fun evolve(fact: Any) {
+    fun evolve(fact: Any): OccurrenceId {
         throw UnsupportedOperationException(
             "This process does not support evolve: declare withEvolving() on the process options",
         )
+    }
+
+    /**
+     * Action-aware form used by [com.embabel.agent.api.common.ActionContext].
+     * It is the same occurrence operation with additional lineage metadata.
+     */
+    fun evolve(fact: Any, publishingActionName: String?): OccurrenceId = evolve(fact)
+
+    /**
+     * Explicitly publish standing state from a child attempt.
+     *
+     * Ordinary blackboard writes remain process-local. Implementations with
+     * an evolving ancestor delegate this operation to that ancestor.
+     */
+    fun share(fact: Any) {
+        addObject(fact)
+    }
+
+    /**
+     * Notify the planner that application-owned state changed without a
+     * blackboard write. In evolving mode this advances the process world
+     * revision and makes parked episodes eligible for reconsideration.
+     */
+    fun signalWorldChange() {
+        // Optional capability for AgentProcess implementations.
     }
 
     /**

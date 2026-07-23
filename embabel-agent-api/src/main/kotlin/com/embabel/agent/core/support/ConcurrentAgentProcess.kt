@@ -63,15 +63,11 @@ open class ConcurrentAgentProcess(
             // it. Concurrent execution under evolving mode is future work
             return super.formulateAndExecutePlan(worldState)
         }
-        admitArrivals()
         // Mirror SimpleAgentProcess: exclude blacklisted actions, fall back without blacklist if needed
         val plan = planner.bestValuePlanToAnyGoal(
-            system = planningSystem(),
-            excludedActionNames = replanBlacklist + gatedChainActions(),
+            system = agent.planningSystem,
+            excludedActionNames = replanBlacklist,
         )
-        if (dispatchIfEpisodeWins(plan, worldState)) {
-            return this
-        }
         if (plan == null) {
             if (replanBlacklist.isNotEmpty()) {
                 logger.debug(

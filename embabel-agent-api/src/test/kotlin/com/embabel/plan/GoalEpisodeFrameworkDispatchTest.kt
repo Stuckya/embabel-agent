@@ -27,6 +27,7 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
+import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -44,7 +45,7 @@ import kotlin.test.assertTrue
 /**
  * Framework dispatch: the developer writes one ordinary agent and calls
  * evolve; the framework runs each admitted episode in a child process it
- * synthesizes from the derived chain. No dispatch actions, no crew
+ * configures from a planner-provided child mission. No dispatch actions, no crew
  * authoring, no platform API in developer code - the complexity is hidden.
  * Child execution is the contract: there is no other rung.
  *
@@ -55,22 +56,20 @@ import kotlin.test.assertTrue
  * - evolve delegates up the tower: a chain action executing inside a
  *   framework child publishes its follow-up through the child's process
  *   handle, and the occurrence reaches the owning evolving parent.
- * - Standing state merges back: everything the chain wrote returns at
- *   completion, so accumulator patterns author identically on both rungs.
- * - Snapshot pairing: each child sees exactly its own occurrence, because
- *   queued arrivals hidden in the parent stay hidden in the snapshot.
+ * - Child state is local. Only explicit share calls cross back to the
+ *   evolving root, so accumulator patterns state their transfer boundary.
+ * - Snapshot pairing: each child sees exactly its selected occurrence;
+ *   queued arrivals exist only in the parent's occurrence ledger.
  * - A stale satisfying output cannot vacuously complete a child: hasRun
  *   is process-scoped, so a fresh child must run its chain.
- * - A blocked child consumes nothing and waits for the world to change; a
- *   crashed child is contained - the parent keeps running - and retries
- *   freely under the budget with the occurrence intact.
+ * - An unroutable occurrence parks without dispatch. A stuck or crashed
+ *   child is contained, and the planner decides whether to retry it.
  * - Standing USE-resources share across children through snapshots,
  *   consumed by none (AIMA 3e SS11.1).
- * - Children inherit the declared planner: the framework never overrides
- *   a declaration, and the pairing goal travels with the chain.
- * - Nothing is proven before dispatch: a blocked episode costs one
- *   observed child per changed world, its litter dies with its board, and
- *   the block is recorded friction - Open Evolving's future input.
+ * - Children inherit the declared planner type; the selected planner also
+ *   supplies their goals.
+ * - Planner obstruction is retained as STUCK evidence without runtime
+ *   diagnosis or graph reconstruction.
  * - The parent's action budget bounds the dispatch loop.
  */
 class GoalEpisodeFrameworkDispatchTest {
@@ -80,14 +79,14 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return CalibrationKit(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate:${kit.id}"))
+            context.share(ExecutedStep("calibrate:${kit.id}"))
             return CalibrationCompleted(kit.id)
         }
     }
@@ -98,11 +97,11 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Batch collected", value = 1.0)
         fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
-            context.addObject(ExecutedStep("batch:${request.id}"))
+            context.share(ExecutedStep("batch:${request.id}"))
             val next = SampleTally(tally.count + 50)
-            context.addObject(next)
+            context.share(next)
             if (next.count < 200) {
-                context.agentProcess.evolve(BatchRequested(request.id + 1))
+                context.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
@@ -120,14 +119,14 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return PreparedSurface(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Surface painted", value = 1.0)
         fun paint(surface: PreparedSurface, can: PaintCan, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${surface.id}"))
+            context.share(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
     }
@@ -137,38 +136,36 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.5)
         fun draftSurvey(request: PaintRequested, context: ActionContext): SurveyDraft {
-            context.addObject(ExecutedStep("draft:${request.id}"))
+            context.share(ExecutedStep("draft:${request.id}"))
             return SurveyDraft(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Survey filed", value = 1.0)
         fun fileSurvey(draft: SurveyDraft, context: ActionContext): SurveyFiled {
-            context.addObject(ExecutedStep("file:${draft.id}"))
+            context.share(ExecutedStep("file:${draft.id}"))
             return SurveyFiled(draft.id)
         }
 
         @Action(canRerun = true, value = 0.5)
         fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return PreparedSurface(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Surface painted", value = 0.5)
         fun paint(surface: PreparedSurface, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${surface.id}"))
+            context.share(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
     }
 
     @Test
-    fun `a contested arrival routes by the chain's own planner - no frame leakage before ownership`() {
-        // Routing and dispatch must share one planning view: a HYBRID
-        // parent's single-step lookahead cannot value a multi-step chain,
-        // and an unowned occurrence is never admitted - so its ungated
-        // chain leaks into founding-frame work. Under child execution the
-        // contest is valued by the same full-path planner the child runs
+    fun `a contested arrival routes through the selected planner without runtime ownership logic`() {
+        // The planner session owns routing and value comparison. The
+        // runtime merely dispatches the returned child mission, using the
+        // same declared planner type in the child.
         val process = dispatching(ContestedMissionAgent(), hybrid = true)
         process.evolve(PaintRequested("job-1"))
 
@@ -178,7 +175,7 @@ class GoalEpisodeFrameworkDispatchTest {
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
             listOf("draft:job-1", "file:job-1"), steps,
-            "The higher-value survey rule won on the merits and its chain ran once, whole, in its child",
+            "The higher-value planner mission won and ran once in its child",
         )
         assertEquals(1, process.frameworkChildCount, "One child for the one occurrence")
     }
@@ -213,14 +210,14 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return PreparedSurface(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Surface painted", value = 1.0)
         fun paint(surface: PreparedSurface, can: PaintCan, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${surface.id}"))
+            context.share(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
 
@@ -229,8 +226,8 @@ class GoalEpisodeFrameworkDispatchTest {
         fun fetchCan(request: CanRequested, context: ActionContext): CanFetched {
             // The can is a lasting write, not the goal's output: it survives
             // the supply episode's completion and enables the blocked job
-            context.addObject(PaintCan("fresh"))
-            context.addObject(ExecutedStep("fetch:${request.id}"))
+            context.share(PaintCan("fresh"))
+            context.share(ExecutedStep("fetch:${request.id}"))
             return CanFetched(request.id)
         }
     }
@@ -241,18 +238,21 @@ class GoalEpisodeFrameworkDispatchTest {
         // a new evolution changes the world, and the blocked work resumes
         // through nothing but the change itself
         val process = dispatching(SupplyChainAgent())
-        process.evolve(PaintRequested("job-1"))
+        val paintOccurrence = process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertNotNull(stalled.last<PaintRequested>(), "The blocked occurrence waits intact")
+        assertEquals(
+            EpisodeState.STUCK,
+            process.activeEpisode(paintOccurrence)?.state,
+            "The blocked occurrence remains in the episode ledger",
+        )
 
         process.evolve(CanRequested("supply-1"))
         val resolved = stalled.run()
 
-        assertNull(resolved.last<PaintRequested>(), "The blocked episode completed after the supply evolution")
-        assertNull(resolved.last<CanRequested>(), "The supply occurrence was consumed by its own episode")
+        assertNull(process.activeEpisode(paintOccurrence), "The blocked episode completed after the supply evolution")
         assertNotNull(resolved.last<PaintCan>(), "The supply run's lasting product survived and enabled the job")
         val steps = resolved.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertTrue("paint:job-1" in steps, "The blocked chain ran to its goal: $steps")
@@ -263,7 +263,7 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.4)
         fun gather(request: BuildRequested, tally: SampleTally, context: ActionContext): SampleTally {
-            context.addObject(ExecutedStep("gather"))
+            context.share(ExecutedStep("gather"))
             return SampleTally(tally.count + 1)
         }
 
@@ -273,7 +273,7 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(pre = ["enough"], canRerun = true, value = 0.9)
         @AchievesGoal(description = "Build done", value = 1.0)
         fun build(request: BuildRequested, tally: SampleTally, context: ActionContext): BuildDone {
-            context.addObject(ExecutedStep("build:${request.id}"))
+            context.share(ExecutedStep("build:${request.id}"))
             return BuildDone(request.id)
         }
     }
@@ -295,18 +295,22 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `the same unprovable chain waits as recorded friction under a classical planner`() {
+    fun `a classical planner can park an unprovable chain without runtime reconstruction`() {
         // A full-path planner cannot see the condition flipping mid-run, so
         // the child parks having done nothing and the block is recorded -
         // the documented limitation, and the future author's input
         val process = dispatching(ValueConditionChainAgent(), SampleTally(0))
-        process.evolve(BuildRequested("b-1"))
+        val occurrence = process.evolve(BuildRequested("b-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertNotNull(result.last<BuildRequested>(), "The occurrence waits intact for the world to change")
-        assertEquals(1, process.frameworkChildCount, "One observed attempt in this world, never a spin")
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
+        assertEquals(
+            0,
+            process.frameworkChildCount,
+            "The runtime must not invent a child mission when the planner cannot produce one",
+        )
     }
 
     @Agent(description = "A completing action with a permanent fault")
@@ -337,13 +341,13 @@ class GoalEpisodeFrameworkDispatchTest {
             DefaultPlannerFactory,
             Instant.now(),
         )
-        process.evolve(CalibrationRequested("cal-1"))
+        val occurrence = process.evolve(CalibrationRequested("cal-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.TERMINATED, result.status, "The budget bounded the retries")
         assertEquals(5, process.frameworkChildCount, "One child per budgeted attempt, then the brake")
-        assertNotNull(result.last<CalibrationRequested>(), "The occurrence was never consumed")
+        assertNotNull(process.activeEpisode(occurrence), "The occurrence was never consumed")
     }
 
     @Agent(description = "Standing state maintained by a two-action cycle, read by a chain")
@@ -351,20 +355,20 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(canRerun = true, value = 0.4)
         fun ping(pong: PongState, context: ActionContext): PingState {
-            context.addObject(ExecutedStep("ping"))
+            context.share(ExecutedStep("ping"))
             return PingState(pong.id)
         }
 
         @Action(canRerun = true, value = 0.4)
         fun pong(ping: PingState, context: ActionContext): PongState {
-            context.addObject(ExecutedStep("pong"))
+            context.share(ExecutedStep("pong"))
             return PongState(ping.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Work done", value = 1.0)
         fun work(request: CalibrationRequested, ping: PingState, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("work:${request.id}"))
+            context.share(ExecutedStep("work:${request.id}"))
             return CalibrationCompleted(request.id)
         }
     }
@@ -384,6 +388,172 @@ class GoalEpisodeFrameworkDispatchTest {
         assertNotNull(result.last<PingState>(), "Cycle-maintained state was never consumed nor hidden")
         val works = result.objects.filterIsInstance<ExecutedStep>().count { it.name.startsWith("work") }
         assertEquals(2, works, "Both runs read the cycle-maintained state")
+    }
+
+    @Agent(description = "A high-value goal that cannot run beside a modest one that can")
+    inner class DeadWinnerAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun draftSurvey(request: PaintRequested, license: SurveyLicense, context: ActionContext): SurveyDraft {
+            context.share(ExecutedStep("draft:${request.id}"))
+            return SurveyDraft(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Survey filed", value = 1.0)
+        fun fileSurvey(draft: SurveyDraft, context: ActionContext): SurveyFiled {
+            context.share(ExecutedStep("file:${draft.id}"))
+            return SurveyFiled(draft.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
+            context.share(ExecutedStep("prep:${request.id}"))
+            return PreparedSurface(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Surface painted", value = 0.5)
+        fun paint(surface: PreparedSurface, context: ActionContext): SurfacePainted {
+            context.share(ExecutedStep("paint:${surface.id}"))
+            return SurfacePainted(surface.id)
+        }
+    }
+
+    @Test
+    fun `a blocked winner releases the contest - the runnable rival completes the work`() {
+        // Ownership is decided by declared value, but the child's run is
+        // the verdict: when the winner's child blocks, the contest reopens
+        // and the next candidate gets the occurrence. Work goes to the rule
+        // that can actually do it
+        val process = dispatching(DeadWinnerAgent())
+        process.evolve(PaintRequested("job-1"))
+
+        val result = process.run()
+
+        assertNull(result.last<PaintRequested>(), "The occurrence found the rule that could run it")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue("paint:job-1" in steps, "The runnable rival completed the work: $steps")
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
+    }
+
+    @Agent(description = "Two contesting goals, both blocked")
+    inner class DeadlockedRivalsAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun draftSurvey(request: PaintRequested, license: SurveyLicense, context: ActionContext): SurveyDraft {
+            context.share(ExecutedStep("draft:${request.id}"))
+            return SurveyDraft(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Survey filed", value = 1.0)
+        fun fileSurvey(draft: SurveyDraft, context: ActionContext): SurveyFiled {
+            context.share(ExecutedStep("file:${draft.id}"))
+            return SurveyFiled(draft.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepSurface(request: PaintRequested, can: PaintCan, context: ActionContext): PreparedSurface {
+            context.share(ExecutedStep("prep:${request.id}"))
+            return PreparedSurface(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Surface painted", value = 0.5)
+        fun paint(surface: PreparedSurface, context: ActionContext): SurfacePainted {
+            context.share(ExecutedStep("paint:${surface.id}"))
+            return SurfacePainted(surface.id)
+        }
+    }
+
+    @Test
+    fun `a reopened contest leaves no arrival bookkeeping when it completes`() {
+        // The blocked-contestant record is per-occurrence state: a long
+        // running process must not accumulate it past completion
+        val process = dispatching(DeadWinnerAgent())
+        val occurrence = process.evolve(PaintRequested("job-1"))
+        val result = process.run()
+        assertNull(result.last<PaintRequested>(), "the rival completed the occurrence")
+        assertEquals(0, process.retainedArrivalBookkeeping, "no arrival bookkeeping survives completion")
+    }
+
+    @Test
+    fun `an unresolved contest parks without runtime candidate reconstruction`() {
+        val process = dispatching(DeadlockedRivalsAgent())
+        val occurrence = process.evolve(PaintRequested("job-1"))
+
+        val stalled = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
+        assertEquals(
+            0,
+            process.frameworkChildCount,
+            "The runtime does not derive contestant missions from the action graph",
+        )
+
+        val again = stalled.run()
+
+        assertEquals(0, process.frameworkChildCount, "An unchanged world buys no inferred attempts")
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
+    }
+
+    @Agent(description = "An action reading its request by an interface type")
+    inner class InterfaceInputAgent {
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Job done", value = 1.0)
+        fun handle(job: JobRequest, context: ActionContext): JobHandled {
+            context.share(ExecutedStep("handle:${job.id}"))
+            return JobHandled(job.id)
+        }
+    }
+
+    @Test
+    fun `a sibling of the request's interface type does not hijack the binding`() {
+        // The planner-selected occurrence is inserted last in the child.
+        // The sibling remains ordinary standing work and may run later in
+        // the root, but it cannot replace the selected child occurrence.
+        val process = dispatching(InterfaceInputAgent())
+        process.evolve(FooRequest("occurrence"))
+        process.addObject(BarRequest("newer-sibling"))
+        val result = process.run()
+        val child = process.frameworkChildren.single()
+        assertEquals("occurrence", child.last<JobHandled>()?.id)
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("handle:occurrence", "handle:newer-sibling"),
+            steps,
+            "The child bound its occurrence before the root handled standing work: $steps",
+        )
+    }
+
+    @Agent(description = "A chain gated by an externally set named condition")
+    inner class ExternalConditionAgent {
+        @Action(pre = ["cleared"], canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            context.share(ExecutedStep("calibrate:${request.id}"))
+            return CalibrationCompleted(request.id)
+        }
+    }
+
+    @Test
+    fun `a block lifts when a named condition changes with no object change`() {
+        // The block record fingerprints conditions as well as objects, so a
+        // condition set with no object change still counts as the world
+        // changing and the blocked episode is tried again
+        val process = dispatching(ExternalConditionAgent())
+        process.evolve(CalibrationRequested("cal-1"))
+        val stalled = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "no cleared condition, the chain cannot start")
+
+        stalled.processContext.blackboard.setCondition("cleared", true)
+        stalled.signalWorldChange()
+        val resumed = stalled.run()
+
+        val steps = resumed.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue("calibrate:cal-1" in steps, "the condition change lifted the block: $steps")
     }
 
     private fun dispatching(
@@ -415,11 +585,11 @@ class GoalEpisodeFrameworkDispatchTest {
 
     @Test
     fun `an evolved episode runs in a framework child - the developer never sees the platform`() {
-        val added = mutableListOf<Any>()
+        var episodeCompletions = 0
         val listener = object : com.embabel.agent.api.event.AgenticEventListener {
             override fun onProcessEvent(event: com.embabel.agent.api.event.AgentProcessEvent) {
-                if (event is com.embabel.agent.api.event.ObjectAddedEvent) {
-                    added.add(event.value)
+                if (event is com.embabel.agent.api.event.EpisodeCompletedEvent) {
+                    episodeCompletions++
                 }
             }
         }
@@ -439,26 +609,23 @@ class GoalEpisodeFrameworkDispatchTest {
 
         val result = process.run()
 
-        assertTrue(
-            added.any { it is CalibrationCompleted },
-            "Merged child outputs publish through the process event path, visible to listeners",
-        )
-
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
         val children = process.frameworkChildren
         assertEquals(1, children.size, "The framework spawned exactly one child for the occurrence")
         assertEquals(result.id, children.single().parentId, "The platform recorded the parent lineage")
         assertEquals(
             AgentProcessStatusCode.COMPLETED, children.single().status,
-            "The synthesized child ran the chain to its goal",
+            "The planner-issued child mission ran to completion",
         )
+        assertEquals(1, episodeCompletions, "Planner-directed completion emitted one episode event")
         assertNull(result.last<CalibrationRequested>(), "The occurrence was consumed")
-        assertNull(result.last<CalibrationKit>(), "The chain's intermediate was consumed as the episode's consumable")
-        assertNull(result.last<CalibrationCompleted>(), "The satisfying output was consumed")
+        assertNull(result.last<CalibrationKit>(), "Child-local intermediates never crossed into root state")
+        assertNull(result.last<CalibrationCompleted>(), "Child-local output disappeared with the attempt")
+        assertNotNull(children.single().last<CalibrationCompleted>(), "The output existed in the child")
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
             listOf("prep:cal-1", "calibrate:cal-1"), steps,
-            "The chain's standing writes merged back: authoring is rung-identical",
+            "Only explicitly shared standing traces crossed the child seam",
         )
     }
 
@@ -466,8 +633,8 @@ class GoalEpisodeFrameworkDispatchTest {
     fun `the batch mission runs unchanged under framework dispatch - self-chaining and standing state survive`() {
         // The decisive standing-state test: the tally advances via addObject
         // inside the chain, and the follow-up occurrence is evolved from
-        // inside the framework child. Merge-back returns the tally; evolve
-        // delegates up the tower to the owning evolving parent
+        // inside the framework child. Explicit share transfers the tally;
+        // evolve delegates up the tower to the owning evolving parent
         val process = dispatching(
             PlainBatchMissionAgent(),
             SampleTally(0),
@@ -479,7 +646,7 @@ class GoalEpisodeFrameworkDispatchTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The committed objective ended the mission")
         assertEquals(200, result.last<BatchMissionDone>()?.samples, "Four child episodes accumulated to the target")
-        assertEquals(200, result.last<SampleTally>()?.count, "The accumulator merged back from every child")
+        assertEquals(200, result.last<SampleTally>()?.count, "The accumulator was shared from every child")
         assertEquals(4, process.frameworkChildren.size, "One framework child per occurrence")
         assertNull(result.last<BatchRequested>(), "Every occurrence was consumed, including tower-delegated ones")
         assertNull(result.last<BatchCollected>(), "Every satisfying output was consumed")
@@ -520,7 +687,7 @@ class GoalEpisodeFrameworkDispatchTest {
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
             attempts++
-            context.addObject(ExecutedStep("attempt:$attempts"))
+            context.share(ExecutedStep("attempt:$attempts"))
             if (attempts == 1) {
                 throw IllegalStateException("flaky calibration")
             }
@@ -554,12 +721,16 @@ class GoalEpisodeFrameworkDispatchTest {
     @Test
     fun `a blocked child consumes nothing and redispatches when the world changes`() {
         val process = dispatching(PlainPaintingAgent())
-        process.evolve(PaintRequested("job-1"))
+        val occurrence = process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No can, so the child stalls before work")
-        assertNotNull(stalled.last<PaintRequested>(), "A blocked episode must not consume its request")
+        assertEquals(
+            EpisodeState.STUCK,
+            process.activeEpisode(occurrence)?.state,
+            "A blocked episode must retain its occurrence",
+        )
         assertTrue(
             stalled.objects.filterIsInstance<ExecutedStep>().isEmpty(),
             "GOAP in the child refuses to start a chain it cannot finish: no stranded prep",
@@ -569,7 +740,7 @@ class GoalEpisodeFrameworkDispatchTest {
         val painted = stalled.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, painted.status)
-        assertNull(painted.last<PaintRequested>(), "The redispatched child completed and consumed")
+        assertNull(process.activeEpisode(occurrence), "The redispatched child completed and consumed")
         assertNotNull(painted.last<PaintCan>(), "The can is used, not consumed")
         val steps = painted.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("prep:job-1", "paint:job-1"), steps, "The chain ran whole in the successful child")
@@ -591,7 +762,7 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Link forged", value = 1.0)
         fun forgeLink(request: BatchRequested, context: ActionContext): BatchCollected {
-            context.agentProcess.evolve(BatchRequested(request.id + 1))
+            context.evolve(BatchRequested(request.id + 1))
             return BatchCollected(request.id)
         }
     }
@@ -624,10 +795,17 @@ class GoalEpisodeFrameworkDispatchTest {
             "The action budget bounded the dispatch loop",
         )
         assertEquals(5, process.frameworkChildren.size, "One child per budgeted action, then the brake")
-        assertNotNull(result.last<BatchRequested>(), "The unbounded chain's next occurrence stayed unconsumed")
+        assertTrue(
+            process.retainedArrivalBookkeeping > 0,
+            "The unbounded chain's next occurrence stayed in the ledger",
+        )
         assertTrue(
             process.lastCompletedEpisode?.causedBy?.request is BatchRequested,
             "A follow-up published from inside a child records the dispatching episode as its cause",
+        )
+        assertTrue(
+            process.lastCompletedEpisode?.publishedBy?.endsWith(".forgeLink") == true,
+            "ctx.evolve records the publishing action across the child boundary",
         )
     }
 
@@ -637,7 +815,7 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.4)
         @AchievesGoal(description = "Surface painted", value = 1.0)
         fun paint(request: PaintRequested, can: PaintCan, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${request.id}"))
+            context.share(ExecutedStep("paint:${request.id}"))
             return SurfacePainted(request.id)
         }
 
@@ -646,7 +824,7 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(pre = ["collecting"], canRerun = true, value = 0.6)
         fun weld(tally: SampleTally, context: ActionContext): SampleTally {
-            context.addObject(ExecutedStep("weld"))
+            context.share(ExecutedStep("weld"))
             return SampleTally(tally.count + 1)
         }
 
@@ -666,11 +844,11 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.1)
         @AchievesGoal(description = "Batch collected", value = 0.2)
         fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
-            context.addObject(ExecutedStep("batch:${request.id}"))
+            context.share(ExecutedStep("batch:${request.id}"))
             val next = SampleTally(tally.count + 50)
-            context.addObject(next)
+            context.share(next)
             if (next.count < 150) {
-                context.agentProcess.evolve(BatchRequested(request.id + 1))
+                context.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
@@ -683,7 +861,7 @@ class GoalEpisodeFrameworkDispatchTest {
 
         @Action(pre = ["welding"], canRerun = true, value = 0.9)
         fun weld(missions: MissionTally, context: ActionContext): MissionTally {
-            context.addObject(ExecutedStep("weld"))
+            context.share(ExecutedStep("weld"))
             return MissionTally(missions.count + 1)
         }
 
@@ -727,28 +905,28 @@ class GoalEpisodeFrameworkDispatchTest {
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Batch collected", value = 1.0)
         fun collectBatch(request: BatchRequested, tally: SampleTally, context: ActionContext): BatchCollected {
-            context.addObject(ExecutedStep("batch:${request.id}"))
+            context.share(ExecutedStep("batch:${request.id}"))
             val next = SampleTally(tally.count + 50)
-            context.addObject(next)
+            context.share(next)
             if (next.count == 100) {
-                context.agentProcess.evolve(HazardDetected("spill-1"))
+                context.evolve(HazardDetected("spill-1"))
             }
             if (next.count < 150) {
-                context.agentProcess.evolve(BatchRequested(request.id + 1))
+                context.evolve(BatchRequested(request.id + 1))
             }
             return BatchCollected(request.id)
         }
 
         @Action(canRerun = true, value = 0.7)
         fun assess(hazard: HazardDetected, context: ActionContext): HazardAssessed {
-            context.addObject(ExecutedStep("assess:${hazard.id}"))
+            context.share(ExecutedStep("assess:${hazard.id}"))
             return HazardAssessed(hazard.id)
         }
 
         @Action(canRerun = true, value = 0.8)
         @AchievesGoal(description = "Hazard cleared", value = 1.0)
         fun clear(assessed: HazardAssessed, context: ActionContext): HazardCleared {
-            context.addObject(ExecutedStep("clear:${assessed.id}"))
+            context.share(ExecutedStep("clear:${assessed.id}"))
             return HazardCleared(assessed.id)
         }
 
@@ -765,18 +943,27 @@ class GoalEpisodeFrameworkDispatchTest {
         val process = dispatching(
             HazardousMissionAgent(),
             SampleTally(0),
-            objective = GoalTarget.output(BatchMissionDone::class.java),
             hybrid = true,
         )
         process.evolve(BatchRequested(1))
 
         val result = process.run()
 
-        assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
-        assertEquals(4, process.frameworkChildren.size, "Three batch children and one hazard child")
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        assertEquals(4, process.frameworkChildren.size, "Three batch occurrences and one hazard occurrence")
         assertEquals(150, result.last<BatchMissionDone>()?.samples)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertTrue("assess:spill-1" in steps && "clear:spill-1" in steps, "The hazard chain ran and merged: $steps")
+        assertTrue(
+            "assess:spill-1" in steps && "clear:spill-1" in steps,
+            "The hazard chain explicitly shared its trace: $steps",
+        )
+        assertTrue(
+            process.frameworkChildren.any { child ->
+                child.history.any { it.actionName.endsWith(".assess") } &&
+                        child.history.any { it.actionName.endsWith(".clear") }
+            },
+            "The selected planner mission executed the hazard in a child",
+        )
         // Selection ranks by declared goal value: the hazard slots into the
         // batch run exactly where its declared worth places it
         assertTrue(
@@ -803,7 +990,7 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `a blocked episode costs one observed child per world - friction is recorded, never predicted`() {
+    fun `an unselected occurrence does not become a runtime-generated child`() {
         // The sphex-wasp hazard (AIMA 3e p. 425, note 5): futile repetition.
         // Nothing is proven before dispatch - failure is welcome, and the
         // blocked child is the record an author will one day consume. The
@@ -825,7 +1012,7 @@ class GoalEpisodeFrameworkDispatchTest {
             DefaultPlannerFactory,
             Instant.now(),
         )
-        process.evolve(PaintRequested("job-1"))
+        val occurrence = process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
 
@@ -834,19 +1021,16 @@ class GoalEpisodeFrameworkDispatchTest {
             "The mission completed; doomed dispatches did not exhaust the budget",
         )
         assertEquals(3, result.last<BatchMissionDone>()?.samples, "Frame work proceeded past the blocked episode")
-        // Observation is type-blind: every weld wrote a new tally, so each
-        // of the three world changes earned the blocked episode one fresh
-        // attempt. Four children across a dozen ticks is the defense
-        // working - one per world, never one per tick
         assertEquals(
-            4, process.frameworkChildCount,
-            "One observed attempt per changed world for the blocked episode, never a per-tick spin",
+            0,
+            process.frameworkChildCount,
+            "The runtime must not turn planner obstruction into a guessed mission",
         )
         assertTrue(
             result.objects.filterIsInstance<ExecutedStep>().none { it.name.startsWith("paint") },
             "The blocked child's litter died with its board: the parent stays clean",
         )
-        assertNotNull(result.last<PaintRequested>(), "The blocked occurrence waits intact for its enabler")
+        assertEquals(EpisodeState.PENDING, process.activeEpisode(occurrence)?.state)
     }
 
     @Test

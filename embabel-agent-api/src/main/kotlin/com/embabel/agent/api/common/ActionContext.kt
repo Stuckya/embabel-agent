@@ -158,6 +158,19 @@ interface ActionContext : ExecutingOperationContext {
     override val processContext: ProcessContext
     val action: Action?
 
+    /**
+     * Submit a new occurrence to the nearest evolving process.
+     *
+     * This is the action-context spelling of [AgentProcess.evolve]; both
+     * operations append to the same occurrence ledger.
+     */
+    fun evolve(fact: Any) = agentProcess.evolve(fact, action?.name)
+
+    /**
+     * Explicitly retain standing state outside the current child attempt.
+     */
+    fun share(fact: Any) = agentProcess.share(fact)
+
     override fun promptRunner(
         llm: LlmOptions,
         toolGroups: Set<ToolGroupRequirement>,

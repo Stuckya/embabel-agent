@@ -27,6 +27,7 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
+import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -59,7 +60,7 @@ data class BetaDone(val id: String)
 
 /**
  * Episode scenarios borrowed from Russell and Norvig, Artificial Intelligence:
- * A Modern Approach (3rd edition), chapters 10 and 11, run against the derived
+ * A Modern Approach (3rd edition), chapters 10 and 11, run against the planner-session
  * evolving-mode contract. These are the high-level behaviors the book expects
  * of an online agent, pinned at scenario level so they survive refactoring.
  *
@@ -79,10 +80,8 @@ data class BetaDone(val id: String)
  * 3. A Sussman-anomaly analogue (SS10.1.3 and exercise 10.7; Sacerdoti 1975).
  *    The classic anomaly needs interleaving because subplans interfere. The
  *    episode-shaped cousin is two goals sharing an intermediate type with
- *    different requests. Neither request is on every path to the shared
- *    intermediate, so derivation excludes both goals and an evolve toward
- *    either fails at the boundary, naming why: the interference class is
- *    unreachable rather than unconfigurable.
+ *    different requests. The selected planner, rather than the evolving
+ *    runtime, resolves the interference and value contest.
  * 4. The painting problem again, under the Hybrid planner. Per-tick value
  *    selection has no complete-path guarantee, so the book's predicament is
  *    real here: prep runs, the chain stalls mid-flight, and the intermediate
@@ -97,7 +96,7 @@ class GoalEpisodeAimaTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return PreparedSurface(request.id)
         }
 
@@ -106,7 +105,7 @@ class GoalEpisodeAimaTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Surface painted", value = 1.0)
         fun paint(surface: PreparedSurface, can: PaintCan, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${surface.id}"))
+            context.share(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
     }
@@ -116,14 +115,14 @@ class GoalEpisodeAimaTest {
 
         @Action(value = 0.5)
         fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
-            context.addObject(ExecutedStep("prep:${request.id}"))
+            context.share(ExecutedStep("prep:${request.id}"))
             return PreparedSurface(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Surface painted", value = 1.0)
         fun paint(surface: PreparedSurface, can: PaintCan, context: ActionContext): SurfacePainted {
-            context.addObject(ExecutedStep("paint:${surface.id}"))
+            context.share(ExecutedStep("paint:${surface.id}"))
             return SurfacePainted(surface.id)
         }
     }
@@ -133,13 +132,13 @@ class GoalEpisodeAimaTest {
 
         @Action(canRerun = true, value = 0.2)
         fun weld(welds: WeldsCompleted, context: ActionContext): WeldsCompleted {
-            context.addObject(ExecutedStep("weld"))
+            context.share(ExecutedStep("weld"))
             val next = WeldsCompleted(welds.count + 1)
             if (next.count == 2) {
-                context.agentProcess.evolve(DoorFellOff("door-7"))
+                context.evolve(DoorFellOff("door-7"))
             }
             if (next.count == 4) {
-                context.agentProcess.evolve(DoorFellOff("door-8"))
+                context.evolve(DoorFellOff("door-8"))
             }
             return next
         }
@@ -157,26 +156,26 @@ class GoalEpisodeAimaTest {
         // chain re-runs its first step forever
         @Action(canRerun = true, value = 0.6)
         fun equipGripper(door: DoorFellOff, context: ActionContext): GripperEquipped {
-            context.addObject(ExecutedStep("equipGripper:${door.id}"))
+            context.share(ExecutedStep("equipGripper:${door.id}"))
             return GripperEquipped(door.id)
         }
 
         @Action(canRerun = true, value = 0.7)
         fun reattachDoor(gripper: GripperEquipped, context: ActionContext): DoorReattached {
-            context.addObject(ExecutedStep("reattachDoor:${gripper.id}"))
+            context.share(ExecutedStep("reattachDoor:${gripper.id}"))
             return DoorReattached(gripper.id)
         }
 
         @Action(canRerun = true, value = 0.8)
         fun notifySupervisor(door: DoorReattached, context: ActionContext): SupervisorNotified {
-            context.addObject(ExecutedStep("notifySupervisor:${door.id}"))
+            context.share(ExecutedStep("notifySupervisor:${door.id}"))
             return SupervisorNotified(door.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Repair completed", value = 1.0)
         fun swapBackToWelder(notified: SupervisorNotified, context: ActionContext): RepairCompleted {
-            context.addObject(ExecutedStep("swapBack:${notified.id}"))
+            context.share(ExecutedStep("swapBack:${notified.id}"))
             return RepairCompleted(notified.id)
         }
     }
@@ -233,7 +232,7 @@ class GoalEpisodeAimaTest {
             "aima-painting-problem",
             ProcessOptions.DEFAULT.withEvolving(),
         )
-        process.evolve(PaintRequested("job-1"))
+        val firstOccurrence = process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
@@ -243,7 +242,7 @@ class GoalEpisodeAimaTest {
         // start a chain it cannot finish. The stall happens before any
         // work: no wasted prep, request untouched
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertNotNull(stalled.last<PaintRequested>(), "A stalled episode must not consume its request")
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(firstOccurrence)?.state)
         assertNull(stalled.last<PreparedSurface>(), "GOAP does not start a chain it cannot finish")
         assertTrue(
             stalled.objects.filterIsInstance<ExecutedStep>().isEmpty(),
@@ -254,7 +253,7 @@ class GoalEpisodeAimaTest {
         val painted = stalled.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, painted.status)
-        assertNull(painted.last<PaintRequested>(), "Completion consumed the request")
+        assertNull(process.activeEpisode(firstOccurrence), "Completion consumed the occurrence")
         assertNull(painted.last<PreparedSurface>(), "Completion consumed the intermediate")
         assertNull(painted.last<SurfacePainted>(), "Completion consumed the satisfying output")
         assertNotNull(painted.last<PaintCan>(), "The can is used, not consumed: AIMA's reusable resource")
@@ -285,30 +284,29 @@ class GoalEpisodeAimaTest {
                 .withPlannerType(PlannerType.HYBRID)
                 .withEvolving(),
         )
-        process.evolve(PaintRequested("job-1"))
+        val occurrence = process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
         assertNull(stalled.last<PreparedSurface>(), "No doomed child, no stranded prep")
-        assertNotNull(stalled.last<PaintRequested>(), "The stall must not consume the request")
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
 
         stalled.addObject(PaintCan("red"))
         val painted = stalled.run()
 
-        assertNull(painted.last<PaintRequested>(), "Completion consumed the request")
+        assertNull(process.activeEpisode(occurrence), "Completion consumed the occurrence")
         assertNull(painted.last<PreparedSurface>(), "Completion consumed the chain's own intermediate")
         assertNull(painted.last<SurfacePainted>(), "Completion consumed the satisfying output")
         assertNotNull(painted.last<PaintCan>(), "The can is still used, not consumed")
     }
 
     @Test
-    fun `the painting problem under hybrid - a blocked chain spends one child, never the budget`() {
-        // In the parent's walk, a rerunnable prep would re-run every tick
-        // toward a completion that never comes, burning the budget - the
-        // sphex loop. The observational defense: the chain gets one child
-        // in this world, its litter dies with its board, and the block is
-        // recorded friction awaiting new facts - or, one day, an author
+    fun `the painting problem under hybrid exposes the planner's native limitation`() {
+        // HYBRID's NIRVANA walk can repeat a rerunnable prefix until the
+        // child's own budget. Evolving Mode contains that behavior in one
+        // child and reports the outcome; it does not reconstruct the graph
+        // to predict or repair the planner's decision.
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-hybrid-spin",
@@ -316,14 +314,14 @@ class GoalEpisodeAimaTest {
                 .withPlannerType(PlannerType.HYBRID)
                 .withEvolving(),
         )
-        process.evolve(PaintRequested("job-1"))
+        val occurrence = process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "A blocked chain parks, never terminates the budget")
         val preps = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "prep:job-1" }
-        assertEquals(0, preps, "The prefix never ran: no child, no spin, no spend")
-        assertNotNull(result.last<PaintRequested>(), "The block never consumed the request")
+        assertEquals(50, preps, "The selected planner retained its native NIRVANA behavior")
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
         assertEquals(
             1, process.frameworkChildCount,
             "One observed attempt, contained by its boundary - the block is recorded, never re-spun",
@@ -337,9 +335,9 @@ class GoalEpisodeAimaTest {
             "aima-spot-welding",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                // The repair rule derives from the goal graph; each evolved
-                // DoorFellOff is one occurrence, and the shift's committed
-                // objective anchors the end
+                // Each DoorFellOff is one occurrence. The planner supplies
+                // its child mission, while the shift's committed objective
+                // anchors root completion.
                 .withEvolving(GoalTarget.output(ShiftReport::class.java)),
             WeldsCompleted(0),
         )
@@ -359,7 +357,7 @@ class GoalEpisodeAimaTest {
         }
         assertEquals(6, steps.count { it == "weld" }, "Standing welds resumed after each repair")
 
-        // Both occurrences and all four chain products are consumed
+        // Both occurrences are consumed; all four repair products stay child-local.
         assertNull(result.last<DoorFellOff>())
         assertNull(result.last<GripperEquipped>())
         assertNull(result.last<DoorReattached>())
@@ -369,10 +367,9 @@ class GoalEpisodeAimaTest {
     }
 
     @Test
-    fun `the sussman analogue still completes as founding-frame planning - excluded means not episodic, not not solvable`() {
-        // Non-serializable subgoals fall to the interleaving planner, as
-        // SS10.5 prescribes: exclusion draws the boundary of what episodes
-        // may serialize, and the planner solves what they may not
+    fun `the sussman analogue remains ordinary root planning without an occurrence`() {
+        // With no evolve call, the selected planner handles the standing
+        // request as ordinary root work.
         val process = create(
             SharedIntermediateAgent(),
             "aima-sussman-frame",
@@ -382,17 +379,15 @@ class GoalEpisodeAimaTest {
 
         val result = process.run()
 
-        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The frame planner solved what episodes exclude")
-        assertNotNull(result.last<AlphaDone>(), "Founding-frame achievement stands, unconsumed")
+        assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The root planner completed its declared mission")
+        assertNotNull(result.last<AlphaDone>(), "Root achievement remains standing state")
     }
 
     @Test
     fun `the sussman analogue - goals sharing an intermediate contest each arrival, and value decides`() {
-        // The declared graph says either request can reach either goal
-        // through the shared kit, so both goals are derivable and every
-        // arrival is a contest: the highest-valued goal owns it, exactly
-        // as shared input types route in default mode. The child's run
-        // decides which path actually serves the winner
+        // The planner sees that either request can reach either goal through
+        // the shared kit. It owns the value contest and supplies the winning
+        // child mission; the evolving runtime does not recreate that logic.
         val process = create(
             SharedIntermediateAgent(),
             "aima-sussman-analogue",
@@ -403,7 +398,7 @@ class GoalEpisodeAimaTest {
         val result = process.run()
 
         assertNull(result.last<BetaRequested>(), "The arrival was owned and consumed")
-        assertNull(result.last<AlphaDone>(), "The higher-valued goal won the contest and its output was consumed")
+        assertNull(result.last<AlphaDone>(), "The winning child output remained child-local")
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
     }
 }

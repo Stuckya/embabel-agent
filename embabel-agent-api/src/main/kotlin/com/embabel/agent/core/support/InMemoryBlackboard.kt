@@ -38,17 +38,23 @@ class InMemoryBlackboard(
     private val hiddens: MutableSet<Any> =
         Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap()))
     private val protectedKeys: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    private val transientEntries = ThreadLocal.withInitial { mutableListOf<Any>() }
 
     override fun spawn(): Blackboard {
         return InMemoryBlackboard().apply {
-            _map.putAll(this@InMemoryBlackboard._map)
+            _map.putAll(
+                this@InMemoryBlackboard._map.filterValues {
+                    !this@InMemoryBlackboard.isHidden(it)
+                }
+            )
             synchronized(_entries) {
-                _entries.addAll(this@InMemoryBlackboard._entries)
+                _entries.addAll(
+                    this@InMemoryBlackboard._entries.filter {
+                        !this@InMemoryBlackboard.isHidden(it)
+                    }
+                )
             }
             protectedKeys.addAll(this@InMemoryBlackboard.protectedKeys)
-            // Hiding travels with the facts: a consumed occurrence must not
-            // resurrect on a child blackboard
-            hiddens.addAll(this@InMemoryBlackboard.hiddens)
         }
     }
 
@@ -75,13 +81,29 @@ class InMemoryBlackboard(
 
     override fun reveal(what: Any): Boolean = hiddens.remove(what)
 
+    override fun <T> withTransientObject(
+        value: Any,
+        block: () -> T,
+    ): T {
+        val entries = transientEntries.get()
+        entries += value
+        return try {
+            block()
+        } finally {
+            entries.removeAt(entries.lastIndex)
+            if (entries.isEmpty()) {
+                transientEntries.remove()
+            }
+        }
+    }
+
     fun isHidden(what: Any): Boolean = hiddens.contains(what)
 
     override val objects: List<Any>
         get() = synchronized(_entries) {
             // Filter rather than minus: minus would rebuild an equality set
             // and defeat identity-based hiding. Snapshot avoids concurrent modification
-            _entries.filter { it !in hiddens }
+            _entries.filter { it !in hiddens } + transientEntries.get().toList()
         }
 
     override fun get(name: String): Any? {

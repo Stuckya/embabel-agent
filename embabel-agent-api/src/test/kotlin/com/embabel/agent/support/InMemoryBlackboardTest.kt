@@ -17,6 +17,10 @@ package com.embabel.agent.support
 
 import com.embabel.agent.core.Blackboard
 import com.embabel.agent.core.support.InMemoryBlackboard
+import org.junit.jupiter.api.Test
+import kotlin.test.assertFalse
+import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 /**
  * Tests for InMemoryBlackboard implementation.
@@ -25,6 +29,20 @@ class InMemoryBlackboardTest : AbstractBlackboardTest() {
 
     override fun createBlackboard(): Blackboard {
         return InMemoryBlackboard()
+    }
+
+    @Test
+    fun `transient objects are thread-scoped and never retained`() {
+        val blackboard = InMemoryBlackboard()
+        val occurrence = Dog("transient-occurrence")
+
+        blackboard.withTransientObject(occurrence) {
+            assertSame(occurrence, blackboard.objects.last())
+            assertTrue(blackboard.infoString().contains(occurrence.toString()).not())
+        }
+
+        assertTrue(blackboard.objects.isEmpty())
+        assertFalse(blackboard.infoString().contains(occurrence.toString()))
     }
 }
 

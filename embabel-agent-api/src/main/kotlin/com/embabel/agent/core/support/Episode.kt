@@ -15,22 +15,16 @@
  */
 package com.embabel.agent.core.support
 
+import com.embabel.agent.core.OccurrenceId
+
 /**
- * One run of an episode at runtime: the request that begins it, the
- * objects its actions have made, and where it stands in its lifecycle.
- * The request's arrival begins the episode and its consumption ends it.
- * Episode rules are derived from the goal graph at construction; each
- * fact arriving through evolve becomes an Episode. At most one Episode
- * per rule is ACTIVE. Later arrivals wait PENDING, hidden until admitted,
- * so each chain reads exactly its own request.
+ * Runtime lifecycle record for one evolved occurrence.
  *
- * Consumables are the per-run products: instances a chain
- * action made for this occurrence, recorded by identity as they appear.
- * Completion consumes the request and the completed candidate's consumables,
- * exactly what this occurrence made and nothing else. Off-chain inputs and
- * standing state are used, not consumed, and survive.
+ * It deliberately contains no derived goal, action chain, consumable types,
+ * planner score, or blocker analysis. Those are planning concerns.
  */
 internal class Episode(
+    val id: OccurrenceId,
     val request: Any,
     val causedBy: Episode? = null,
     val publishedBy: String? = null,
@@ -39,52 +33,55 @@ internal class Episode(
     var state: EpisodeState = EpisodeState.PENDING
         private set
 
-    private val consumables = mutableListOf<AttributedConsumable>()
+    var attemptCount: Int = 0
+        private set
 
-    fun activate() {
-        check(state == EpisodeState.PENDING) { "Only a PENDING episode can activate, not $state" }
-        state = EpisodeState.ACTIVE
+    var waitingSinceRevision: Long? = null
+        private set
+
+    fun run() {
+        check(state == EpisodeState.PENDING || state == EpisodeState.STUCK) {
+            "Only a PENDING or STUCK episode can run, not $state"
+        }
+        state = EpisodeState.RUNNING
+        waitingSinceRevision = null
+        attemptCount++
+    }
+
+    fun await(revision: Long) {
+        check(state != EpisodeState.COMPLETED && state != EpisodeState.CANCELLED) {
+            "A terminal episode cannot become STUCK: $state"
+        }
+        state = EpisodeState.STUCK
+        waitingSinceRevision = revision
+    }
+
+    fun retry() {
+        check(state == EpisodeState.RUNNING) { "Only a RUNNING episode can retry, not $state" }
+        state = EpisodeState.PENDING
     }
 
     fun complete() {
-        check(state == EpisodeState.ACTIVE) { "Only an ACTIVE episode can complete, not $state" }
+        check(state == EpisodeState.RUNNING) { "Only a RUNNING episode can complete, not $state" }
         state = EpisodeState.COMPLETED
     }
 
-    fun record(actionName: String, instance: Any) {
-        consumables += AttributedConsumable(actionName, instance)
+    fun cancel() {
+        check(state != EpisodeState.COMPLETED && state != EpisodeState.CANCELLED) {
+            "A terminal episode cannot be cancelled: $state"
+        }
+        state = EpisodeState.CANCELLED
     }
 
-    /** Consumables made by the given chain actions, in production order */
-    fun consumablesFrom(chainActionNames: Set<String>): List<Any> =
-        consumables.filter { it.actionName in chainActionNames }.map { it.instance }
-
     override fun toString(): String =
-        "Episode(state=$state, request=$request, consumables=${consumables.size}" +
-                (causedBy?.let { ", causedBy=${it.request}" } ?: "") + ")"
-
+        "Episode(id=$id, state=$state, attempts=$attemptCount, request=$request" +
+                (causedBy?.let { ", causedBy=${it.id}" } ?: "") + ")"
 }
-
-/**
- * The founding episode's request: the facts already on the blackboard when
- * the process was created. In evolving mode the whole process is treated
- * as one outermost episode, so even work belonging to no smaller episode
- * has an episode to answer for it, and a parent process can treat this
- * entire process as a single episode of its own.
- */
-internal data class FoundingFacts(val seeds: List<Any>)
-
-/**
- * A consumable attributed to the chain action that made it, so completion
- * can consume the completed candidate's consumables and no other's.
- */
-internal data class AttributedConsumable(
-    val actionName: String,
-    val instance: Any,
-)
 
 internal enum class EpisodeState {
     PENDING,
-    ACTIVE,
+    RUNNING,
+    STUCK,
     COMPLETED,
+    CANCELLED,
 }

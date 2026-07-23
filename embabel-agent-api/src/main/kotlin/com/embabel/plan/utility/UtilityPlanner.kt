@@ -17,6 +17,8 @@ package com.embabel.plan.utility
 
 import com.embabel.plan.Action
 import com.embabel.plan.Goal
+import com.embabel.plan.Plan
+import com.embabel.plan.PlanningSessionRequest
 import com.embabel.plan.common.condition.AbstractConditionPlanner
 import com.embabel.plan.common.condition.ConditionAction
 import com.embabel.plan.common.condition.ConditionGoal
@@ -30,6 +32,20 @@ import com.embabel.plan.common.condition.WorldStateDeterminer
 class UtilityPlanner(
     worldStateDeterminer: WorldStateDeterminer,
 ) : AbstractConditionPlanner(worldStateDeterminer) {
+
+    override fun episodeMissionGoals(
+        plan: Plan,
+        request: PlanningSessionRequest,
+    ): Set<Goal> {
+        val nirvana = request.planningSystem.goals.filter { it.name == NIRVANA }
+        return if (plan.goal.name == NIRVANA) {
+            request.planningSystem.goals
+                .filterNot { it.name in request.rootMission?.goalNames.orEmpty() }
+                .toSet()
+        } else {
+            setOf(plan.goal) + nirvana
+        }
+    }
 
     override fun planToGoal(
         actions: Collection<Action>,

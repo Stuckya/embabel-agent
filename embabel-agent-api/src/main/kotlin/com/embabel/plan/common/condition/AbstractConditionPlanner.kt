@@ -15,6 +15,10 @@
  */
 package com.embabel.plan.common.condition
 
+import com.embabel.plan.Goal
+import com.embabel.plan.Plan
+import com.embabel.plan.PlanningSession
+import com.embabel.plan.PlanningSessionRequest
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
@@ -27,4 +31,21 @@ abstract class AbstractConditionPlanner(
     final override fun worldState(): ConditionWorldState {
         return worldStateDeterminer.determineWorldState()
     }
+
+    final override fun openSession(request: PlanningSessionRequest): PlanningSession =
+        ConditionPlanningSession(
+            planner = this,
+            request = request,
+            missionGoals = ::episodeMissionGoals,
+        )
+
+    /**
+     * Planner-owned construction of a child mission. GOAP's natural mission
+     * is the goal of its selected plan; value-walking planners can widen
+     * this in their own implementations.
+     */
+    protected open fun episodeMissionGoals(
+        plan: Plan,
+        request: PlanningSessionRequest,
+    ): Set<Goal> = setOf(plan.goal)
 }

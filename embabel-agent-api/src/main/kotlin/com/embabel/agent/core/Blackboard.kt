@@ -144,6 +144,21 @@ interface Blackboard : Bindable, MayHaveLastResult, HasInfoString {
     fun reveal(what: Any): Boolean
 
     /**
+     * Make [value] visible only while [block] runs.
+     *
+     * Planning uses this for an occurrence-scoped view: the occurrence is
+     * neither standing state nor retained after the planning call. Custom
+     * blackboards must implement this capability to support evolving mode.
+     */
+    @ApiStatus.Internal
+    fun <T> withTransientObject(
+        value: Any,
+        block: () -> T,
+    ): T = throw UnsupportedOperationException(
+        "${javaClass.name} does not support transient planning objects"
+    )
+
+    /**
      * Threadsafe get or put
      */
     fun <V : Any> getOrPut(

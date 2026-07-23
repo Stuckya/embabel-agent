@@ -39,6 +39,14 @@ interface PlanningSystem : HasInfoString {
 interface Planner<S : PlanningSystem, W : WorldState, P : Plan> {
 
     /**
+     * Open the process-lifetime planning interface used by Evolving Mode.
+     *
+     * Implementations must use their own planning semantics; the evolving
+     * runtime does not adapt [planToGoal] by reconstructing planner logic.
+     */
+    fun openSession(request: PlanningSessionRequest): PlanningSession
+
+    /**
      * Current world state
      */
     fun worldState(): W

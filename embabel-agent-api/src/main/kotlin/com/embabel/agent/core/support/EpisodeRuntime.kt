@@ -16,30 +16,33 @@
 package com.embabel.agent.core.support
 
 import com.embabel.agent.api.event.EpisodeCompletedEvent
+import com.embabel.agent.api.event.OccurrenceAcceptedEvent
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.ActionStatus
-import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.Blackboard
-import com.embabel.agent.core.Goal
-import com.embabel.agent.core.IoBinding
-import com.embabel.agent.core.JvmType
-import com.embabel.plan.Plan
-import com.embabel.plan.PlanningSystem
+import com.embabel.agent.core.GoalTarget
+import com.embabel.agent.core.OccurrenceId
+import com.embabel.plan.ExecutionOutcome
+import com.embabel.plan.ExecutionOutcomeCode
+import com.embabel.plan.PlanningDirective
+import com.embabel.plan.PlanningEpisodeState
+import com.embabel.plan.PlanningEpisodeView
+import com.embabel.plan.PlanningSession
+import com.embabel.plan.PlanningSessionRequest
+import com.embabel.plan.PlanningTurn
+import com.embabel.plan.RootMission
 import com.embabel.plan.WorldState
 import org.slf4j.LoggerFactory
-import java.util.Collections
-import java.util.IdentityHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
- * The episode machinery for one evolving process: derivation, admission,
- * routing, the visibility windows, publisher tracking, dispatch selection,
- * and completion bookkeeping. The process owns its run loop and status;
- * the runtime owns every episode decision inside it, borrowing exactly the
- * two process powers it declares - setting status and resuming. Outside evolving
- * mode evolve hands the fact to the nearest evolving ancestor or fails
- * fast, and every other path is inert.
+ * Mechanical occurrence and child lifecycle for one evolving process.
+ *
+ * Planning decisions cross exactly one seam: [PlanningSession.next]. This
+ * runtime never derives rules, walks goals or actions, selects a goal,
+ * scores work, constructs a chain, infers consumables, or diagnoses a
+ * blocker.
  */
 internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
@@ -48,479 +51,190 @@ internal class EpisodeRuntime(
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
-
-    private val blackboard: Blackboard get() = process.blackboard
-    private val agent: Agent get() = process.agent
-    private val planner get() = process.planner
-    private val id: String get() = process.id
-
-    /**
-     * In evolving mode every episode rule is derived from the goal graph at
-     * construction, with underivable goals excluded and their reasons kept
-     * for the evolve call site. Null outside evolving mode.
-     */
-    private val evolvingDeclared: Boolean = process.processOptions.evolving != null
-
-    /**
-     * Derivation runs when a fact first asks for it, against the agent as
-     * it stands then - not at construction, because a running process may
-     * change. The result is kept until something invalidates it, which is
-     * the seam a future scope change will use: the next arrival after an
-     * invalidation derives against the changed declarations, live.
-     */
-    private var derivedScopeCache: DerivedEvolvingScope? = null
-
-    private val derivedScope: DerivedEvolvingScope?
-        get() {
-            if (!evolvingDeclared) {
-                return null
-            }
-            derivedScopeCache?.let { return it }
-            val derived = EpisodeDerivation.deriveEvolving(agent, process.processOptions.evolving?.objective)
-            derivedScopeCache = derived
-            return derived
-        }
-
-    /** Episode rules, derived at first need. Empty outside evolving mode. */
-    private val derivedRules: List<DerivedEpisodeRule>
-        get() = derivedScope?.rules.orEmpty()
+    private val evolvingDeclaration = process.processOptions.evolving
 
     init {
-        // Dispatch would reject an ephemeral parent only at first dispatch,
-        // mid-mission: the conflicting declarations fail here
-        require(!evolvingDeclared || !process.processOptions.ephemeral) {
-            "An ephemeral process cannot evolve: episodes execute in child processes, " +
-                    "which require the persistence the ephemeral declaration disclaims"
+        require(evolvingDeclaration == null || !process.processOptions.ephemeral) {
+            "An ephemeral process cannot evolve: episodes execute in child processes"
         }
     }
 
-    /**
-     * Rules that have admitted at least one occurrence. A goal's
-     * episodicity is established by its first observed occurrence: before
-     * that the goal is founding frame, and after that its exclusive chain
-     * is the episode machinery's, not the parent planner's.
-     */
-    private val activatedRules = mutableSetOf<DerivedEpisodeRule>()
-
-    /**
-     * In evolving mode the whole process is treated as one outermost
-     * episode, active from construction. Its request is the set of facts
-     * already on the blackboard at creation. Work that belongs to no
-     * smaller episode runs inside it, so when that work publishes a fact
-     * through evolve, this episode is recorded as the publisher.
-     */
-    /**
-     * The goals whose completion completes the process, resolved eagerly:
-     * stale instances of their output types must be hidden before any work
-     * runs, and an objective naming no goal must fail at construction.
-     */
     private val objectiveGoals: Set<String> =
-        process.processOptions.evolving
-            ?.let { EpisodeDerivation.resolveObjective(it.objective, agent) }
-            .orEmpty()
+        evolvingDeclaration?.let { resolveObjective(it.objective) }.orEmpty()
 
-    private val foundingEpisode: Episode? =
-        if (evolvingDeclared) Episode(FoundingFacts(blackboard.objects.toList())).also(Episode::activate) else null
-
-    /**
-     * Goals outside any episode that were already achieved: recorded and
-     * removed from planning so the process goes back to its long-running
-     * work instead of ending, or doing the same thing again. Only the
-     * declared objective ends the process.
-     */
-    private val achievedFrameGoals = mutableSetOf<String>()
-
-    /**
-     * Instances of the objective's output type that were already on the
-     * blackboard at creation. Left visible, they would look like the
-     * objective was already met, and the process could neither finish
-     * properly nor plan toward finishing. They are hidden here and made
-     * visible again when the process completes.
-     */
-    private val foundingShadow: List<Any> = shadowFoundingObjective()
-
-    private fun shadowFoundingObjective(): List<Any> {
-        if (!evolvingDeclared || objectiveGoals.isEmpty()) {
-            return emptyList()
+    private val session: PlanningSession? =
+        evolvingDeclaration?.let {
+            process.planner.openSession(
+                PlanningSessionRequest(
+                    planningSystem = process.agent.planningSystem,
+                    rootMission = objectiveGoals.takeIf(Set<String>::isNotEmpty)?.let(::RootMission),
+                )
+            )
         }
-        val satisfyingClasses = agent.goals
-            .filter { it.name in objectiveGoals }
-            .mapNotNull { goal ->
-                val resolved = (goal.outputType as? JvmType)
-                    ?.let { IoBinding(it.className).resolveJvmType()?.clazz }
-                if (resolved == null) {
-                    logger.warn(
-                        "Process {} cannot resolve the satisfying type of objective goal {}: " +
-                                "construction-time instances of it will not be shadowed",
-                        id,
-                        goal.name,
-                    )
-                }
-                resolved
-            }
-        if (satisfyingClasses.isEmpty()) {
-            return emptyList()
-        }
-        val shadowed = blackboard.objects.filter { instance ->
-            satisfyingClasses.any { it.isInstance(instance) }
-        }
-        shadowed.forEach(blackboard::hide)
-        return shadowed
-    }
 
-    /**
-     * Serial admission: each arriving occurrence becomes an [Episode], and
-     * at most one Episode per rule is ACTIVE. Later arrivals wait PENDING,
-     * hidden and queued FIFO, admitted when the active episode completes.
-     * A pending request never changes type-level conditions because the
-     * active request of the same type stays visible.
-     */
-    private val admissionSeen: MutableSet<Any> =
-        Collections.newSetFromMap(IdentityHashMap())
-
-    /**
-     * Instances published as occurrences, each mapped to the episode whose
-     * action published it, if any: the publisher is captured at the moment
-     * of publication. The call site decides what a fact is: a fact
-     * published through evolve starts an episode, while a fact added
-     * through addObject is ordinary shared state, even when both have the
-     * same type.
-     */
-    private val evolvedArrivals: MutableMap<Any, EvolveOrigin> = IdentityHashMap()
-
-    private data class EvolveOrigin(
+    private data class AcceptedOccurrence(
+        val id: OccurrenceId,
+        val occurrence: Any,
         val causedBy: Episode?,
         val publishedBy: String?,
-        val owner: DerivedEpisodeRule? = null,
     )
 
-    /**
-     * The episode evolve attributes publications to right now: the founding
-     * episode during a frame action, the dispatching episode during a child
-     * run. Pure publisher tracking - no chain action ever executes here.
-     */
-    private var executingEpisode: Episode? = null
+    private val acceptedOccurrences = ConcurrentLinkedQueue<AcceptedOccurrence>()
+    private val episodes = linkedMapOf<OccurrenceId, Episode>()
+    private val outcomes = ArrayDeque<ExecutionOutcome>()
+    private val missions = mutableMapOf<OccurrenceId, com.embabel.plan.ChildMission>()
+    private val executor by lazy { EpisodeExecutor(process) }
 
-    /** The name of the frame action currently executing, if any */
-    private var executingAction: String? = null
+    private var revision: Long = 0
+    private val executingEpisode = ThreadLocal<Episode?>()
+    private val executingAction = ThreadLocal<String?>()
 
-    /**
-     * The most recently completed episode, kept so callers can inspect
-     * what just finished and who published what. Completed episodes are
-     * otherwise discarded.
-     */
     var lastCompletedEpisode: Episode? = null
         private set
 
-    private val pendingEpisodes = mutableMapOf<DerivedEpisodeRule, ArrayDeque<Episode>>()
-    private val activeEpisodes = mutableMapOf<DerivedEpisodeRule, Episode>()
-
-    /**
-     * Pre-existing instances hidden for the length of an episode: without
-     * this, an old object of a type the episode is meant to produce would
-     * make the goal look already satisfied, and the episode would complete
-     * without running its chain. Hidden when the episode starts, made
-     * visible again when it completes - hidden, never consumed.
-     */
-    private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
-
-    /**
-     * The episode execution adapter: it runs already-selected
-     * episodes and supplies the values selection ranks. Selection itself
-     * stays with the planner.
-     */
-    private val executor: EpisodeExecutor by lazy {
-        EpisodeExecutor(process)
-    }
-
-    /** Recent framework children, bounded, for inspection */
     val frameworkChildren: List<AgentProcess> get() = executor.recentChildrenView
 
-    /** Total framework children ever dispatched */
     val frameworkChildCount: Int get() = executor.childCount
 
-    /** Whether this process declared evolving mode, for platform wiring */
-    val isEvolving: Boolean get() = evolvingDeclared
+    val retainedArrivalBookkeeping: Int
+        get() = acceptedOccurrences.size + episodes.size + outcomes.size + missions.size
 
-    /**
-     * Arrival bookkeeping still held, for inspection: an intentionally
-     * infinite process ingests occurrences forever, so bookkeeping retained
-     * past completion is a leak, not a record.
-     */
-    val retainedArrivalBookkeeping: Int get() = evolvedArrivals.size + admissionSeen.size
+    fun activeEpisode(id: OccurrenceId): Episode? = episodes[id]
 
-    /**
-     * Set by the platform on children of an evolving process: evolve from
-     * inside a child hands the fact to the nearest evolving ancestor,
-     * however deep the nesting, so an action publishes the same way
-     * whether it runs in the parent or in a child.
-     */
-    var evolveDelegate: ((Any) -> Unit)? = null
+    val isEvolving: Boolean get() = evolvingDeclaration != null
 
-    /**
-     * Publish a fact that asks for one run of an episode. The fact goes to
-     * the rule whose chain needs its type as an input, one run at a time,
-     * and exactly this instance is consumed when the run completes.
-     */
-    fun evolve(fact: Any) {
-        if (!evolvingDeclared) {
-            val delegate = evolveDelegate
-            require(delegate != null) {
-                "evolve requires an evolving process: declare withEvolving() on the process options"
-            }
-            delegate(fact)
-            return
+    var evolveDelegate: ((Any, String?) -> OccurrenceId)? = null
+
+    var shareDelegate: ((Any) -> Unit)? = null
+
+    fun evolve(
+        fact: Any,
+        publishedBy: String? = executingAction.get(),
+    ): OccurrenceId {
+        if (!isEvolving) {
+            return evolveDelegate?.invoke(fact, publishedBy)
+                ?: throw IllegalArgumentException(
+                    "evolve requires an evolving process: declare withEvolving() on the process options"
+                )
         }
-        val candidates = routableRules(fact)
-        requireRoutable(fact, candidates)
-        process.addObject(fact)
-        // Contested ownership stays open until the next planning tick: a
-        // mid-action evolve precedes its own action's remaining effects, so
-        // the arrival's world has not materialized yet
-        evolvedArrivals[fact] = EvolveOrigin(executingEpisode, executingAction, candidates.singleOrNull())
-    }
-
-    private fun routableRules(fact: Any): List<DerivedEpisodeRule> =
-        derivedRules.filter { it.isEvolvedEligible(fact) }
-
-    /**
-     * When more than one rule could take an arriving fact, the rule whose
-     * goal has the highest declared value in the current world owns it.
-     * Ownership is decided once and not revisited, so a rule that is busy
-     * cannot lose a fact that belongs to it. Ties go to the first-declared
-     * candidate. Other instances of the same class are hidden while the
-     * values are read, so a value function that inspects the world sees
-     * only the arriving fact.
-     */
-    private fun routeByPlan(fact: Any, candidates: List<DerivedEpisodeRule>): DerivedEpisodeRule? {
-        val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
-        competitors.forEach(blackboard::hide)
-        try {
-            // Declared values always bind: ownership resolves at the first
-            // settled tick, never earlier than the arrival's world
-            val scored = candidates.map { it to bestPlanValue(it) }
-            return scored.maxByOrNull { it.second }?.first
-        } finally {
-            competitors.forEach(blackboard::reveal)
-        }
-    }
-
-    /**
-     * Routing shares dispatch's view: a candidate is worth its goal's
-     * declared value in the current world. Nothing is proven at routing
-     * time - the owning rule's child run is the verdict on the chain.
-     */
-    private fun bestPlanValue(rule: DerivedEpisodeRule): Double =
-        rule.goalsByName.values.maxOfOrNull { goal -> goal.value(planner.worldState()) }
-            ?: Double.NEGATIVE_INFINITY
-
-    /**
-     * Fail fast at the boundary: an evolving process's evolvable types are
-     * its enforced contract. Without this, a mis-deployed publisher would
-     * believe work was scheduled while nothing ever admits the fact. In
-     * evolving mode the message also carries why derivation excluded goals,
-     * so the publisher learns what the graph could not support.
-     */
-    private fun requireRoutable(fact: Any, candidates: List<DerivedEpisodeRule>) {
-        require(candidates.isNotEmpty()) {
-            "${fact.javaClass.simpleName} cannot evolve this process: no episodic rule consumes it. " +
-                    "Evolvable types: ${evolvableTypeNames().ifEmpty { "none" }}" +
-                    describeExclusions()
-        }
-    }
-
-    private fun describeExclusions(): String {
-        val exclusions = derivedScope?.exclusions.orEmpty()
-        if (exclusions.isEmpty()) {
-            return ""
-        }
-        return ". Goals excluded from derivation: " +
-                exclusions.entries.joinToString("; ") { (goal, reason) -> "$goal ($reason)" }
-    }
-
-    private fun evolvableTypeNames(): String =
-        derivedRules.flatMap { it.evolvedEligible }.joinToString { it.simpleName }
-
-    fun admitArrivals() {
-        resolveDeferredRouting()
-        derivedRules.forEach(::admitArrivalsFor)
-        admitDeferred()
-    }
-
-    /**
-     * Resolve contested ownership left open at the evolve boundary, now
-     * that the arrival's world has settled. Arrival order remains the
-     * boundary fact; ownership is decided against the materialized world.
-     */
-    private fun resolveDeferredRouting() {
-        evolvedArrivals.entries
-            .filter { it.value.owner == null }
-            .toList()
-            .forEach { (fact, origin) ->
-                routeByPlan(fact, routableRules(fact))?.let { owner ->
-                    evolvedArrivals[fact] = origin.copy(owner = owner)
-                }
-            }
-    }
-
-    /**
-     * Admit waiting episodes once the process's own work is out of moves.
-     * Work that could end the process always runs before the next episode
-     * is allowed to start.
-     */
-    private fun admitDeferred() {
-        if (!evolvingDeclared) {
-            return
-        }
-        val idleWithPending = derivedRules.filter {
-            activeEpisodes[it] == null && !pendingEpisodes[it].isNullOrEmpty()
-        }
-        if (idleWithPending.isEmpty() || foundingWorkPlannable()) {
-            return
-        }
-        idleWithPending.forEach(::admitNext)
-    }
-
-    private fun admitArrivalsFor(rule: DerivedEpisodeRule) {
-        arrivalsFor(rule)
-            .filter { admissionSeen.add(it) }
-            .forEach { arrival ->
-                val origin = evolvedArrivals[arrival]
-                admitOrQueue(rule, Episode(arrival, origin?.causedBy, origin?.publishedBy))
-            }
-    }
-
-    /**
-     * A rule admits only instances published through [evolve], routed to
-     * their owning rule fixed at the arrival boundary.
-     */
-    private fun arrivalsFor(rule: DerivedEpisodeRule): List<Any> =
-        blackboard.objects.filter { routesTo(rule, it) }
-
-    /**
-     * An evolved arrival routes to its owning rule. Uncontested arrivals
-     * are owned at the evolve boundary; contested ones at the next tick,
-     * before any admission scan runs.
-     */
-    private fun routesTo(rule: DerivedEpisodeRule, instance: Any): Boolean =
-        evolvedArrivals[instance]?.owner == rule
-
-    private fun admitOrQueue(rule: DerivedEpisodeRule, episode: Episode) {
-        activatedRules += rule
-        // An occurrence reopens the question: the goal was achieved as
-        // state, and a fresh request makes it unachieved by definition
-        achievedFrameGoals -= rule.goalsByName.keys
-        if (activeEpisodes[rule] == null && foundingWorkPlannable()) {
-            // Work that could end the process runs before any new episode
-            // starts, whichever path the fact came in by
-            blackboard.hide(episode.request)
-            pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
-            logger.debug("Process {} deferred {}: work that could end the process runs first", id, episode)
-            return
-        }
-        if (activeEpisodes.putIfAbsent(rule, episode) == null) {
-            episode.activate()
-            groundOutcomeWindow(rule, episode)
-            logger.debug("Process {} admitted {}", id, episode)
-            return
-        }
-        blackboard.hide(episode.request)
-        pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
-        logger.debug("Process {} queued {}", id, episode)
-    }
-
-    /**
-     * Complete the active episode and consume exactly its request. Whether
-     * the next waiting episode starts is the caller's decision, because
-     * work that could end the process gets its chance first.
-     */
-    private fun completeActiveEpisode(rule: DerivedEpisodeRule): Boolean {
-        val episode = activeEpisodes.remove(rule) ?: return false
-        blackboard.hide(episode.request)
-        outcomeGroundings.remove(episode)?.forEach(blackboard::reveal)
-        // The consumed occurrence releases its arrival bookkeeping: an
-        // intentionally infinite process must not accumulate per-occurrence
-        // state past completion
-        admissionSeen.remove(episode.request)
-        evolvedArrivals.remove(episode.request)
-        episode.complete()
-        lastCompletedEpisode = episode
-        logger.debug("Process {} completed {}", id, episode)
-        return true
-    }
-
-    private fun admitNext(rule: DerivedEpisodeRule) {
-        val next = pendingEpisodes[rule]?.removeFirstOrNull() ?: return
-        if (!blackboard.reveal(next.request)) {
-            logger.warn(
-                "Process {} admitted {} but its request was not hidden; queue state may be inconsistent",
-                id,
-                next,
+        require(
+            process.status !in setOf(
+                AgentProcessStatusCode.COMPLETED,
+                AgentProcessStatusCode.FAILED,
+                AgentProcessStatusCode.KILLED,
+                AgentProcessStatusCode.TERMINATED,
             )
+        ) {
+            "Cannot evolve terminal process ${process.id} in state ${process.status}"
         }
-        next.activate()
-        activeEpisodes[rule] = next
-        groundOutcomeWindow(rule, next)
-        logger.debug("Process {} admitted queued {}", id, next)
-    }
 
-    private fun groundOutcomeWindow(rule: DerivedEpisodeRule, episode: Episode) {
-        val consumableTypes = rule.consumableTypesByGoal.values.flatten().toSet()
-        val shadowed = blackboard.objects.filter { instance ->
-            instance !== episode.request && consumableTypes.any { it.isInstance(instance) }
-        }
-        shadowed.forEach(blackboard::hide)
-        if (shadowed.isNotEmpty()) {
-            outcomeGroundings[episode] = shadowed
-        }
+        val occurrenceId = OccurrenceId.create()
+        val accepted = AcceptedOccurrence(
+            id = occurrenceId,
+            occurrence = fact,
+            causedBy = executingEpisode.get(),
+            publishedBy = publishedBy,
+        )
+        acceptedOccurrences += accepted
+        process.processContext.onProcessEvent(
+            OccurrenceAcceptedEvent(
+                agentProcess = process,
+                occurrenceId = occurrenceId,
+                occurrence = fact,
+                causedBy = accepted.causedBy?.id,
+                publishedBy = publishedBy,
+            )
+        )
+        makeRunning()
+        return occurrenceId
     }
 
     /**
-     * Completes one episode without completing the process: consumes the
-     * episode's request and exactly the objects this run made - its final
-     * output and any intermediates - then keeps the process running so
-     * normal planning resumes. The next waiting episode, if any, starts
-     * once the process's own work is out of moves, and plans its chain
-     * from scratch.
+     * Explicit standing-state transfer. Ordinary child writes never cross
+     * this seam.
      */
-    private fun completeEpisode(
-        rule: DerivedEpisodeRule,
-        goal: Goal,
+    fun share(fact: Any) {
+        if (!isEvolving && shareDelegate != null) {
+            shareDelegate?.invoke(fact)
+            return
+        }
+        process.addObject(fact)
+    }
+
+    fun onStandingStateChanged() {
+        if (!isEvolving) {
+            return
+        }
+        advanceRevision()
+        makeRunning()
+    }
+
+    fun nextDirective(excludedActionNames: Set<String>): PlanningDirective {
+        val planningSession = checkNotNull(session) { "No planning session outside evolving mode" }
+        admitAcceptedOccurrences()
+        val turn = PlanningTurn(
+            revision = revision,
+            episodes = episodes.values.map(::viewOf),
+            outcomes = outcomes.toList(),
+            excludedActionNames = excludedActionNames,
+            availableChildCapacity = 1,
+        )
+        val directive = planningSession.next(turn)
+        outcomes.clear()
+        return directive
+    }
+
+    fun runEpisode(directive: PlanningDirective.RunEpisode) {
+        val episode = requireEpisode(directive.episodeId)
+        episode.run()
+        missions[episode.id] = directive.mission
+        executingEpisode.set(episode)
+        val outcome = try {
+            executor.execute(episode, directive.mission)
+        } finally {
+            executingEpisode.remove()
+        }
+        when (outcome) {
+            DispatchOutcome.COMPLETED ->
+                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.COMPLETED)
+
+            DispatchOutcome.STUCK ->
+                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.STUCK)
+
+            DispatchOutcome.FAILED -> {
+                episode.retry()
+                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.FAILED)
+            }
+
+            DispatchOutcome.CANCELLED ->
+                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.CANCELLED)
+
+            DispatchOutcome.BUDGET_EXHAUSTED -> {
+                setStatus(AgentProcessStatusCode.TERMINATED)
+                return
+            }
+        }
+        advanceRevision()
+        makeRunning()
+    }
+
+    fun awaitEpisode(directive: PlanningDirective.AwaitEpisode) {
+        requireEpisode(directive.episodeId).await(revision)
+        makeRunning()
+    }
+
+    fun completeEpisode(
+        directive: PlanningDirective.CompleteEpisode,
         worldState: WorldState,
     ) {
-        logger.debug(
-            "🔁 Process {} completed episode goal {}; consuming and continuing",
-            id,
-            goal.name,
-        )
-        val consumedConsumables = consumeAttributed(rule, goal.name)
-        val consumedRequest = completeActiveEpisode(rule)
-        if (foundingWorkPlannable()) {
-            logger.debug("Process {} deferring admission: work that could end the process runs first", id)
-        } else {
-            admitNext(rule)
-        }
-        if (!consumedRequest) {
-            logger.warn(
-                "Process {} episode goal {} completed with no active episode; " +
-                        "no evolved occurrence was admitted for this completion",
-                id,
-                goal.name,
-            )
-        }
-        if (!consumedRequest && consumedConsumables == 0) {
-            logger.error(
-                "Process {} episode goal {} completed but nothing was consumed; " +
-                        "failing instead of spinning on a goal that will stay satisfied",
-                id,
-                goal.name,
-            )
-            setStatus(AgentProcessStatusCode.FAILED)
-            return
-        }
-        if (makeRunning()) {
-            // The event announces consumption and continuation, so it fires
-            // only once both are true
+        val episode = requireEpisode(directive.episodeId)
+        episode.complete()
+        episodes.remove(episode.id)
+        val mission = missions.remove(episode.id)
+        lastCompletedEpisode = episode
+        val goal = mission?.goals?.firstOrNull { it.name != NIRVANA.name }
+            ?: mission?.goals?.firstOrNull()
+        if (goal != null && makeRunning()) {
             process.processContext.onProcessEvent(
                 EpisodeCompletedEvent(
                     agentProcess = process,
@@ -529,212 +243,104 @@ internal class EpisodeRuntime(
                 )
             )
         }
+        advanceRevision()
     }
 
-    /**
-     * Completion is anchored to the committed objective: in evolving mode
-     * only the founding episode's goal completes the process, and no
-     * objective means intentionally infinite. Outside evolving mode any
-     * goal completes the process, as ever.
-     */
-    fun completesProcess(goalName: String): Boolean {
-        if (!evolvingDeclared) {
-            return true
-        }
-        return goalName in objectiveGoals
-    }
-
-    /**
-     * A goal outside any episode was achieved along the way: record it and
-     * remove it from planning. The process keeps running - only the
-     * declared objective ends it.
-     */
-    fun recordFrameAchievement(goalName: String) {
-        achievedFrameGoals += goalName
-        logger.info(
-            "Process {} achieved goal {} along the way and keeps running: only the objective ends the process",
-            id,
-            goalName,
-        )
+    fun cancelEpisode(directive: PlanningDirective.CancelEpisode) {
+        val episode = requireEpisode(directive.episodeId)
+        episode.cancel()
+        episodes.remove(episode.id)
+        missions.remove(episode.id)
+        advanceRevision()
         makeRunning()
     }
 
-    fun completeFoundingEpisode() {
-        val founding = foundingEpisode ?: return
-        foundingShadow.forEach(blackboard::reveal)
-        founding.complete()
-        lastCompletedEpisode = founding
-    }
-
-    /**
-     * True when the process's own work - any goal not owned by an episode
-     * rule - still has a possible plan in the world as it stands after
-     * consumption. While it does, that work runs before any waiting
-     * episode starts, so whether the process can end never depends on how
-     * its values compare with the next episode's.
-     */
-    private fun foundingWorkPlannable(): Boolean {
-        if (!evolvingDeclared) {
-            return false
-        }
-        return foundingGoals().any { planner.planToGoal(agent.planningSystem.actions, it) != null }
-    }
-
-    private fun foundingGoals(): List<Goal> =
-        agent.goals.filter {
-            it.name != NIRVANA.name && it.name !in achievedFrameGoals && !ownedByActivatedRule(it.name)
-        }
-
-    private fun ownedByActivatedRule(goalName: String): Boolean =
-        derivedRules.any { it.matches(goalName) && it in activatedRules }
-
-    /**
-     * A process completing with occurrences still queued abandons them:
-     * report the fact rather than dropping it silently.
-     */
     fun reportAbandonedOccurrences() {
-        val abandoned = pendingEpisodes.values.sumOf { it.size }
-        if (abandoned > 0) {
+        if (episodes.isNotEmpty()) {
             logger.info(
-                "Process {} finished with {} pending occurrence(s) abandoned in queue",
-                id,
-                abandoned,
-            )
-        }
-        val unowned = evolvedArrivals.count { it.value.owner == null }
-        if (unowned > 0) {
-            logger.info(
-                "Process {} finished with {} evolved occurrence(s) that never found an owner",
-                id,
-                unowned,
+                "Process {} finished with {} active occurrence(s)",
+                process.id,
+                episodes.size,
             )
         }
     }
 
-    /**
-     * Consume the active episode's attributed consumables for the completed
-     * candidate by identity: exactly what this occurrence made, nothing
-     * made elsewhere. A failed child never merges, so a failed attempt
-     * leaves nothing behind to sweep.
-     */
-    private fun consumeAttributed(rule: DerivedEpisodeRule, goalName: String): Int {
-        val episode = activeEpisodes[rule] ?: return 0
-        val consumed = episode.consumablesFrom(rule.chainActionsFor(goalName))
-        consumed.forEach(blackboard::hide)
-        if (consumed.isNotEmpty()) {
-            logger.debug(
-                "Process {} consumed {} attributed consumable(s)",
-                id,
-                consumed.size,
-            )
-        }
-        return consumed.size
-    }
-
-    /**
-     * Execute an action in the parent process. Episode chains only run in
-     * child processes, so everything the parent itself runs is its own
-     * long-running work. The only bookkeeping here is publisher tracking:
-     * a fact this action publishes records the outermost episode as its
-     * publisher.
-     */
     fun runTrackingPublisher(action: Action, execute: () -> ActionStatus): ActionStatus {
-        executingEpisode = foundingEpisode
-        executingAction = action.name
+        executingAction.set(action.name)
         try {
             return execute()
         } finally {
-            executingEpisode = null
-            executingAction = null
+            executingAction.remove()
         }
     }
 
-    /**
-     * Everything episodic happens inside an episode: a rule's exclusive
-     * chain actions are plannable only while the rule has an active
-     * episode, so a standing resource can never let the chain complete
-     * outside an episode.
-     */
-    fun gatedChainActions(): Set<String> =
-        // An activated rule's chain is never the parent planner's to run:
-        // the framework dispatches it. The exclusion also holds against
-        // value-driven planners, which pick any runnable action by value
-        // without needing a goal to justify it
-        derivedRules
-            .filter { episodicNow(it) }
-            .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
+    private fun viewOf(episode: Episode): PlanningEpisodeView =
+        object : PlanningEpisodeView {
+            override val id = episode.id
+            override val occurrence = episode.request
+            override val state = when (episode.state) {
+                EpisodeState.PENDING -> PlanningEpisodeState.PENDING
+                EpisodeState.RUNNING -> PlanningEpisodeState.RUNNING
+                EpisodeState.STUCK -> PlanningEpisodeState.STUCK
+                EpisodeState.COMPLETED,
+                EpisodeState.CANCELLED,
+                    -> error("Terminal episode ${episode.id} remained active")
+            }
+            override val attemptCount = episode.attemptCount
+            override val waitingSinceRevision = episode.waitingSinceRevision
 
-    /**
-     * A rule becomes episodic at its first observed occurrence: before that
-     * the goal is founding frame, and its chain runs ungated.
-     */
-    private fun episodicNow(rule: DerivedEpisodeRule): Boolean =
-        rule in activatedRules
-
-    /**
-     * The planning system for the next planning round: goals already
-     * achieved along the way are removed so finished work never outranks
-     * the remaining work, and goals that belong to episodes are removed
-     * because only dispatch may complete them - the parent can never plan
-     * toward an episode's goal, not even when its condition already looks
-     * satisfied.
-     */
-    fun planningSystem(): PlanningSystem {
-        val withdrawn = achievedFrameGoals +
-                activatedRules.flatMapTo(mutableSetOf()) { it.goalsByName.keys }
-        if (withdrawn.isEmpty()) {
-            return agent.planningSystem
+            override fun <T> evaluate(block: () -> T): T =
+                process.blackboard.withTransientObject(episode.request, block)
         }
-        val declared = agent.planningSystem
-        return object : PlanningSystem {
-            override val actions = declared.actions
-            override val goals = declared.goals.filterNot { it.name in withdrawn }.toSet()
-            override fun knownConditions() = declared.knownConditions()
-            override fun infoString(verbose: Boolean?, indent: Int) = declared.infoString(verbose, indent)
+
+    private fun admitAcceptedOccurrences() {
+        var admitted = false
+        while (true) {
+            val accepted = acceptedOccurrences.poll() ?: break
+            episodes[accepted.id] = Episode(
+                id = accepted.id,
+                request = accepted.occurrence,
+                causedBy = accepted.causedBy,
+                publishedBy = accepted.publishedBy,
+            )
+            admitted = true
+        }
+        if (admitted) {
+            advanceRevision()
         }
     }
 
+    private fun requireEpisode(id: OccurrenceId): Episode =
+        requireNotNull(episodes[id]) { "Planner directive referenced inactive episode $id" }
+
+    private fun advanceRevision() {
+        revision++
+    }
+
     /**
-     * Each planning round, the best active episode - ranked by its goal's
-     * declared value - competes with the process's own best plan, and the
-     * winner runs. One execution per round, so the process's own work and
-     * its episodes interleave by value. Nothing is proven about a chain
-     * before it runs: the child's run is the verdict, and an episode
-     * whose child blocked waits for the blackboard to change before it is
-     * tried again.
+     * Resolve only an explicit declaration. This does not inspect action
+     * preconditions, effects, producers, consumers, or reachability.
      */
-    fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean {
-        val choice = executor.choices(activeEpisodes, agent, worldState).maxByOrNull { it.value } ?: return false
-        if (plan != null && plan.netValue(worldState) > choice.value) {
-            return false
+    private fun resolveObjective(target: GoalTarget?): Set<String> {
+        if (target == null) {
+            return emptySet()
         }
-        // A fact published from inside the child records the dispatching
-        // episode as its publisher
-        executingEpisode = choice.episode
-        val execution = try {
-            executor.execute(choice)
-        } finally {
-            executingEpisode = null
-        }
-        when (execution) {
-            DispatchOutcome.COMPLETED -> completeEpisode(choice.rule, choice.goal, planner.worldState())
-            DispatchOutcome.NOT_COMPLETED -> {
-                // Contained failure or a stuck child: the occurrence is
-                // intact and the next tick re-selects by value
-            }
-            DispatchOutcome.BUDGET_EXHAUSTED -> {
-                reportAbandonedOccurrences()
-                setStatus(AgentProcessStatusCode.TERMINATED)
-                return true
+        val candidates = process.agent.goals.filter { goal ->
+            when (target) {
+                is GoalTarget.Named -> goal.name == target.goalName
+                is GoalTarget.Output -> goal.outputType?.isAssignableTo(target.satisfiedByType) == true
             }
         }
-        // FAILED is terminal here too: the anti-spin failsafe must never be
-        // resurrected to RUNNING by the tail of its own dispatch
-        if (process.status != AgentProcessStatusCode.TERMINATED &&
-            process.status != AgentProcessStatusCode.FAILED
-        ) {
-            makeRunning()
+        require(candidates.isNotEmpty()) {
+            "Evolving objective $target resolves to no declared goal in scope. " +
+                    "Available goals: ${process.agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
         }
-        return true
+        if (target is GoalTarget.Named) {
+            require(candidates.size == 1) {
+                "Evolving objective $target resolves to ${candidates.size} declared goals; " +
+                        "a named target must identify exactly one"
+            }
+        }
+        return candidates.mapTo(mutableSetOf()) { it.name }
     }
 }

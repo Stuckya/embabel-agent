@@ -50,6 +50,11 @@ data class BuildRequested(val id: String)
 data class BuildDone(val id: String)
 data class PingState(val id: String)
 data class PongState(val id: String)
+data class SurveyLicense(val id: String)
+interface JobRequest { val id: String }
+data class FooRequest(override val id: String) : JobRequest
+data class BarRequest(override val id: String) : JobRequest
+data class JobHandled(val id: String)
 data class SurveyDraft(val id: String)
 data class SurveyFiled(val id: String)
 data class CalibrationCompleted(val id: String)
@@ -405,7 +410,7 @@ class GoalEpisodeBaselineTest {
         // remainder mid-episode: prep runs, then collects, then calibrate
         @Action(canRerun = true, value = 0.2, post = ["enoughSamples"])
         fun collect(tally: SampleTally, context: ActionContext): SampleTally {
-            context.addObject(ExecutedStep("collect"))
+            context.share(ExecutedStep("collect"))
             val next = SampleTally(tally.count + 1)
             if (next.count == 2) {
                 context.addObject(CalibrationRequested("cal-1"))
@@ -419,20 +424,20 @@ class GoalEpisodeBaselineTest {
         @Action(pre = ["enoughSamples"], value = 0.9)
         @AchievesGoal(description = "Mission complete", value = 0.5)
         fun missionComplete(tally: SampleTally, context: ActionContext): MissionReport {
-            context.addObject(ExecutedStep("missionComplete"))
+            context.share(ExecutedStep("missionComplete"))
             return MissionReport(tally.count)
         }
 
         @Action(value = 0.9)
         fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
-            context.addObject(ExecutedStep("prepKit"))
+            context.share(ExecutedStep("prepKit"))
             return CalibrationKit(request.id)
         }
 
         @Action(value = 0.55)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate"))
+            context.share(ExecutedStep("calibrate"))
             return CalibrationCompleted(kit.id)
         }
     }

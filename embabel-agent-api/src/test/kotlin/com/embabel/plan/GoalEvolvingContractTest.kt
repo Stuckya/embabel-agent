@@ -25,7 +25,7 @@ import com.embabel.agent.api.event.AgentProcessFinishedEvent
 import com.embabel.agent.api.event.AgenticEventListener
 import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
-import com.embabel.agent.api.event.ObjectAddedEvent
+import com.embabel.agent.api.event.OccurrenceAcceptedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Evolving
@@ -36,6 +36,7 @@ import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessCallback
 import com.embabel.agent.core.last
 import com.embabel.agent.core.support.ConcurrentAgentProcess
+import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
@@ -44,6 +45,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import java.time.Instant
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -64,13 +66,23 @@ data class SignalArchived(val id: String)
  */
 class GoalEvolvingContractTest {
 
+    @Test
+    fun `equal evolved values receive distinct occurrence identities`() {
+        val process = evolvingProcess(CalibrationAgent())
+
+        val first = process.evolve(CalibrationRequested("cal-1"))
+        val second = process.evolve(CalibrationRequested("cal-1"))
+
+        assertNotEquals(first, second, "Occurrence identity, not value equality, defines an episode")
+    }
+
     @Agent(description = "Single-step calibration driven by evolved occurrences")
     inner class CalibrationAgent {
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            context.share(ExecutedStep("calibrate:${request.id}"))
             return CalibrationCompleted(request.id)
         }
     }
@@ -80,14 +92,14 @@ class GoalEvolvingContractTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prepKit(request: CalibrationRequested, context: ActionContext): CalibrationKit {
-            context.addObject(ExecutedStep("prepKit:${request.id}"))
+            context.share(ExecutedStep("prepKit:${request.id}"))
             return CalibrationKit(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(kit: CalibrationKit, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate:${kit.id}"))
+            context.share(ExecutedStep("calibrate:${kit.id}"))
             return CalibrationCompleted(kit.id)
         }
     }
@@ -98,7 +110,7 @@ class GoalEvolvingContractTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, zone: ZoneInfo, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate:${request.id}@${zone.name}"))
+            context.share(ExecutedStep("calibrate:${request.id}@${zone.name}"))
             return CalibrationCompleted(request.id)
         }
     }
@@ -112,7 +124,7 @@ class GoalEvolvingContractTest {
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
             attempts++
-            context.addObject(ExecutedStep("attempt:$attempts"))
+            context.share(ExecutedStep("attempt:$attempts"))
             if (attempts == 1) {
                 throw IllegalStateException("flaky calibration")
             }
@@ -126,7 +138,7 @@ class GoalEvolvingContractTest {
         @Action(value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("calibrate:${request.id}"))
+            context.share(ExecutedStep("calibrate:${request.id}"))
             return CalibrationCompleted(request.id)
         }
     }
@@ -136,20 +148,20 @@ class GoalEvolvingContractTest {
 
         @Action(canRerun = true, value = 0.5)
         fun makePartA(request: CalibrationRequested, context: ActionContext): PartA {
-            context.addObject(ExecutedStep("partA:${request.id}"))
+            context.share(ExecutedStep("partA:${request.id}"))
             return PartA(request.id)
         }
 
         @Action(canRerun = true, value = 0.5)
         fun makePartB(request: CalibrationRequested, context: ActionContext): PartB {
-            context.addObject(ExecutedStep("partB:${request.id}"))
+            context.share(ExecutedStep("partB:${request.id}"))
             return PartB(request.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Calibration completed", value = 1.0)
         fun assemble(a: PartA, b: PartB, context: ActionContext): CalibrationCompleted {
-            context.addObject(ExecutedStep("assemble:${a.id}"))
+            context.share(ExecutedStep("assemble:${a.id}"))
             return CalibrationCompleted(a.id)
         }
     }
@@ -172,10 +184,9 @@ class GoalEvolvingContractTest {
 
     @Test
     fun `an evolving concurrent process executes one action per tick - attribution is single-threaded bookkeeping`() {
-        // Episode attribution diffs the board around each action and tracks
-        // the executing episode in shared state: concurrent fan-out would
-        // cross-attribute consumables. Evolving mode is serial in phase 1;
-        // concurrent width is phase 2's admission-width work
+        // The current planner session advertises one child-capacity slot,
+        // so a ConcurrentAgentProcess preserves the same serial directive
+        // contract. Wider admission is future planner-session policy.
         val batches = mutableListOf<MutableList<String>>()
         val callback = object : AgentProcessCallback {
             override fun beforeActionLaunched(process: AgentProcess) {
@@ -218,10 +229,10 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `derivation survives a null thread context classloader`() {
-        // Type resolution must use the defining classloader: a null or
-        // foreign TCCL silently dropping goals from derivation would turn
-        // a deployment detail into missing capability
+    fun `planner grounding survives a null thread context classloader`() {
+        // Occurrence type grounding must use the defining classloader: a
+        // null or foreign TCCL must not turn deployment detail into missing
+        // planner capability.
         val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
         val thread = Thread.currentThread()
         val original = thread.contextClassLoader
@@ -239,7 +250,7 @@ class GoalEvolvingContractTest {
             )
             process.evolve(CalibrationRequested("cal-1"))
             val result = process.run()
-            assertNull(result.last<CalibrationRequested>(), "The goal derived and the occurrence was consumed")
+            assertNull(result.last<CalibrationRequested>(), "The planner grounded and consumed the occurrence")
         } finally {
             thread.contextClassLoader = original
         }
@@ -383,14 +394,15 @@ class GoalEvolvingContractTest {
         // behind it. Head-of-line blocking is the accepted cost of serial
         // admission
         val process = evolvingProcess(DualInputAgent())
-        process.evolve(CalibrationRequested("cal-1"))
-        process.evolve(CalibrationRequested("cal-2"))
+        val first = process.evolve(CalibrationRequested("cal-1"))
+        val second = process.evolve(CalibrationRequested("cal-2"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No ZoneInfo, so the chain cannot start")
-        val visible = stalled.objects.filterIsInstance<CalibrationRequested>()
-        assertEquals(listOf("cal-1"), visible.map { it.id }, "Only the active request is visible; cal-2 waits hidden")
+        assertTrue(stalled.objects.filterIsInstance<CalibrationRequested>().isEmpty())
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(first)?.state)
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(second)?.state)
 
         stalled.addObject(ZoneInfo("zone-9"))
         val resumed = stalled.run()
@@ -425,22 +437,22 @@ class GoalEvolvingContractTest {
 
     @Test
     fun `the chain binds its episode's request even when a plain fact of the same type is newer`() {
-        // Grounding: while a chain action runs, the episode's request is the
-        // only visible instance of its own class. Standard ground-action
-        // semantics (AIMA 3e SS10.1), per occurrence
+        // The selected occurrence is last in the fresh child. A same-typed
+        // standing fact remains legitimate root work after the episode.
         val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"))
         process.evolve(CalibrationRequested("cal-1"))
         process.addObject(CalibrationRequested("cal-2"))
 
         val result = process.run()
 
+        assertEquals("cal-1", process.frameworkChildren.single().last<CalibrationCompleted>()?.id)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
-            listOf("calibrate:cal-1@zone-9"), steps,
-            "The chain executed against its episode's request, not the newest same-type fact",
+            listOf("calibrate:cal-1@zone-9", "calibrate:cal-2@zone-9"), steps,
+            "The child bound its occurrence before the root handled standing work",
         )
         assertEquals("cal-2", result.last<CalibrationRequested>()?.id, "The plain fact survives, unbound and unconsumed")
-        assertNull(result.last<CalibrationCompleted>(), "The episode's own output was consumed")
+        assertEquals("cal-2", result.last<CalibrationCompleted>()?.id)
     }
 
     @Test
@@ -494,7 +506,7 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `founding completion emits goal and finished events`() {
+    fun `root mission completion emits goal and finished events`() {
         val events = mutableListOf<AgentProcessEvent>()
         val listener = object : AgenticEventListener {
             override fun onProcessEvent(event: AgentProcessEvent) {
@@ -513,8 +525,8 @@ class GoalEvolvingContractTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         val goalEvents = events.filterIsInstance<GoalAchievedEvent>()
-        assertEquals(1, goalEvents.size, "One founding achievement")
-        assertTrue(goalEvents.single() !is EpisodeCompletedEvent, "The founding completion is terminal, not an episode")
+        assertEquals(1, goalEvents.size, "One root-mission achievement")
+        assertTrue(goalEvents.single() !is EpisodeCompletedEvent, "Root completion is terminal, not an episode")
         assertTrue(events.any { it is AgentProcessFinishedEvent }, "Terminal completion emits a finished event")
     }
 
@@ -547,31 +559,29 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `an occurrence reopens a frame-achieved goal`() {
-        // The goal was achieved as state, and a fresh request makes it
-        // unachieved by definition: admission clears the frame achievement
-        // so the planner can serve the new occurrence
+    fun `a frame-achieved goal is not reopened by runtime inference`() {
+        // The condition planner owns whether a prior root achievement can
+        // serve a later occurrence. The runtime must not shadow outputs or
+        // clear planner state to force a rerun.
         val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"), CalibrationRequested("cal-1"))
 
-        val founding = process.run()
-        assertEquals(AgentProcessStatusCode.STUCK, founding.status)
+        val rootRun = process.run()
+        assertEquals(AgentProcessStatusCode.STUCK, rootRun.status)
         assertEquals(
-            1, founding.objects.filterIsInstance<ExecutedStep>().size,
-            "The founding frame ran the seeded work once",
+            1, rootRun.objects.filterIsInstance<ExecutedStep>().size,
+            "The root planner ran the seeded work once",
         )
 
-        process.evolve(CalibrationRequested("cal-2"))
-        val reopened = founding.run()
+        val occurrence = process.evolve(CalibrationRequested("cal-2"))
+        val reopened = rootRun.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, reopened.status, "The episode completed, then a clean park")
         val steps = reopened.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertEquals(
-            listOf("calibrate:cal-1@zone-9", "calibrate:cal-2@zone-9"), steps,
-            "The occurrence reopened the goal the founding frame had achieved",
-        )
+        assertEquals(listOf("calibrate:cal-1@zone-9"), steps)
+        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
         assertEquals(
             "cal-1", reopened.last<CalibrationRequested>()?.id,
-            "The episode consumed its own occurrence; the founding-frame fact survives",
+            "The episode consumed its own occurrence; the root standing fact survives",
         )
     }
 
@@ -580,30 +590,30 @@ class GoalEvolvingContractTest {
 
         @Action(canRerun = true, value = 0.5)
         fun prep(zone: ZoneInfo, context: ActionContext): CalibrationKit {
-            context.addObject(ExecutedStep("prep:${zone.name}"))
+            context.share(ExecutedStep("prep:${zone.name}"))
             return CalibrationKit(zone.name)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Alpha done", value = 1.0)
         fun finishAlpha(kit: CalibrationKit, request: AlphaRequested, context: ActionContext): AlphaDone {
-            context.addObject(ExecutedStep("alpha:${request.id}"))
+            context.share(ExecutedStep("alpha:${request.id}"))
             return AlphaDone(request.id)
         }
 
         @Action(canRerun = true, value = 0.8)
         @AchievesGoal(description = "Beta done", value = 0.9)
         fun finishBeta(kit: CalibrationKit, request: BetaRequested, context: ActionContext): BetaDone {
-            context.addObject(ExecutedStep("beta:${request.id}"))
+            context.share(ExecutedStep("beta:${request.id}"))
             return BetaDone(request.id)
         }
     }
 
     @Test
     fun `an action serving a live episode is never gated by a dormant sibling`() {
-        // Two derived rules share the prep step. After the alpha episode
-        // completes, its rule is dormant and would gate the shared prep,
-        // but the beta episode is live and needs it: liveness wins
+        // Both planner missions share the prep step. Completing alpha must
+        // not prevent a later beta occurrence from receiving a fresh child
+        // mission containing that step.
         val process = evolvingProcess(SharedPrepAgent(), ZoneInfo("zone-9"))
         process.evolve(AlphaRequested("a-1"))
 
@@ -618,7 +628,7 @@ class GoalEvolvingContractTest {
         val steps = afterBeta.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
             listOf("prep:zone-9", "alpha:a-1", "prep:zone-9", "beta:b-1"), steps,
-            "The beta episode reran the shared prep despite the dormant alpha rule",
+            "The beta episode received a fresh planner mission containing the shared prep",
         )
         assertNull(afterBeta.last<BetaRequested>(), "The beta occurrence was consumed")
     }
@@ -629,22 +639,22 @@ class GoalEvolvingContractTest {
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Kickoff done", value = 1.0)
         fun kickoff(seed: MissionReport, context: ActionContext): KickoffDone {
-            context.agentProcess.evolve(SignalReceived("s-1"))
-            context.addObject(Enablement("e-1"))
+            context.evolve(SignalReceived("s-1"))
+            context.share(Enablement("e-1"))
             return KickoffDone("k-${seed.samples}")
         }
 
         @Action(canRerun = true, value = 0.1)
         @AchievesGoal(description = "Signal archived", value = 0.3)
         fun archive(signal: SignalReceived, context: ActionContext): SignalArchived {
-            context.addObject(ExecutedStep("archive:${signal.id}"))
+            context.share(ExecutedStep("archive:${signal.id}"))
             return SignalArchived(signal.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Signal triaged", value = 1.0)
         fun triage(signal: SignalReceived, e: Enablement, context: ActionContext): SignalTriaged {
-            context.addObject(ExecutedStep("triage:${signal.id}"))
+            context.share(ExecutedStep("triage:${signal.id}"))
             return SignalTriaged(signal.id)
         }
     }
@@ -683,15 +693,15 @@ class GoalEvolvingContractTest {
         process.evolve(fact)
 
         assertTrue(
-            events.filterIsInstance<ObjectAddedEvent>().any { it.value === fact },
-            "An evolved arrival is an object addition like any other, visible to listeners",
+            events.filterIsInstance<OccurrenceAcceptedEvent>().any { it.occurrence === fact },
+            "An evolved arrival has an explicit acceptance event without becoming standing state",
         )
     }
 
     @Test
     fun `an ambiguous named objective fails fast`() {
-        // GoalTarget.Named promises exactly one goal; the objective must
-        // enforce it even though derivation excludes duplicate names
+        // GoalTarget.Named promises exactly one goal; the root mission must
+        // enforce that invariant before the planner session opens.
         val blackboard = InMemoryBlackboard()
         val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
         // A distinct instance sharing the name: an identical copy would
@@ -722,14 +732,14 @@ class GoalEvolvingContractTest {
         @Action(canRerun = true, value = 0.5)
         @AchievesGoal(description = "Signal archived", value = 0.5)
         fun archive(signal: SignalReceived, kit: CalibrationKit, context: ActionContext): SignalArchived {
-            context.addObject(ExecutedStep("archive:${signal.id}"))
+            context.share(ExecutedStep("archive:${signal.id}"))
             return SignalArchived(signal.id)
         }
 
         @Action(canRerun = true, value = 0.9)
         @AchievesGoal(description = "Signal triaged", value = 1.0)
         fun triage(signal: SignalReceived, e: Enablement, context: ActionContext): SignalTriaged {
-            context.addObject(ExecutedStep("triage:${signal.id}"))
+            context.share(ExecutedStep("triage:${signal.id}"))
             return SignalTriaged(signal.id)
         }
     }

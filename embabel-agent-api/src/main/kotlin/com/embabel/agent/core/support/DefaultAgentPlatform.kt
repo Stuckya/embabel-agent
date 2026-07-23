@@ -252,11 +252,18 @@ open class DefaultAgentPlatform(
         // nesting: an evolving parent hands down its own evolve, and a
         // non-evolving intermediary hands down the delegate it received
         if (parentAgentProcess is SimpleAgentProcess) {
-            val delegate: ((Any) -> Unit)? = when {
-                parentAgentProcess.isEvolving -> parentAgentProcess::evolve
+            val delegate: ((Any, String?) -> com.embabel.agent.core.OccurrenceId)? = when {
+                parentAgentProcess.isEvolving -> { fact, publishedBy ->
+                    parentAgentProcess.evolve(fact, publishedBy)
+                }
                 else -> parentAgentProcess.evolveDelegate
             }
             delegate?.let { childAgentProcess.evolveDelegate = it }
+            val shareDelegate: ((Any) -> Unit)? = when {
+                parentAgentProcess.isEvolving -> parentAgentProcess::share
+                else -> parentAgentProcess.shareDelegate
+            }
+            shareDelegate?.let { childAgentProcess.shareDelegate = it }
         }
         logger.debug("👶 Creating child process {} from {}", childAgentProcess.id, parentAgentProcess.id)
         agentProcessRepository.save(childAgentProcess)

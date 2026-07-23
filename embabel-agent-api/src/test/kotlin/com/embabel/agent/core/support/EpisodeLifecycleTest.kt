@@ -20,37 +20,41 @@ import org.junit.jupiter.api.assertThrows
 import kotlin.test.assertEquals
 
 /**
- * The episode lifecycle is PENDING, ACTIVE, COMPLETED, in that order and
- * no other: the transitions themselves enforce it, so a runtime bug that
+ * The episode lifecycle is planner-directed. The transitions themselves
+ * enforce it, so a runtime bug that
  * skipped or repeated a stage fails fast at the offending call site
  * instead of corrupting admission bookkeeping silently.
  */
 class EpisodeLifecycleTest {
 
     @Test
-    fun `an episode moves PENDING to ACTIVE to COMPLETED`() {
-        val episode = Episode("request")
+    fun `an episode moves PENDING to RUNNING to COMPLETED`() {
+        val episode = Episode(com.embabel.agent.core.OccurrenceId.create(), "request")
         assertEquals(EpisodeState.PENDING, episode.state)
-        episode.activate()
-        assertEquals(EpisodeState.ACTIVE, episode.state)
+        episode.run()
+        assertEquals(EpisodeState.RUNNING, episode.state)
         episode.complete()
         assertEquals(EpisodeState.COMPLETED, episode.state)
     }
 
     @Test
     fun `completing a pending episode fails fast`() {
-        assertThrows<IllegalStateException> { Episode("request").complete() }
+        assertThrows<IllegalStateException> {
+            Episode(com.embabel.agent.core.OccurrenceId.create(), "request").complete()
+        }
     }
 
     @Test
-    fun `activating an active episode fails fast`() {
-        val episode = Episode("request").also(Episode::activate)
-        assertThrows<IllegalStateException> { episode.activate() }
+    fun `running a running episode fails fast`() {
+        val episode = Episode(com.embabel.agent.core.OccurrenceId.create(), "request").also(Episode::run)
+        assertThrows<IllegalStateException> { episode.run() }
     }
 
     @Test
     fun `completing a completed episode fails fast`() {
-        val episode = Episode("request").also(Episode::activate).also(Episode::complete)
+        val episode = Episode(com.embabel.agent.core.OccurrenceId.create(), "request")
+            .also(Episode::run)
+            .also(Episode::complete)
         assertThrows<IllegalStateException> { episode.complete() }
     }
 }

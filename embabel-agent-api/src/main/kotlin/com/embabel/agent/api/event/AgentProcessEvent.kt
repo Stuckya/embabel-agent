@@ -21,6 +21,7 @@ import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusReport
 import com.embabel.agent.core.InProcess
+import com.embabel.agent.core.OccurrenceId
 import com.embabel.agent.core.ToolGroupMetadata
 import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.chat.Message
@@ -108,16 +109,29 @@ open class GoalAchievedEvent(
 ) : AbstractAgentProcessEvent(agentProcess)
 
 /**
- * A nonterminal goal achievement: an episode goal completed, its request and
- * products were consumed, and the process continues. Emitted in place of the
- * plain [GoalAchievedEvent] so listeners can distinguish episodic completions;
- * listeners matching on [GoalAchievedEvent] still receive it.
+ * A nonterminal goal achievement: the selected occurrence was consumed, the
+ * child working memory was disposed, and the process continues. Emitted in
+ * place of the plain [GoalAchievedEvent] so listeners can distinguish episodic
+ * completions; listeners matching on [GoalAchievedEvent] still receive it.
  */
 class EpisodeCompletedEvent(
     agentProcess: AgentProcess,
     worldState: WorldState,
     goal: Goal,
 ) : GoalAchievedEvent(agentProcess, worldState, goal)
+
+/**
+ * An occurrence was accepted at the evolving process boundary. Acceptance
+ * does not make the occurrence standing state; the planning thread admits it
+ * to the occurrence ledger on its next tick.
+ */
+class OccurrenceAcceptedEvent(
+    agentProcess: AgentProcess,
+    val occurrenceId: OccurrenceId,
+    val occurrence: Any,
+    val causedBy: OccurrenceId?,
+    val publishedBy: String?,
+) : AbstractAgentProcessEvent(agentProcess)
 
 class ActionExecutionStartEvent(
     agentProcess: AgentProcess,
