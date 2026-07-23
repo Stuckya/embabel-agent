@@ -25,11 +25,9 @@ import com.embabel.agent.core.Blackboard
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.IoBinding
 import com.embabel.agent.core.JvmType
-import com.embabel.agent.spi.PlannerFactory
 import com.embabel.plan.Plan
 import com.embabel.plan.PlanningSystem
 import com.embabel.plan.WorldState
-import com.embabel.plan.common.condition.WorldStateDeterminer
 import org.slf4j.LoggerFactory
 import java.util.Collections
 import java.util.IdentityHashMap
@@ -45,8 +43,6 @@ import java.util.IdentityHashMap
  */
 internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
-    plannerFactory: PlannerFactory,
-    worldStateDeterminer: WorldStateDeterminer,
     private val setStatus: (AgentProcessStatusCode) -> Unit,
     private val makeRunning: () -> Boolean,
 ) {
@@ -209,7 +205,7 @@ internal class EpisodeRuntime(
      * stays with the planner.
      */
     private val executor: EpisodeExecutor by lazy {
-        EpisodeExecutor(process, plannerFactory, worldStateDeterminer)
+        EpisodeExecutor(process)
     }
 
     /** Recent framework children, bounded, for inspection */

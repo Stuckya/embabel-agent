@@ -37,12 +37,6 @@ import com.embabel.plan.common.condition.EffectSpec
  * effects satisfy its own input, as with an accumulator) is never a consumable.
  * @param chainActionsByGoal for each candidate goal, the names of the actions
  * the planner can route toward it.
- * @param attributedTypesByAction for each chain action, the consumable types
- * whose new instances are attributed to the active episode when it runs.
- * Completion consumes the attributed consumables of the completed candidate's
- * chain by identity, so an occurrence consumes exactly what it made: a stale
- * intermediate of its own cannot shortcut the next occurrence's plan, and
- * instances made elsewhere are used, not consumed.
  * @param exclusiveChainActions the chain actions serving no non-episode
  * goal, gated from planning whenever the activated rule has no active
  * episode
@@ -52,19 +46,12 @@ internal data class ResolvedEpisodeRule(
     val evolvedEligible: List<Class<*>> = emptyList(),
     val consumableTypesByGoal: Map<String, List<Class<*>>>,
     val chainActionsByGoal: Map<String, Set<String>>,
-    val attributedTypesByAction: Map<String, List<Class<*>>>,
     val exclusiveChainActions: Set<String> = emptySet(),
 ) {
 
     fun matches(goalName: String): Boolean = goalName in goalsByName
 
     fun chainActionsFor(goalName: String): Set<String> = chainActionsByGoal[goalName].orEmpty()
-
-    fun isChainAction(actionName: String): Boolean =
-        chainActionsByGoal.values.any { actionName in it }
-
-    fun attributedTypesFor(actionName: String): List<Class<*>> =
-        attributedTypesByAction[actionName].orEmpty()
 
     fun isEvolvedEligible(instance: Any): Boolean =
         evolvedEligible.any { it.isInstance(instance) }
@@ -195,30 +182,7 @@ internal object EpisodeResolution {
             chainActionsByGoal = chains.mapValues { (_, chain) ->
                 chain.chainActions.mapTo(linkedSetOf()) { it.name }
             },
-            attributedTypesByAction = attributedTypes(chains, consumableTypesByGoal),
         )
-    }
-
-    /**
-     * For each chain action, the consumable types whose instances are
-     * attributed to the active episode when the action executes: the
-     * action's declared outputs, restricted to validated consumable types, so
-     * self-maintained standing state is never attributed.
-     */
-    private fun attributedTypes(
-        chains: Map<String, GoalChain>,
-        consumableTypesByGoal: Map<String, List<Class<*>>>,
-    ): Map<String, List<Class<*>>> {
-        val byAction = mutableMapOf<String, MutableSet<Class<*>>>()
-        chains.forEach { (goalName, chain) ->
-            val consumables = consumableTypesByGoal[goalName].orEmpty()
-            chain.chainActions.forEach { action ->
-                val declared = action.outputs.mapTo(mutableSetOf()) { it.type }
-                byAction.getOrPut(action.name) { linkedSetOf() } +=
-                    consumables.filter { it.name in declared }
-            }
-        }
-        return byAction.mapValues { it.value.toList() }
     }
 
     /**

@@ -20,10 +20,7 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Goal
-import com.embabel.agent.core.ProcessOptions
-import com.embabel.agent.spi.PlannerFactory
 import com.embabel.plan.WorldState
-import com.embabel.plan.common.condition.WorldStateDeterminer
 import org.slf4j.LoggerFactory
 import java.util.Collections
 import java.util.IdentityHashMap
@@ -58,8 +55,6 @@ internal enum class DispatchOutcome {
  */
 internal class EpisodeExecutor(
     private val process: SimpleAgentProcess,
-    plannerFactory: PlannerFactory,
-    worldStateDeterminer: WorldStateDeterminer,
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)

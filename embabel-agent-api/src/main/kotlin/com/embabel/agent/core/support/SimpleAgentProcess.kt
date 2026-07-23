@@ -73,8 +73,6 @@ open class SimpleAgentProcess(
      */
     private val episodes = EpisodeRuntime(
         process = this,
-        plannerFactory = plannerFactory,
-        worldStateDeterminer = worldStateDeterminer,
         setStatus = ::setStatus,
         makeRunning = ::makeRunning,
     )
