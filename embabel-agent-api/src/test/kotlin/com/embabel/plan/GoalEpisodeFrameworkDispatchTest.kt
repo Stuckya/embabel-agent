@@ -208,6 +208,144 @@ class GoalEpisodeFrameworkDispatchTest {
         )
     }
 
+    @Agent(description = "A blocked job and a supply run - one evolution unblocks another")
+    inner class SupplyChainAgent {
+
+        @Action(canRerun = true, value = 0.5)
+        fun prepSurface(request: PaintRequested, context: ActionContext): PreparedSurface {
+            context.addObject(ExecutedStep("prep:${request.id}"))
+            return PreparedSurface(request.id)
+        }
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Surface painted", value = 1.0)
+        fun paint(surface: PreparedSurface, can: PaintCan, context: ActionContext): SurfacePainted {
+            context.addObject(ExecutedStep("paint:${surface.id}"))
+            return SurfacePainted(surface.id)
+        }
+
+        @Action(canRerun = true, value = 0.5)
+        @AchievesGoal(description = "Can fetched", value = 0.8)
+        fun fetchCan(request: CanRequested, context: ActionContext): CanFetched {
+            // The can is a lasting write, not the goal's output: it survives
+            // the supply episode's completion and enables the blocked job
+            context.addObject(PaintCan("fresh"))
+            context.addObject(ExecutedStep("fetch:${request.id}"))
+            return CanFetched(request.id)
+        }
+    }
+
+    @Test
+    fun `an evolution resolves a blocked episode - friction, new evolution, resolution`() {
+        // The loop this whole feature exists for, in miniature: work blocks,
+        // a new evolution changes the world, and the blocked work resumes
+        // through nothing but the change itself
+        val process = dispatching(SupplyChainAgent())
+        process.evolve(PaintRequested("job-1"))
+
+        val stalled = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
+        assertNotNull(stalled.last<PaintRequested>(), "The blocked occurrence waits intact")
+
+        process.evolve(CanRequested("supply-1"))
+        val resolved = stalled.run()
+
+        assertNull(resolved.last<PaintRequested>(), "The blocked episode completed after the supply evolution")
+        assertNull(resolved.last<CanRequested>(), "The supply occurrence was consumed by its own episode")
+        assertNotNull(resolved.last<PaintCan>(), "The supply run's lasting product survived and enabled the job")
+        val steps = resolved.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue("paint:job-1" in steps, "The blocked chain ran to its goal: $steps")
+    }
+
+    @Agent(description = "A chain gated by a value condition no planner can project")
+    inner class ValueConditionChainAgent {
+
+        @Action(canRerun = true, value = 0.4)
+        fun gather(request: BuildRequested, tally: SampleTally, context: ActionContext): SampleTally {
+            context.addObject(ExecutedStep("gather"))
+            return SampleTally(tally.count + 1)
+        }
+
+        @Condition(name = "enough")
+        fun enough(tally: SampleTally): Boolean = tally.count >= 2
+
+        @Action(pre = ["enough"], canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Build done", value = 1.0)
+        fun build(request: BuildRequested, tally: SampleTally, context: ActionContext): BuildDone {
+            context.addObject(ExecutedStep("build:${request.id}"))
+            return BuildDone(request.id)
+        }
+    }
+
+    @Test
+    fun `a chain no planner can prove ahead of time still runs - the walk is the proof`() {
+        // The condition flips only while the chain runs, so no plan can be
+        // proven before dispatch. Under a value-walking planner the child
+        // walks the chain and the condition turns true under its feet
+        val process = dispatching(ValueConditionChainAgent(), SampleTally(0), hybrid = true)
+        process.evolve(BuildRequested("b-1"))
+
+        val result = process.run()
+
+        assertNull(result.last<BuildRequested>(), "The unprovable chain completed and consumed its occurrence")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertTrue("build:b-1" in steps, "The chain reached its goal: $steps")
+        assertTrue(steps.count { it == "gather" } >= 2, "The walk crossed the value condition: $steps")
+    }
+
+    @Test
+    fun `the same unprovable chain waits as recorded friction under a classical planner`() {
+        // A full-path planner cannot see the condition flipping mid-run, so
+        // the child parks having done nothing and the block is recorded -
+        // the documented limitation, and the future author's input
+        val process = dispatching(ValueConditionChainAgent(), SampleTally(0))
+        process.evolve(BuildRequested("b-1"))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        assertNotNull(result.last<BuildRequested>(), "The occurrence waits intact for the world to change")
+        assertEquals(1, process.frameworkChildCount, "One observed attempt in this world, never a spin")
+    }
+
+    @Agent(description = "A completing action with a permanent fault")
+    inner class AlwaysCrashingAgent {
+
+        @Action(canRerun = true, value = 0.9)
+        @AchievesGoal(description = "Calibration completed", value = 1.0)
+        fun calibrate(request: CalibrationRequested, context: ActionContext): CalibrationCompleted {
+            throw IllegalStateException("permanent fault")
+        }
+    }
+
+    @Test
+    fun `a permanent crash retries to the budget and terminates - bounded, never infinite`() {
+        // A crash leaves the blackboard unchanged, so waiting would gain
+        // nothing: crashes retry freely, and the budget is the bound
+        val blackboard = InMemoryBlackboard()
+        val agent = AgentMetadataReader().createAgentMetadata(AlwaysCrashingAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "framework-dispatch-crash-budget",
+            null,
+            agent,
+            ProcessOptions.DEFAULT
+                .withBudget(com.embabel.agent.core.Budget().withActions(5))
+                .withEvolving(),
+            blackboard,
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+        process.evolve(CalibrationRequested("cal-1"))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.TERMINATED, result.status, "The budget bounded the retries")
+        assertEquals(5, process.frameworkChildCount, "One child per budgeted attempt, then the brake")
+        assertNotNull(result.last<CalibrationRequested>(), "The occurrence was never consumed")
+    }
+
     private fun dispatching(
         agentInstance: Any,
         vararg seeds: Any,
@@ -447,6 +585,10 @@ class GoalEpisodeFrameworkDispatchTest {
         )
         assertEquals(5, process.frameworkChildren.size, "One child per budgeted action, then the brake")
         assertNotNull(result.last<BatchRequested>(), "The unbounded chain's next occurrence stayed unconsumed")
+        assertTrue(
+            process.lastCompletedEpisode?.causedBy?.request is BatchRequested,
+            "A follow-up published from inside a child records the dispatching episode as its cause",
+        )
     }
 
     @Agent(description = "A blocked episode beside busy frame work - dispatch must not spin")

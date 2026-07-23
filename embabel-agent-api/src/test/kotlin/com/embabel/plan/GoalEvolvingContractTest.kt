@@ -245,6 +245,72 @@ class GoalEvolvingContractTest {
         }
     }
 
+    @Test
+    fun `two equal facts are two occurrences - identity decides, never equality`() {
+        // Every arrival structure is keyed by instance identity: two facts
+        // with equal content are two requests for work, and a refactor that
+        // switched any of that bookkeeping to equality would merge them
+        val process = evolvingProcess(CalibrationAgent())
+        process.evolve(CalibrationRequested("cal-1"))
+        process.evolve(CalibrationRequested("cal-1"))
+
+        val result = process.run()
+
+        assertEquals(AgentProcessStatusCode.STUCK, result.status)
+        assertNull(result.last<CalibrationRequested>(), "Both occurrences were consumed")
+        val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
+        assertEquals(
+            listOf("calibrate:cal-1", "calibrate:cal-1"), steps,
+            "Two equal facts ran two full episodes",
+        )
+    }
+
+    @Test
+    fun `evolve without the declaration fails with guidance`() {
+        val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
+        val process = SimpleAgentProcess(
+            "evolving-contract-plain",
+            null,
+            agent,
+            ProcessOptions.DEFAULT,
+            InMemoryBlackboard(),
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+        val rejection = assertThrows<IllegalArgumentException> {
+            process.evolve(CalibrationRequested("cal-1"))
+        }
+        assertTrue(
+            "withEvolving" in rejection.message!!,
+            "The rejection tells the caller what to declare: ${rejection.message}",
+        )
+    }
+
+    @Test
+    fun `a child of a non-evolving parent cannot evolve - no ancestor can receive the fact`() {
+        val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
+        val parent = SimpleAgentProcess(
+            "evolving-contract-plain-parent",
+            null,
+            agent,
+            ProcessOptions.DEFAULT,
+            InMemoryBlackboard(),
+            dummyPlatformServices(),
+            DefaultPlannerFactory,
+            Instant.now(),
+        )
+        val platform = parent.processContext.platformServices.agentPlatform
+        val child = platform.createChildProcess(agent, parent)
+        val rejection = assertThrows<IllegalArgumentException> {
+            child.evolve(CalibrationRequested("cal-1"))
+        }
+        assertTrue(
+            "withEvolving" in rejection.message!!,
+            "The rejection tells the caller what to declare: ${rejection.message}",
+        )
+    }
+
     private fun evolvingProcess(
         agentInstance: Any,
         vararg seeds: Any,
