@@ -402,7 +402,7 @@ class GoalEpisodeAimaTest {
         }
         assertTrue("AlphaRequested" in exception.message!!, "Names the unroutable type: ${exception.message}")
         assertTrue(
-            "no default-binding off-chain input" in exception.message!!,
+            "no required input that its own chain does not produce" in exception.message!!,
             "Carries the derivation exclusion reason: ${exception.message}",
         )
     }

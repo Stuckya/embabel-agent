@@ -29,14 +29,14 @@ import com.embabel.plan.common.condition.EffectSpec
  * Rules are per goal by construction: one goal, one rule.
  * @param goalsByName the rule's goal, keyed by name
  * @param evolvedEligible the loaded types an evolved instance may arrive
- * under for this rule: the default-binding off-chain inputs required on
- * every completion path
+ * under for this rule: the input types every path to the goal needs but
+ * no chain action produces
  * @param consumableTypesByGoal for each candidate goal, the validated consumable types
  * its chain can manufacture: the satisfying output and any intermediates,
  * loaded and consumable. Standing state an action maintains for itself (its
  * effects satisfy its own input, as with an accumulator) is never a consumable.
  * @param chainActionsByGoal for each candidate goal, the names of the actions
- * the planner can route toward it: attribution membership.
+ * the planner can route toward it.
  * @param attributedTypesByAction for each chain action, the consumable types
  * whose new instances are attributed to the active episode when it runs.
  * Completion consumes the attributed consumables of the completed candidate's
@@ -104,10 +104,10 @@ internal object EpisodeResolution {
         val exclusions = mutableMapOf<String, String>()
         agent.goals.forEach { goal ->
             if (goal.name in objectiveGoals) {
-                // The objective is the tournament, never one of its games: an
-                // episodic objective would consume-and-rearm forever and the
-                // mission could never end
-                exclusions[goal.name] = "the committed objective is terminal, never episodic"
+                // The objective ends the whole process, so it must never
+                // repeat as an episode: an episodic objective would consume
+                // its own completion and start again forever
+                exclusions[goal.name] = "the committed objective ends the process, so it never repeats as an episode"
                 return@forEach
             }
             try {
@@ -223,8 +223,9 @@ internal object EpisodeResolution {
 
     /**
      * The types an evolved instance may arrive under for this rule: the
-     * default-binding off-chain inputs required on every completion path,
-     * loaded. An evolved arrival of any other type never routes here.
+     * input types every path to the goal needs but no chain action
+     * produces, loaded. An evolved fact of any other type never goes to
+     * this rule.
      */
     private fun evolvedEligibleTypes(goal: Goal, requiredOnEveryPath: Set<String>): List<Class<*>> {
         val eligible = requiredOnEveryPath
@@ -232,12 +233,12 @@ internal object EpisodeResolution {
             .map { binding ->
                 IoBinding(binding).resolveJvmType()?.clazz
                     ?: throw UnderivableGoalException(
-                        "Goal ${goal.name} cannot load off-chain input " +
+                        "Goal ${goal.name} cannot load required input " +
                                 "${IoBinding(binding).type}: evolved occurrences must be loadable JVM types"
                     )
             }
         requireDerivable(eligible.isNotEmpty()) {
-            "Goal ${goal.name} has no default-binding off-chain input: " +
+            "Goal ${goal.name} has no required input that its own chain does not produce: " +
                     "nothing can be evolved for it"
         }
         return eligible
@@ -265,17 +266,18 @@ internal object EpisodeResolution {
     }
 
     /**
-     * A satisfying output must be a per-occurrence consumable. An output that is
-     * standing state would survive consumption and keep the goal satisfied
-     * forever, and a non-JVM output could never be hidden at all: either way
-     * the episode could not rearm.
+     * A goal's output must be something each run makes fresh and completion
+     * can consume. An output that doubles as long-lived shared state would
+     * survive consumption and keep the goal satisfied forever, and an
+     * output with no JVM class could never be hidden at all: either way
+     * the goal could never run again as a fresh episode.
      */
     private fun requireConsumableOutput(goal: Goal, agent: Agent) {
         val outputType = goal.outputType
         if (outputType !is JvmType) {
             throw UnderivableGoalException(
                 "Episode candidate ${goal.name} does not produce a JVM output type: " +
-                        "its instances could never be consumed, so the episode could not rearm"
+                        "its instances could never be consumed, so the goal could never run again as a fresh episode"
             )
         }
         requireDerivable(!isSelfMaintained(outputType.className, agent)) {
@@ -289,7 +291,7 @@ internal object EpisodeResolution {
         goal.outputType?.isAssignableTo(target.satisfiedByType) == true
 
     private data class GoalChain(
-        /** Off-chain input bindings required on every completion path to the goal */
+        /** Inputs every path to the goal needs but no chain action produces */
         val requiredOffChainBindings: Set<String>,
         /** The actions the planner can route toward the goal */
         val chainActions: Set<Action>,

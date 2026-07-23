@@ -337,7 +337,7 @@ data class ProcessOptions @JvmOverloads constructor(
  * declared once. The optional [objective] is the committed objective: the
  * founding episode completes the process when it completes, and no other
  * completion ends it. No objective means intentionally infinite. Episodes
- * execute in framework-synthesized child processes: there is no other rung.
+ * execute in child processes the framework creates and runs.
  */
 data class Evolving(
     val objective: GoalTarget? = null,

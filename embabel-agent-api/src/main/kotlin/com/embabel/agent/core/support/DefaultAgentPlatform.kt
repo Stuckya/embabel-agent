@@ -247,9 +247,9 @@ open class DefaultAgentPlatform(
             processOptions = processOptions,
             plannerFactory = plannerFactory,
         )
-        // evolve from inside any descendant of an evolving process
-        // delegates up the tower to the nearest evolving ancestor, at any
-        // depth: an evolving parent hands down its own evolve, and a
+        // evolve from inside any descendant of an evolving process hands
+        // the fact to the nearest evolving ancestor, however deep the
+        // nesting: an evolving parent hands down its own evolve, and a
         // non-evolving intermediary hands down the delegate it received
         if (parentAgentProcess is SimpleAgentProcess) {
             val delegate: ((Any) -> Unit)? = when {

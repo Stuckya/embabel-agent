@@ -79,9 +79,10 @@ internal class EpisodeExecutor(
     /**
      * Nothing is proven before dispatch: an active episode is a candidate
      * at its goal's declared value, and the child's own run is the only
-     * verdict on the chain. The one exclusion is observational, the sphex
-     * defense: an episode whose child ran and blocked is not re-attempted
-     * into a world that has not changed since.
+     * verdict on the chain. The one exclusion is based on what already
+     * happened: an episode whose child ran and blocked is not tried again
+     * until the parent's blackboard has changed, because an unchanged
+     * world would just block it again.
      */
     fun choices(
         active: Map<ResolvedEpisodeRule, Episode>,
@@ -223,11 +224,10 @@ internal class EpisodeExecutor(
     }
 
     /**
-     * The request window, structurally: in the child's world the episode's
-     * request is the only visible instance of its own class, so binding by
-     * type resolves the occurrence the episode holds, not a newer plain
-     * fact riding the snapshot. Standard ground-action semantics per
-     * occurrence (AIMA 3e SS10.1).
+     * Inside the child, the episode's request is the only visible instance
+     * of its own class. Actions that look up an input by type therefore
+     * find the request this episode holds, never a newer fact of the same
+     * type that happened to be on the parent's blackboard.
      */
     private fun groundRequestWindow(choice: EpisodeChoice, child: AgentProcess) {
         val requestClass = choice.episode.request.javaClass

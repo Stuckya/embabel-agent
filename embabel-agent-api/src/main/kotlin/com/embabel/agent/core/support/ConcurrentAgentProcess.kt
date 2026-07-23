@@ -57,9 +57,10 @@ open class ConcurrentAgentProcess(
 ) {
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         if (isEvolving) {
-            // Evolving mode executes serially in phase 1: evolve lineage
-            // rides per-action bookkeeping that concurrent fan-out would
-            // race. Concurrent width is phase 2's admission-width work
+            // Evolving mode executes one action at a time for now: the
+            // record of which episode published each fact is kept around
+            // the running action, and concurrent execution would corrupt
+            // it. Concurrent execution under evolving mode is future work
             return super.formulateAndExecutePlan(worldState)
         }
         admitArrivals()

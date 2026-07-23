@@ -16,17 +16,15 @@
 package com.embabel.agent.core.support
 
 /**
- * One occurrence of a goal episode at runtime: the request that begins it,
- * the consumables its chain has made, and where it stands in the
- * serial-admission lifecycle. The request is the episode's percept in the
- * sense of AIMA 3e chapter 2: its arrival begins the episode, and its
- * consumption ends it. Episode rules are derived from the goal graph at
- * construction; each occurrence arriving through evolve becomes an
- * Episode. At most one Episode per rule is ACTIVE. Later arrivals wait
- * PENDING, hidden until admitted, so each chain binds exactly its own
- * request.
+ * One run of an episode at runtime: the request that begins it, the
+ * objects its actions have made, and where it stands in its lifecycle.
+ * The request's arrival begins the episode and its consumption ends it.
+ * Episode rules are derived from the goal graph at construction; each
+ * fact arriving through evolve becomes an Episode. At most one Episode
+ * per rule is ACTIVE. Later arrivals wait PENDING, hidden until admitted,
+ * so each chain reads exactly its own request.
  *
- * Consumables follow AIMA's consumable-resource idea: instances a chain
+ * Consumables are the per-run products: instances a chain
  * action made for this occurrence, recorded by identity as they appear.
  * Completion consumes the request and the completed candidate's consumables,
  * exactly what this occurrence made and nothing else. Off-chain inputs and
@@ -68,11 +66,11 @@ internal class Episode(
 }
 
 /**
- * The founding episode's request: the percept that began the process-episode.
- * In evolving mode the process itself is the outermost episode, terminal from
- * within and episodic from a parent's level (AIMA 3e ch 2 p. 45: many
- * environments are episodic at higher levels; the tournament is not one of
- * its games). Its percept is the process's initial observations.
+ * The founding episode's request: the facts already on the blackboard when
+ * the process was created. In evolving mode the whole process is treated
+ * as one outermost episode, so even work belonging to no smaller episode
+ * has an episode to answer for it, and a parent process can treat this
+ * entire process as a single episode of its own.
  */
 internal data class FoundingPercept(val seeds: List<Any>)
 

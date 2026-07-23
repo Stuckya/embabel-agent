@@ -92,9 +92,9 @@ open class SimpleAgentProcess(
 
     /**
      * Set by the platform on children of an evolving process: evolve from
-     * inside a child delegates up the tower to the nearest evolving
-     * ancestor, so chain actions publish occurrences exactly as frame
-     * actions do.
+     * inside a child hands the fact to the nearest evolving ancestor,
+     * however deep the nesting, so an action publishes the same way
+     * whether it runs in the parent or in a child.
      */
     internal var evolveDelegate: ((Any) -> Unit)?
         get() = episodes.evolveDelegate
@@ -103,8 +103,8 @@ open class SimpleAgentProcess(
         }
 
     /**
-     * The most recently completed episode, retained for lineage inspection.
-     * Completed episodes are otherwise discarded.
+     * The most recently completed episode, kept so callers can inspect
+     * what just finished. Completed episodes are otherwise discarded.
      */
     internal val lastCompletedEpisode: Episode? get() = episodes.lastCompletedEpisode
 
@@ -129,9 +129,10 @@ open class SimpleAgentProcess(
         episodes.dispatchIfEpisodeWins(plan, worldState)
 
     /**
-     * Execute a frame action. Everything the parent runs is founding-frame
-     * work - episode chains execute only in children - so the runtime's
-     * only bookkeeping here is evolve lineage.
+     * Execute an action in this process. Episode chains only run in child
+     * processes, so everything this process runs itself is its own
+     * long-running work - the runtime just tracks which episode any
+     * published fact came from.
      */
     protected fun executeFrameAction(action: Action): ActionStatus =
         episodes.executingInFrame(action) { executeAction(action) }

@@ -36,12 +36,12 @@ import java.util.IdentityHashMap
 
 /**
  * The episode machinery for one evolving process: derivation, admission,
- * routing, the visibility windows, evolve lineage, dispatch selection, and
- * completion bookkeeping. The process owns the tick loop and its status;
+ * routing, the visibility windows, publisher tracking, dispatch selection,
+ * and completion bookkeeping. The process owns its run loop and status;
  * the runtime owns every episode decision inside it, borrowing exactly the
- * two process powers it declares - status and rearming. Outside evolving
- * mode evolve delegates up the tower or fails fast, and every other path
- * is inert.
+ * two process powers it declares - setting status and resuming. Outside evolving
+ * mode evolve hands the fact to the nearest evolving ancestor or fails
+ * fast, and every other path is inert.
  */
 internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
@@ -91,29 +91,29 @@ internal class EpisodeRuntime(
     private val activatedRules = mutableSetOf<ResolvedEpisodeRule>()
 
     /**
-     * The process-episode: in evolving mode the process itself is the
-     * outermost episode, active from construction, terminal from within and
-     * episodic from a parent's level. Its request is the founding percept,
-     * the initial observations present at construction. Founding-frame work
-     * executes inside it, so evolves it publishes record it as their cause.
+     * In evolving mode the whole process is treated as one outermost
+     * episode, active from construction. Its request is the set of facts
+     * already on the blackboard at creation. Work that belongs to no
+     * smaller episode runs inside it, so when that work publishes a fact
+     * through evolve, this episode is recorded as the publisher.
      */
     private val foundingEpisode: Episode? =
         derivedScope?.let { Episode(FoundingPercept(blackboard.objects.toList())).also(Episode::activate) }
 
     /**
-     * Founding-frame goals already achieved: recorded and withdrawn from
-     * planning so the process resumes its mission instead of completing or
-     * replaying them. The spot-welding robot reattaches the door and
-     * resumes its work (AIMA 3e p. 422); only the objective ends the mission.
+     * Goals outside any episode that were already achieved: recorded and
+     * removed from planning so the process goes back to its long-running
+     * work instead of ending, or doing the same thing again. Only the
+     * declared objective ends the process.
      */
     private val achievedFrameGoals = mutableSetOf<String>()
 
     /**
-     * The founding shadow: a construction-time instance of the objective's
-     * satisfying type is an ungrounded leftover - the mission's satisfying
-     * instance must be its own product (AIMA 3e SS10.1) - and would
-     * otherwise strand the mission, unsatisfied yet unplannable. Shadowed
-     * here, revealed at founding completion.
+     * Instances of the objective's output type that were already on the
+     * blackboard at creation. Left visible, they would look like the
+     * objective was already met, and the process could neither finish
+     * properly nor plan toward finishing. They are hidden here and made
+     * visible again when the process completes.
      */
     private val foundingShadow: List<Any> = shadowFoundingObjective()
 
@@ -159,10 +159,11 @@ internal class EpisodeRuntime(
 
     /**
      * Instances published as occurrences, each mapped to the episode whose
-     * chain action published it, if any: lineage captured at publication.
-     * Designation rides the instance: an evolved fact is admitted to drive
-     * an episode, while a plain addObject fact of the same type is
-     * standing state.
+     * action published it, if any: the publisher is captured at the moment
+     * of publication. The call site decides what a fact is: a fact
+     * published through evolve starts an episode, while a fact added
+     * through addObject is ordinary shared state, even when both have the
+     * same type.
      */
     private val evolvedArrivals: MutableMap<Any, EvolveOrigin> = IdentityHashMap()
 
@@ -175,7 +176,7 @@ internal class EpisodeRuntime(
     /**
      * The episode evolve attributes publications to right now: the founding
      * episode during a frame action, the dispatching episode during a child
-     * run. Pure lineage state - no chain action ever executes here.
+     * run. Pure publisher tracking - no chain action ever executes here.
      */
     private var executingEpisode: Episode? = null
 
@@ -183,8 +184,9 @@ internal class EpisodeRuntime(
     private var executingAction: String? = null
 
     /**
-     * The most recently completed episode, retained for lineage inspection.
-     * Completed episodes are otherwise discarded.
+     * The most recently completed episode, kept so callers can inspect
+     * what just finished and who published what. Completed episodes are
+     * otherwise discarded.
      */
     var lastCompletedEpisode: Episode? = null
         private set
@@ -193,11 +195,11 @@ internal class EpisodeRuntime(
     private val activeEpisodes = mutableMapOf<ResolvedEpisodeRule, Episode>()
 
     /**
-     * Standing instances shadowed for an episode's outcome window: without
-     * this, a founding-frame product of a consumable type would keep the
-     * goal satisfied and the episode would complete vacuously, consuming
-     * its occurrence without running its chain. Shadowed at admission,
-     * revealed at completion: founding products are shadowed, never consumed.
+     * Pre-existing instances hidden for the length of an episode: without
+     * this, an old object of a type the episode is meant to produce would
+     * make the goal look already satisfied, and the episode would complete
+     * without running its chain. Hidden when the episode starts, made
+     * visible again when it completes - hidden, never consumed.
      */
     private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
 
@@ -228,17 +230,16 @@ internal class EpisodeRuntime(
 
     /**
      * Set by the platform on children of an evolving process: evolve from
-     * inside a child delegates up the tower to the nearest evolving
-     * ancestor, so chain actions publish occurrences exactly as frame
-     * actions do.
+     * inside a child hands the fact to the nearest evolving ancestor,
+     * however deep the nesting, so an action publishes the same way
+     * whether it runs in the parent or in a child.
      */
     var evolveDelegate: ((Any) -> Unit)? = null
 
     /**
-     * Publish a fact as an occurrence. The process evolves only at evolve
-     * boundaries, and every evolution is handled inside an episode: the
-     * instance is admitted to the rule that names its type as a required
-     * off-chain input, serially, and consumed by identity on completion.
+     * Publish a fact that asks for one run of an episode. The fact goes to
+     * the rule whose chain needs its type as an input, one run at a time,
+     * and exactly this instance is consumed when the run completes.
      */
     fun evolve(fact: Any) {
         if (derivedScope == null) {
@@ -262,14 +263,13 @@ internal class EpisodeRuntime(
         resolvedEpisodes.filter { it.isEvolvedEligible(fact) }
 
     /**
-     * Routing is planning: a contested arrival is owned by the rule whose
-     * goal the planner values highest given the arrival, the same best-value
-     * decision default mode makes over shared input types. Ownership is part
-     * of the arrival boundary fact, decided once here and never renegotiated,
-     * so a busy rule cannot lose an arrival that belongs to it on the merits.
-     * Ties go to the first-declared candidate, matching the planner's own
-     * stable ordering. Same-class competitors are hidden during the
-     * competition, mirroring request grounding.
+     * When more than one rule could take an arriving fact, the rule whose
+     * goal has the highest declared value in the current world owns it.
+     * Ownership is decided once and not revisited, so a rule that is busy
+     * cannot lose a fact that belongs to it. Ties go to the first-declared
+     * candidate. Other instances of the same class are hidden while the
+     * values are read, so a value function that inspects the world sees
+     * only the arriving fact.
      */
     private fun routeByPlan(fact: Any, candidates: List<ResolvedEpisodeRule>): ResolvedEpisodeRule? {
         val competitors = blackboard.objects.filter { it !== fact && fact.javaClass.isInstance(it) }
@@ -343,8 +343,9 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Resume admissions deferred at an episode boundary once founding-scope
-     * work is no longer plannable: terminal evaluation precedes rearming.
+     * Admit waiting episodes once the process's own work is out of moves.
+     * Work that could end the process always runs before the next episode
+     * is allowed to start.
      */
     private fun admitDeferred() {
         if (derivedScope == null) {
@@ -389,12 +390,11 @@ internal class EpisodeRuntime(
         // state, and a fresh request makes it unachieved by definition
         achievedFrameGoals -= rule.goalsByName.keys
         if (activeEpisodes[rule] == null && foundingWorkPlannable()) {
-            // Terminal evaluation precedes rearming for fresh arrivals too:
-            // plannable founding work runs before any admission re-arms the
-            // rule, whichever path the occurrence came in by
+            // Work that could end the process runs before any new episode
+            // starts, whichever path the fact came in by
             blackboard.hide(episode.request)
             pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
-            logger.debug("Process {} deferred {}: terminal evaluation precedes admission", id, episode)
+            logger.debug("Process {} deferred {}: work that could end the process runs first", id, episode)
             return
         }
         if (activeEpisodes.putIfAbsent(rule, episode) == null) {
@@ -409,9 +409,9 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Complete the active episode: consume its request by identity. Rearm
-     * is the caller's decision, because terminal evaluation sits between
-     * consumption and the next admission.
+     * Complete the active episode and consume exactly its request. Whether
+     * the next waiting episode starts is the caller's decision, because
+     * work that could end the process gets its chance first.
      */
     private fun completeActiveEpisode(rule: ResolvedEpisodeRule): Boolean {
         val episode = activeEpisodes.remove(rule) ?: return false
@@ -455,12 +455,12 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Completes a goal episode without completing the process: consumes the
-     * active episode's request and its attributed consumables (satisfying
-     * output and any intermediates this occurrence made) by identity, then keeps the process running so ordinary
-     * selection resumes at the next planning tick. The next pending episode,
-     * if any, is admitted once no founding-scope work is plannable - terminal
-     * evaluation precedes rearming - and replans the entire chain fresh.
+     * Completes one episode without completing the process: consumes the
+     * episode's request and exactly the objects this run made - its final
+     * output and any intermediates - then keeps the process running so
+     * normal planning resumes. The next waiting episode, if any, starts
+     * once the process's own work is out of moves, and plans its chain
+     * from scratch.
      */
     private fun completeEpisode(
         rule: ResolvedEpisodeRule,
@@ -475,7 +475,7 @@ internal class EpisodeRuntime(
         val consumedConsumables = consumeAttributed(rule, goal.name)
         val consumedRequest = completeActiveEpisode(rule)
         if (foundingWorkPlannable()) {
-            logger.debug("Process {} deferring admission: terminal evaluation precedes rearming", id)
+            logger.debug("Process {} deferring admission: work that could end the process runs first", id)
         } else {
             admitNext(rule)
         }
@@ -522,13 +522,14 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * An incidental founding-frame achievement is recorded and withdrawn
-     * from planning; the process resumes instead of completing.
+     * A goal outside any episode was achieved along the way: record it and
+     * remove it from planning. The process keeps running - only the
+     * declared objective ends it.
      */
     fun recordFrameAchievement(goalName: String) {
         achievedFrameGoals += goalName
         logger.info(
-            "Process {} achieved frame goal {} and resumes: completion is anchored to the objective",
+            "Process {} achieved goal {} along the way and keeps running: only the objective ends the process",
             id,
             goalName,
         )
@@ -543,12 +544,11 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Terminal evaluation precedes rearming: at an episode boundary,
-     * founding-scope work that is plannable runs before any pending
-     * occurrence is admitted, so termination never depends on value tuning
-     * between a terminal plan and the next episode. Founding scope is every
-     * goal not owned by an activated rule, evaluated on the
-     * post-consumption world.
+     * True when the process's own work - any goal not owned by an episode
+     * rule - still has a possible plan in the world as it stands after
+     * consumption. While it does, that work runs before any waiting
+     * episode starts, so whether the process can end never depends on how
+     * its values compare with the next episode's.
      */
     private fun foundingWorkPlannable(): Boolean {
         if (derivedScope == null) {
@@ -609,10 +609,11 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Execute a frame action. Under one execution model everything the
-     * parent runs is founding-frame work - episode chains execute only in
-     * children - so the only bookkeeping is lineage: an evolve the action
-     * publishes records the founding episode as its cause.
+     * Execute an action in the parent process. Episode chains only run in
+     * child processes, so everything the parent itself runs is its own
+     * long-running work. The only bookkeeping here is publisher tracking:
+     * a fact this action publishes records the outermost episode as its
+     * publisher.
      */
     fun executingInFrame(action: Action, execute: () -> ActionStatus): ActionStatus {
         executingEpisode = foundingEpisode
@@ -633,8 +634,9 @@ internal class EpisodeRuntime(
      */
     fun gatedChainActions(): Set<String> =
         // An activated rule's chain is never the parent planner's to run:
-        // the framework dispatches it. The gate holds against opportunistic
-        // value selection, which picks achievable actions without a goal
+        // the framework dispatches it. The exclusion also holds against
+        // value-driven planners, which pick any runnable action by value
+        // without needing a goal to justify it
         resolvedEpisodes
             .filter { episodicNow(it) }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
@@ -647,11 +649,12 @@ internal class EpisodeRuntime(
         rule in activatedRules
 
     /**
-     * The planning system for the next tick: achieved founding-frame goals
-     * are withdrawn so a satisfied incident never outcompetes the mission,
-     * and activated rules' goals are withdrawn because they belong to the
-     * dispatch machinery - the parent can never plan toward or complete an
-     * episodic goal, not even vacuously off a satisfied condition.
+     * The planning system for the next planning round: goals already
+     * achieved along the way are removed so finished work never outranks
+     * the remaining work, and goals that belong to episodes are removed
+     * because only dispatch may complete them - the parent can never plan
+     * toward an episode's goal, not even when its condition already looks
+     * satisfied.
      */
     fun planningSystem(): PlanningSystem {
         val withdrawn = achievedFrameGoals +
@@ -669,20 +672,21 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Selection is the planner's: active episodes are
-     * valued by the plans their children would run and compete with frame
-     * work on net value. One execution per tick, so standing work and
-     * other episodes interleave exactly as value dictates. An unplannable
-     * chain is never a candidate, so a blocked episode never spawns a
-     * doomed child.
+     * Each planning round, the best active episode - ranked by its goal's
+     * declared value - competes with the process's own best plan, and the
+     * winner runs. One execution per round, so the process's own work and
+     * its episodes interleave by value. Nothing is proven about a chain
+     * before it runs: the child's run is the verdict, and an episode
+     * whose child blocked waits for the blackboard to change before it is
+     * tried again.
      */
     fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean {
         val choice = executor.choices(activeEpisodes, agent, worldState).maxByOrNull { it.value } ?: return false
         if (plan != null && plan.netValue(worldState) > choice.value) {
             return false
         }
-        // An evolve delegated up from inside the child records the
-        // dispatching episode as its cause: lineage rides the dispatch
+        // A fact published from inside the child records the dispatching
+        // episode as its publisher
         executingEpisode = choice.episode
         val execution = try {
             executor.execute(choice)
