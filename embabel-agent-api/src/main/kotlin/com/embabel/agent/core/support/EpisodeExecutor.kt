@@ -53,6 +53,7 @@ internal class EpisodeExecutor(
     fun execute(
         episode: Episode,
         mission: ChildMission,
+        onChildCreated: (AgentProcess) -> Unit,
     ): DispatchOutcome {
         if (childCount >= process.processOptions.budget.actions) {
             logger.warn(
@@ -63,14 +64,10 @@ internal class EpisodeExecutor(
             return DispatchOutcome.BUDGET_EXHAUSTED
         }
 
-        // The planner supplies the goals. The action scope remains intact:
-        // the runtime never synthesizes a chain-shaped agent.
-        val childAgent = process.agent.copy(
-            goals = mission.goals.mapTo(mutableSetOf()) { goal ->
-                goal as? com.embabel.agent.core.Goal
-                    ?: error("Child mission goal ${goal.name} is not an agent goal")
-            }
-        )
+        // The mission is planner-owned and opaque here. Its materialization
+        // operation supplies the complete child agent without exposing goals,
+        // actions, costs, or dependencies to the runtime.
+        val childAgent = mission.materialize(process.agent)
         val child = process.processContext.platformServices.agentPlatform.createChildProcess(
             childAgent,
             process,
@@ -82,6 +79,7 @@ internal class EpisodeExecutor(
         // blackboard binding receives that exact identity.
         child.addObject(episode.request)
         recordChild(child)
+        onChildCreated(child)
 
         val result = runCatching { child.run() }.getOrElse { failure ->
             logger.warn(

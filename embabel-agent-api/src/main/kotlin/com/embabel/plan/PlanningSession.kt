@@ -15,6 +15,9 @@
  */
 package com.embabel.plan
 
+import com.embabel.agent.core.Agent
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.OccurrenceId
 
 /**
@@ -33,16 +36,17 @@ data class RootMission(
 data class PlanningSessionRequest(
     val planningSystem: PlanningSystem,
     val rootMission: RootMission?,
+    val rootObjective: GoalTarget? = null,
 )
 
 /**
  * Runtime-owned lifecycle state exposed to the planner. The runtime never
  * decides what this state means for planning.
  */
-enum class PlanningEpisodeState {
+enum class PlanningOccurrenceState {
     PENDING,
     RUNNING,
-    STUCK,
+    AWAITING,
 }
 
 /**
@@ -52,13 +56,13 @@ enum class PlanningEpisodeState {
  * The selected planner decides when to use that window and what conclusions
  * to draw from it.
  */
-interface PlanningEpisodeView {
+interface PlanningOccurrenceView {
 
     val id: OccurrenceId
 
     val occurrence: Any
 
-    val state: PlanningEpisodeState
+    val state: PlanningOccurrenceState
 
     val attemptCount: Int
 
@@ -67,43 +71,35 @@ interface PlanningEpisodeView {
     fun <T> evaluate(block: () -> T): T
 }
 
-enum class ExecutionOutcomeCode {
-    COMPLETED,
-    STUCK,
-    FAILED,
-    CANCELLED,
-}
-
-/**
- * An observed child result. It is evidence for the planner, not a lifecycle
- * decision by the runtime.
- */
-data class ExecutionOutcome(
-    val episodeId: OccurrenceId,
-    val code: ExecutionOutcomeCode,
-    val detail: Any? = null,
-)
-
 data class PlanningTurn(
     val revision: Long,
-    val episodes: List<PlanningEpisodeView>,
-    val outcomes: List<ExecutionOutcome>,
+    val occurrences: List<PlanningOccurrenceView>,
+    val outcomes: List<EpisodeExecution>,
     val excludedActionNames: Set<String> = emptySet(),
     val availableChildCapacity: Int = 1,
 )
 
 /**
- * A planner-produced mission for a fresh child. The runtime applies these
- * declared goals without deriving or filtering an action chain.
+ * A planner-produced mission for a fresh child. Its representation is opaque
+ * to the runtime; only the planner-owned materialization operation is visible.
  */
 interface ChildMission {
 
-    val goals: Set<Goal>
+    fun materialize(parent: Agent): Agent
 }
 
-data class GoalChildMission(
-    override val goals: Set<Goal>,
-) : ChildMission
+class GoalChildMission(
+    private val goals: Set<Goal>,
+) : ChildMission {
+
+    override fun materialize(parent: Agent): Agent =
+        parent.copy(
+            goals = goals.mapTo(mutableSetOf()) { goal ->
+                goal as? com.embabel.agent.core.Goal
+                    ?: error("Child mission goal ${goal.name} is not an agent goal")
+            }
+        )
+}
 
 data class PlannerExecution(
     val plan: Plan,
@@ -125,22 +121,22 @@ sealed interface PlanningDirective {
     ) : PlanningDirective
 
     data class RunEpisode(
-        val episodeId: OccurrenceId,
+        val occurrenceId: OccurrenceId,
         val mission: ChildMission,
     ) : PlanningDirective
 
-    data class AwaitEpisode(
-        val episodeId: OccurrenceId,
+    data class AwaitOccurrence(
+        val occurrenceId: OccurrenceId,
         val interest: WorldInterest,
         val obstruction: PlanningObstruction? = null,
     ) : PlanningDirective
 
-    data class CompleteEpisode(
-        val episodeId: OccurrenceId,
+    data class CompleteOccurrence(
+        val occurrenceId: OccurrenceId,
     ) : PlanningDirective
 
-    data class CancelEpisode(
-        val episodeId: OccurrenceId,
+    data class CancelOccurrence(
+        val occurrenceId: OccurrenceId,
         val reason: String,
     ) : PlanningDirective
 

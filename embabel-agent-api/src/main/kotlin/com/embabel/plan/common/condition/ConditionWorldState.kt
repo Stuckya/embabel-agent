@@ -28,6 +28,29 @@ private const val LUMON_MEMBRANE_COLOR = 0xbeb780
 typealias ConditionState = Map<String, ConditionDetermination>
 
 /**
+ * Planner-owned evidence for why a condition has its current determination.
+ */
+sealed interface ConditionEvidence
+
+data class DeterminationEvidence(
+    val determination: ConditionDetermination,
+) : ConditionEvidence
+
+/**
+ * Evidence for a data-binding condition. Equality is intentionally
+ * referential so equal but distinct occurrence values remain distinct work.
+ */
+class BindingEvidence(
+    val value: Any?,
+) : ConditionEvidence {
+
+    override fun equals(other: Any?): Boolean =
+        other is BindingEvidence && value === other.value
+
+    override fun hashCode(): Int = System.identityHashCode(value)
+}
+
+/**
  * Determine the world state: the conditions that drive GOAP planning
  * Our conditions can have 3 values: true, false or unknown.
  * Unknown may be genuinely unknown, or it may mean that the condition has been lazily evaluated
@@ -47,6 +70,14 @@ interface WorldStateDeterminer {
      * Any previously UNKNOWN condition must be re-evaluated if possible.
      */
     fun determineCondition(condition: String): ConditionDetermination
+
+    /**
+     * Return planner evidence for the condition. Implementations that can
+     * identify a selected binding should override this; determination-only
+     * planners retain their existing behavior through the default.
+     */
+    fun determineEvidence(condition: String): ConditionEvidence =
+        DeterminationEvidence(determineCondition(condition))
 
     companion object {
 

@@ -17,6 +17,7 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.api.common.PlatformServices
 import com.embabel.agent.api.event.AgentProcessPlanFormulatedEvent
+import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ReplanRequestedEvent
 import com.embabel.agent.api.tool.TerminateActionException
@@ -71,6 +72,7 @@ open class SimpleAgentProcess(
         process = this,
         setStatus = ::setStatus,
         makeRunning = ::makeRunning,
+        onOccurrenceConsumed = ::emitLegacyEpisodeCompletion,
     )
 
     /**
@@ -205,6 +207,25 @@ open class SimpleAgentProcess(
         setStatus(AgentProcessStatusCode.COMPLETED)
     }
 
+    /**
+     * Compatibility event derived from the observed child result. Occurrence
+     * routing and completion remain planner directives owned by the session.
+     */
+    private fun emitLegacyEpisodeCompletion(
+        worldState: WorldState,
+        child: AgentProcess,
+    ) {
+        child.goal?.let { goal ->
+            processContext.onProcessEvent(
+                EpisodeCompletedEvent(
+                    agentProcess = this,
+                    worldState = worldState,
+                    goal = goal,
+                )
+            )
+        }
+    }
+
     protected fun sendProcessRunningEvent(
         plan: Plan,
         worldState: WorldState,
@@ -273,18 +294,18 @@ open class SimpleAgentProcess(
                 this
             }
 
-            is PlanningDirective.AwaitEpisode -> {
-                episodes.awaitEpisode(directive)
+            is PlanningDirective.AwaitOccurrence -> {
+                episodes.awaitOccurrence(directive)
                 this
             }
 
-            is PlanningDirective.CompleteEpisode -> {
-                episodes.completeEpisode(directive, worldState)
+            is PlanningDirective.CompleteOccurrence -> {
+                episodes.completeOccurrence(directive, worldState)
                 this
             }
 
-            is PlanningDirective.CancelEpisode -> {
-                episodes.cancelEpisode(directive)
+            is PlanningDirective.CancelOccurrence -> {
+                episodes.cancelOccurrence(directive)
                 this
             }
 

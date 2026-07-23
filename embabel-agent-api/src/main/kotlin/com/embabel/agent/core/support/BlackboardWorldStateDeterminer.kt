@@ -22,6 +22,8 @@ import com.embabel.agent.core.ProcessContext
 import com.embabel.agent.core.expression.LogicalExpressionParser
 import com.embabel.agent.core.satisfiesType
 import com.embabel.plan.common.condition.ConditionDetermination
+import com.embabel.plan.common.condition.BindingEvidence
+import com.embabel.plan.common.condition.ConditionEvidence
 import com.embabel.plan.common.condition.ConditionWorldState
 import com.embabel.plan.common.condition.WorldStateDeterminer
 import com.fasterxml.jackson.annotation.JsonIgnore
@@ -172,6 +174,23 @@ class BlackboardWorldStateDeterminer(
             )
         }
         return conditionDetermination
+    }
+
+    override fun determineEvidence(condition: String): ConditionEvidence {
+        val logicalExpression = logicalExpressionParser.parse(condition)
+        if (logicalExpression != null || !condition.contains(":")) {
+            return super.determineEvidence(condition)
+        }
+
+        val (variable, type) = condition.split(":")
+        val namedValue = processContext.blackboard[variable]
+        return BindingEvidence(
+            if (namedValue is Map<*, *>) {
+                namedValue
+            } else {
+                processContext.agentProcess.getValue(variable, type)
+            }
+        )
     }
 
     private fun resolveAsAgentCondition(condition: String): Condition? {

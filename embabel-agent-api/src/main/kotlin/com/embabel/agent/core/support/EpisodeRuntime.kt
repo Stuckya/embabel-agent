@@ -15,23 +15,25 @@
  */
 package com.embabel.agent.core.support
 
-import com.embabel.agent.api.event.EpisodeCompletedEvent
+import com.embabel.agent.api.event.EpisodeFinishedEvent
+import com.embabel.agent.api.event.EpisodeStartedEvent
 import com.embabel.agent.api.event.OccurrenceAcceptedEvent
+import com.embabel.agent.api.event.OccurrenceConsumedEvent
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.GoalTarget
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.EpisodeId
+import com.embabel.agent.core.EpisodeOutcome
+import com.embabel.agent.core.EpisodeTrace
 import com.embabel.agent.core.OccurrenceId
-import com.embabel.plan.ExecutionOutcome
-import com.embabel.plan.ExecutionOutcomeCode
 import com.embabel.plan.PlanningDirective
-import com.embabel.plan.PlanningEpisodeState
-import com.embabel.plan.PlanningEpisodeView
+import com.embabel.plan.PlanningOccurrenceState
+import com.embabel.plan.PlanningOccurrenceView
 import com.embabel.plan.PlanningSession
 import com.embabel.plan.PlanningSessionRequest
 import com.embabel.plan.PlanningTurn
-import com.embabel.plan.RootMission
 import com.embabel.plan.WorldState
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -48,6 +50,7 @@ internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
     private val setStatus: (AgentProcessStatusCode) -> Unit,
     private val makeRunning: () -> Boolean,
+    private val onOccurrenceConsumed: (WorldState, AgentProcess) -> Unit,
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -59,15 +62,13 @@ internal class EpisodeRuntime(
         }
     }
 
-    private val objectiveGoals: Set<String> =
-        evolvingDeclaration?.let { resolveObjective(it.objective) }.orEmpty()
-
     private val session: PlanningSession? =
         evolvingDeclaration?.let {
             process.planner.openSession(
                 PlanningSessionRequest(
                     planningSystem = process.agent.planningSystem,
-                    rootMission = objectiveGoals.takeIf(Set<String>::isNotEmpty)?.let(::RootMission),
+                    rootMission = null,
+                    rootObjective = it.objective,
                 )
             )
         }
@@ -81,12 +82,19 @@ internal class EpisodeRuntime(
 
     private val acceptedOccurrences = ConcurrentLinkedQueue<AcceptedOccurrence>()
     private val episodes = linkedMapOf<OccurrenceId, Episode>()
-    private val outcomes = ArrayDeque<ExecutionOutcome>()
-    private val missions = mutableMapOf<OccurrenceId, com.embabel.plan.ChildMission>()
+    private val outcomes = ArrayDeque<EpisodeExecution>()
+    private val lastExecutionIds = mutableMapOf<OccurrenceId, EpisodeId>()
+    private val lastExecutionChildren = mutableMapOf<OccurrenceId, AgentProcess>()
     private val executor by lazy { EpisodeExecutor(process) }
 
     private var revision: Long = 0
-    private val executingEpisode = ThreadLocal<Episode?>()
+    private data class ExecutingEpisode(
+        val occurrence: Episode,
+        val episodeId: EpisodeId,
+        var childProcessId: String? = null,
+    )
+
+    private val executingEpisode = ThreadLocal<ExecutingEpisode?>()
     private val executingAction = ThreadLocal<String?>()
 
     var lastCompletedEpisode: Episode? = null
@@ -97,7 +105,9 @@ internal class EpisodeRuntime(
     val frameworkChildCount: Int get() = executor.childCount
 
     val retainedArrivalBookkeeping: Int
-        get() = acceptedOccurrences.size + episodes.size + outcomes.size + missions.size
+        get() =
+            acceptedOccurrences.size + episodes.size + outcomes.size +
+                    lastExecutionIds.size + lastExecutionChildren.size
 
     fun activeEpisode(id: OccurrenceId): Episode? = episodes[id]
 
@@ -129,10 +139,11 @@ internal class EpisodeRuntime(
         }
 
         val occurrenceId = OccurrenceId.create()
+        val execution = executingEpisode.get()
         val accepted = AcceptedOccurrence(
             id = occurrenceId,
             occurrence = fact,
-            causedBy = executingEpisode.get(),
+            causedBy = execution?.occurrence,
             publishedBy = publishedBy,
         )
         acceptedOccurrences += accepted
@@ -142,6 +153,8 @@ internal class EpisodeRuntime(
                 occurrenceId = occurrenceId,
                 occurrence = fact,
                 causedBy = accepted.causedBy?.id,
+                causedByEpisodeId = execution?.episodeId,
+                causedByChildProcessId = execution?.childProcessId,
                 publishedBy = publishedBy,
             )
         )
@@ -174,7 +187,7 @@ internal class EpisodeRuntime(
         admitAcceptedOccurrences()
         val turn = PlanningTurn(
             revision = revision,
-            episodes = episodes.values.map(::viewOf),
+            occurrences = episodes.values.map(::viewOf),
             outcomes = outcomes.toList(),
             excludedActionNames = excludedActionNames,
             availableChildCapacity = 1,
@@ -185,72 +198,115 @@ internal class EpisodeRuntime(
     }
 
     fun runEpisode(directive: PlanningDirective.RunEpisode) {
-        val episode = requireEpisode(directive.episodeId)
+        val episode = requireEpisode(directive.occurrenceId)
+        val episodeId = EpisodeId.create()
         episode.run()
-        missions[episode.id] = directive.mission
-        executingEpisode.set(episode)
+        val execution = ExecutingEpisode(episode, episodeId)
+        executingEpisode.set(execution)
         val outcome = try {
-            executor.execute(episode, directive.mission)
+            executor.execute(episode, directive.mission) { child ->
+                execution.childProcessId = child.id
+                process.processContext.onProcessEvent(
+                    EpisodeStartedEvent(
+                        agentProcess = process,
+                        occurrenceId = episode.id,
+                        episodeId = episodeId,
+                        childProcessId = child.id,
+                    )
+                )
+            }
         } finally {
             executingEpisode.remove()
         }
+        val child = executor.recentChildrenView.lastOrNull()
+        val completedExecution = if (child != null) {
+            val terminalOutcome = when (outcome) {
+                DispatchOutcome.COMPLETED -> EpisodeOutcome.COMPLETED
+                DispatchOutcome.STUCK -> EpisodeOutcome.STUCK
+                DispatchOutcome.FAILED -> EpisodeOutcome.FAILED
+                DispatchOutcome.CANCELLED -> EpisodeOutcome.CANCELLED
+                DispatchOutcome.BUDGET_EXHAUSTED -> null
+            }
+            if (terminalOutcome != null) {
+                val completed = EpisodeExecution(
+                    id = episodeId,
+                    occurrenceId = episode.id,
+                    childProcessId = child.id,
+                    outcome = terminalOutcome,
+                    trace = EpisodeTrace(child.history.toList()),
+                )
+                lastExecutionIds[episode.id] = episodeId
+                lastExecutionChildren[episode.id] = child
+                process.processContext.onProcessEvent(
+                    EpisodeFinishedEvent(
+                        agentProcess = process,
+                        execution = completed,
+                    )
+                )
+                completed
+            } else {
+                null
+            }
+        } else {
+            null
+        }
         when (outcome) {
-            DispatchOutcome.COMPLETED ->
-                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.COMPLETED)
-
-            DispatchOutcome.STUCK ->
-                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.STUCK)
+            DispatchOutcome.COMPLETED,
+            DispatchOutcome.STUCK,
+                -> Unit
 
             DispatchOutcome.FAILED -> {
                 episode.retry()
-                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.FAILED)
             }
 
-            DispatchOutcome.CANCELLED ->
-                outcomes += ExecutionOutcome(episode.id, ExecutionOutcomeCode.CANCELLED)
+            DispatchOutcome.CANCELLED -> Unit
 
             DispatchOutcome.BUDGET_EXHAUSTED -> {
                 setStatus(AgentProcessStatusCode.TERMINATED)
                 return
             }
         }
+        completedExecution?.let(outcomes::addLast)
         advanceRevision()
         makeRunning()
     }
 
-    fun awaitEpisode(directive: PlanningDirective.AwaitEpisode) {
-        requireEpisode(directive.episodeId).await(revision)
+    fun awaitOccurrence(directive: PlanningDirective.AwaitOccurrence) {
+        requireEpisode(directive.occurrenceId).await(revision)
         makeRunning()
     }
 
-    fun completeEpisode(
-        directive: PlanningDirective.CompleteEpisode,
+    fun completeOccurrence(
+        directive: PlanningDirective.CompleteOccurrence,
         worldState: WorldState,
     ) {
-        val episode = requireEpisode(directive.episodeId)
+        val episode = requireEpisode(directive.occurrenceId)
         episode.complete()
         episodes.remove(episode.id)
-        val mission = missions.remove(episode.id)
+        val completedExecutionId = lastExecutionIds.remove(episode.id)
+        val completedChild = lastExecutionChildren.remove(episode.id)
         lastCompletedEpisode = episode
-        val goal = mission?.goals?.firstOrNull { it.name != NIRVANA.name }
-            ?: mission?.goals?.firstOrNull()
-        if (goal != null && makeRunning()) {
+        if (completedChild != null && makeRunning()) {
+            onOccurrenceConsumed(worldState, completedChild)
+        }
+        if (completedExecutionId != null) {
             process.processContext.onProcessEvent(
-                EpisodeCompletedEvent(
+                OccurrenceConsumedEvent(
                     agentProcess = process,
-                    worldState = worldState,
-                    goal = goal,
+                    occurrenceId = episode.id,
+                    episodeId = completedExecutionId,
                 )
             )
         }
         advanceRevision()
     }
 
-    fun cancelEpisode(directive: PlanningDirective.CancelEpisode) {
-        val episode = requireEpisode(directive.episodeId)
+    fun cancelOccurrence(directive: PlanningDirective.CancelOccurrence) {
+        val episode = requireEpisode(directive.occurrenceId)
         episode.cancel()
         episodes.remove(episode.id)
-        missions.remove(episode.id)
+        lastExecutionIds.remove(episode.id)
+        lastExecutionChildren.remove(episode.id)
         advanceRevision()
         makeRunning()
     }
@@ -274,14 +330,14 @@ internal class EpisodeRuntime(
         }
     }
 
-    private fun viewOf(episode: Episode): PlanningEpisodeView =
-        object : PlanningEpisodeView {
+    private fun viewOf(episode: Episode): PlanningOccurrenceView =
+        object : PlanningOccurrenceView {
             override val id = episode.id
             override val occurrence = episode.request
             override val state = when (episode.state) {
-                EpisodeState.PENDING -> PlanningEpisodeState.PENDING
-                EpisodeState.RUNNING -> PlanningEpisodeState.RUNNING
-                EpisodeState.STUCK -> PlanningEpisodeState.STUCK
+                EpisodeState.PENDING -> PlanningOccurrenceState.PENDING
+                EpisodeState.RUNNING -> PlanningOccurrenceState.RUNNING
+                EpisodeState.STUCK -> PlanningOccurrenceState.AWAITING
                 EpisodeState.COMPLETED,
                 EpisodeState.CANCELLED,
                     -> error("Terminal episode ${episode.id} remained active")
@@ -317,30 +373,4 @@ internal class EpisodeRuntime(
         revision++
     }
 
-    /**
-     * Resolve only an explicit declaration. This does not inspect action
-     * preconditions, effects, producers, consumers, or reachability.
-     */
-    private fun resolveObjective(target: GoalTarget?): Set<String> {
-        if (target == null) {
-            return emptySet()
-        }
-        val candidates = process.agent.goals.filter { goal ->
-            when (target) {
-                is GoalTarget.Named -> goal.name == target.goalName
-                is GoalTarget.Output -> goal.outputType?.isAssignableTo(target.satisfiedByType) == true
-            }
-        }
-        require(candidates.isNotEmpty()) {
-            "Evolving objective $target resolves to no declared goal in scope. " +
-                    "Available goals: ${process.agent.goals.joinToString { it.name }.ifEmpty { "none" }}"
-        }
-        if (target is GoalTarget.Named) {
-            require(candidates.size == 1) {
-                "Evolving objective $target resolves to ${candidates.size} declared goals; " +
-                        "a named target must identify exactly one"
-            }
-        }
-        return candidates.mapTo(mutableSetOf()) { it.name }
-    }
 }

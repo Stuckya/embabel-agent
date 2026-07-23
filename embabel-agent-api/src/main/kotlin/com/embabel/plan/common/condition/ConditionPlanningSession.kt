@@ -15,16 +15,16 @@
  */
 package com.embabel.plan.common.condition
 
+import com.embabel.agent.core.EpisodeOutcome
 import com.embabel.plan.ChildMission
-import com.embabel.plan.ExecutionOutcomeCode
 import com.embabel.plan.Goal
 import com.embabel.plan.GoalChildMission
 import com.embabel.plan.NoPlanForOccurrence
 import com.embabel.plan.Plan
 import com.embabel.plan.PlannerExecution
 import com.embabel.plan.PlanningDirective
-import com.embabel.plan.PlanningEpisodeState
-import com.embabel.plan.PlanningEpisodeView
+import com.embabel.plan.PlanningOccurrenceState
+import com.embabel.plan.PlanningOccurrenceView
 import com.embabel.plan.PlanningSession
 import com.embabel.plan.PlanningSessionRequest
 import com.embabel.plan.PlanningSystem
@@ -35,10 +35,9 @@ import com.embabel.plan.WorldInterest
  * Session implementation shared by condition-based planners.
  *
  * It delegates plan construction, goal ordering, costs, values, and
- * feasibility to the selected planner. Its only occurrence-specific
- * reasoning is native condition-planner grounding: a plan is a candidate
- * for an occurrence when one of its own action preconditions explicitly
- * accepts that occurrence's runtime type.
+ * feasibility to the selected planner. Each occurrence is presented as a
+ * planner-visible world and the session accepts the planner's result without
+ * inspecting its actions or reconstructing why that plan is valid.
  */
 internal class ConditionPlanningSession(
     private val planner: ConditionPlanner,
@@ -50,28 +49,28 @@ internal class ConditionPlanningSession(
 
     override fun next(turn: PlanningTurn): PlanningDirective {
         turn.outcomes.firstOrNull()?.let { outcome ->
-            return when (outcome.code) {
-                ExecutionOutcomeCode.COMPLETED ->
-                    PlanningDirective.CompleteEpisode(outcome.episodeId)
+            return when (outcome.outcome) {
+                EpisodeOutcome.COMPLETED ->
+                    PlanningDirective.CompleteOccurrence(outcome.occurrenceId)
 
-                ExecutionOutcomeCode.STUCK ->
-                    PlanningDirective.AwaitEpisode(
-                        episodeId = outcome.episodeId,
+                EpisodeOutcome.STUCK ->
+                    PlanningDirective.AwaitOccurrence(
+                        occurrenceId = outcome.occurrenceId,
                         interest = WorldInterest.AnyRevision,
                         obstruction = NoPlanForOccurrence,
                     )
 
-                ExecutionOutcomeCode.CANCELLED ->
-                    PlanningDirective.CancelEpisode(outcome.episodeId, "Child attempt was cancelled")
+                EpisodeOutcome.CANCELLED ->
+                    PlanningDirective.CancelOccurrence(outcome.occurrenceId, "Child attempt was cancelled")
 
-                ExecutionOutcomeCode.FAILED -> chooseWork(turn)
+                EpisodeOutcome.FAILED -> chooseWork(turn)
             }
         }
         return chooseWork(turn)
     }
 
     private fun chooseWork(turn: PlanningTurn): PlanningDirective {
-        val system = scopedSystem(turn.excludedActionNames)
+        var system = scopedSystem(turn.excludedActionNames)
         var rootPlans = planner.plansToGoals(system)
 
         while (rootPlans.firstOrNull()?.isComplete() == true) {
@@ -80,21 +79,23 @@ internal class ConditionPlanningSession(
                 return PlanningDirective.CompleteProcess(completed.goal)
             }
             withdrawnRootGoals += completed.goal.name
-            rootPlans = planner.plansToGoals(scopedSystem(turn.excludedActionNames))
+            system = scopedSystem(turn.excludedActionNames)
+            rootPlans = planner.plansToGoals(system)
         }
 
+        val planningSnapshot = planner.snapshot(system)
         val root = rootPlans.firstOrNull()?.let { plan ->
             ValuedRoot(plan, plan.netValue(planner.worldState()))
         }
-        val episode = turn.episodes
+        val episode = turn.occurrences
             .asSequence()
-            .filter { it.state != PlanningEpisodeState.RUNNING }
+            .filter { it.state != PlanningOccurrenceState.RUNNING }
             .filter {
-                it.state != PlanningEpisodeState.STUCK ||
+                it.state != PlanningOccurrenceState.AWAITING ||
                         it.waitingSinceRevision == null ||
                         it.waitingSinceRevision != turn.revision
             }
-            .mapNotNull { candidateFor(it, system) }
+            .mapNotNull { candidateFor(it, system, planningSnapshot) }
             .maxByOrNull { it.value }
 
         if (root != null && (episode == null || root.value > episode.value)) {
@@ -102,18 +103,18 @@ internal class ConditionPlanningSession(
         }
         if (episode != null && turn.availableChildCapacity > 0) {
             return PlanningDirective.RunEpisode(
-                episodeId = episode.episode.id,
+                occurrenceId = episode.episode.id,
                 mission = episode.mission,
             )
         }
 
-        val awaiting = turn.episodes.firstOrNull {
-            it.state != PlanningEpisodeState.RUNNING &&
-                    (it.state != PlanningEpisodeState.STUCK || it.waitingSinceRevision != turn.revision)
+        val awaiting = turn.occurrences.firstOrNull {
+            it.state != PlanningOccurrenceState.RUNNING &&
+                    (it.state != PlanningOccurrenceState.AWAITING || it.waitingSinceRevision != turn.revision)
         }
         if (awaiting != null) {
-            return PlanningDirective.AwaitEpisode(
-                episodeId = awaiting.id,
+            return PlanningDirective.AwaitOccurrence(
+                occurrenceId = awaiting.id,
                 interest = WorldInterest.AnyRevision,
                 obstruction = NoPlanForOccurrence,
             )
@@ -122,12 +123,17 @@ internal class ConditionPlanningSession(
     }
 
     private fun candidateFor(
-        episode: PlanningEpisodeView,
+        episode: PlanningOccurrenceView,
         system: PlanningSystem,
+        planningSnapshot: ConditionPlanningSnapshot,
     ): ValuedEpisode? =
         episode.evaluate {
-            val plan = planner.plansToGoals(system)
-                .firstOrNull { it.actions.isNotEmpty() && acceptsOccurrence(it, episode.occurrence) }
+            val plan = planner.planForOccurrence(
+                system = system,
+                before = planningSnapshot,
+                occurrenceId = episode.id,
+                occurrence = episode.occurrence,
+            )
                 ?: return@evaluate null
             ValuedEpisode(
                 episode = episode,
@@ -135,28 +141,6 @@ internal class ConditionPlanningSession(
                 value = plan.netValue(planner.worldState()),
             )
         }
-
-    /**
-     * Condition-planner-native occurrence grounding. This is deliberately
-     * inside the planner session: the evolving runtime never walks actions,
-     * parses conditions, or identifies a producer/consumer chain.
-     */
-    private fun acceptsOccurrence(plan: Plan, occurrence: Any): Boolean =
-        plan.actions
-            .filterIsInstance<ConditionAction>()
-            .flatMap { action -> action.preconditions.keys }
-            .filter { it.startsWith(INPUT_CONDITION_PREFIX) }
-            .map { it.removePrefix(INPUT_CONDITION_PREFIX) }
-            .any { acceptsType(it, occurrence) }
-
-    private fun acceptsType(typeName: String, occurrence: Any): Boolean {
-        if (typeName == occurrence.javaClass.name || typeName == occurrence.javaClass.simpleName) {
-            return true
-        }
-        return runCatching {
-            Class.forName(typeName, false, occurrence.javaClass.classLoader).isInstance(occurrence)
-        }.getOrDefault(false)
-    }
 
     private fun scopedSystem(excludedActionNames: Set<String>): PlanningSystem {
         val declared = request.planningSystem
@@ -177,12 +161,9 @@ internal class ConditionPlanningSession(
     )
 
     private data class ValuedEpisode(
-        val episode: PlanningEpisodeView,
+        val episode: PlanningOccurrenceView,
         val mission: ChildMission,
         val value: Double,
     )
 
-    companion object {
-        private const val INPUT_CONDITION_PREFIX = "it:"
-    }
 }

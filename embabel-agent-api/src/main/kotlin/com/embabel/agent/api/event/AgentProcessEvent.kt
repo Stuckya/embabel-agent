@@ -20,6 +20,10 @@ import com.embabel.agent.core.ActionInvocation
 import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusReport
+import com.embabel.agent.core.EpisodeExecution
+import com.embabel.agent.core.EpisodeId
+import com.embabel.agent.core.EpisodeOutcome
+import com.embabel.agent.core.EpisodeTrace
 import com.embabel.agent.core.InProcess
 import com.embabel.agent.core.OccurrenceId
 import com.embabel.agent.core.ToolGroupMetadata
@@ -131,6 +135,51 @@ class OccurrenceAcceptedEvent(
     val occurrence: Any,
     val causedBy: OccurrenceId?,
     val publishedBy: String?,
+    val causedByEpisodeId: EpisodeId? = null,
+    val causedByChildProcessId: String? = null,
+) : AbstractAgentProcessEvent(agentProcess) {
+
+    val causedByOccurrenceId: OccurrenceId? get() = causedBy
+}
+
+/**
+ * One child episode has been created and is about to run.
+ */
+class EpisodeStartedEvent(
+    agentProcess: AgentProcess,
+    val occurrenceId: OccurrenceId,
+    val episodeId: EpisodeId,
+    val childProcessId: String,
+) : AbstractAgentProcessEvent(agentProcess)
+
+/**
+ * One child episode reached a terminal outcome. A STUCK or failed episode
+ * leaves its occurrence available for a later planning turn.
+ */
+class EpisodeFinishedEvent(
+    agentProcess: AgentProcess,
+    val execution: EpisodeExecution,
+) : AbstractAgentProcessEvent(agentProcess) {
+
+    val occurrenceId: OccurrenceId get() = execution.occurrenceId
+
+    val episodeId: EpisodeId get() = execution.id
+
+    val childProcessId: String get() = execution.childProcessId
+
+    val outcome: EpisodeOutcome get() = execution.outcome
+
+    val trace: EpisodeTrace get() = execution.trace
+}
+
+/**
+ * The planner declared an occurrence complete after observing an episode
+ * outcome. Consumption is distinct from child termination.
+ */
+class OccurrenceConsumedEvent(
+    agentProcess: AgentProcess,
+    val occurrenceId: OccurrenceId,
+    val episodeId: EpisodeId,
 ) : AbstractAgentProcessEvent(agentProcess)
 
 class ActionExecutionStartEvent(
