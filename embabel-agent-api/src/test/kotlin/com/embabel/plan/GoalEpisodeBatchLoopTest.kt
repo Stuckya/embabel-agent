@@ -24,8 +24,6 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
-import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -147,7 +145,7 @@ class GoalEpisodeBatchLoopTest {
                 .withPlannerType(PlannerType.HYBRID)
                 // No policy anywhere: both rules derive from the goal
                 // graph, and the objective anchors completion
-                .withEvolving(Evolving(GoalTarget.output(BatchMissionDone::class.java), EpisodeExecution.IN_PROCESS)),
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

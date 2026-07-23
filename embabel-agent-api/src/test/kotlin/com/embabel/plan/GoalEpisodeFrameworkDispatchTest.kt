@@ -24,8 +24,6 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
-import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -47,8 +45,7 @@ import kotlin.test.assertTrue
  * evolve; the framework runs each admitted episode in a child process it
  * synthesizes from the derived chain. No dispatch actions, no crew
  * authoring, no platform API in developer code - the complexity is hidden.
- * Child execution is the default under withEvolving; the in-process rung
- * is the declared opt-out.
+ * Child execution is the contract: there is no other rung.
  *
  * What it pins:
  * - Hidden complexity: a plain agent's evolved episode runs in a
@@ -183,10 +180,11 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `an ephemeral process cannot declare child execution - the conflict fails at construction`() {
-        // Child dispatch would reject the ephemeral parent only at first
-        // dispatch, mid-mission and outside containment. Fail at the
-        // declaration instead, naming the declared opt-out
+    fun `an ephemeral process cannot evolve - the conflict fails at construction`() {
+        // Episodes execute in child processes, which require the persistence
+        // the ephemeral declaration disclaims. Dispatch would reject the
+        // parent only mid-mission and outside containment: fail at the
+        // declaration instead
         val agent = AgentMetadataReader().createAgentMetadata(PlainCalibrationAgent()) as CoreAgent
         val rejection = assertThrows<IllegalArgumentException> {
             SimpleAgentProcess(
@@ -201,20 +199,8 @@ class GoalEpisodeFrameworkDispatchTest {
             )
         }
         assertTrue(
-            rejection.message!!.contains("IN_PROCESS"),
-            "The rejection names EpisodeExecution.IN_PROCESS as the opt-out: ${rejection.message}",
-        )
-        // Ephemeral with in-process execution spawns nothing and stays legal
-        SimpleAgentProcess(
-            "framework-dispatch-ephemeral-in-process",
-            null,
-            agent,
-            ProcessOptions.DEFAULT.withEphemeral(true)
-                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
-            InMemoryBlackboard(),
-            dummyPlatformServices(),
-            DefaultPlannerFactory,
-            Instant.now(),
+            rejection.message!!.contains("ephemeral"),
+            "The rejection names the conflicting declaration: ${rejection.message}",
         )
     }
 

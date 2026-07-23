@@ -57,9 +57,9 @@ open class ConcurrentAgentProcess(
 ) {
     override fun formulateAndExecutePlan(worldState: WorldState): AgentProcess {
         if (isEvolving) {
-            // Evolving mode executes serially in phase 1: episode attribution
-            // diffs the board around each action, which concurrent fan-out
-            // would corrupt. Concurrent width is phase 2's admission-width work
+            // Evolving mode executes serially in phase 1: evolve lineage
+            // rides per-action bookkeeping that concurrent fan-out would
+            // race. Concurrent width is phase 2's admission-width work
             return super.formulateAndExecutePlan(worldState)
         }
         admitArrivals()
@@ -130,7 +130,7 @@ open class ConcurrentAgentProcess(
                                 platformServices.asyncer.async {
                                     try {
                                         callbacks.forEach { it.onActionLaunched(process, action) }
-                                        executeActionAttributingConsumables(action, plan.goal.name)
+                                        executeFrameAction(action)
                                     } catch (rpe: ReplanRequestedException) {
                                         // Capture for post-execution handling; return TERMINATED so
                                         // the status aggregation loop doesn't fail on a missing value.

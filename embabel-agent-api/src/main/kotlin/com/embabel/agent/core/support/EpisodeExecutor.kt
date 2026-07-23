@@ -41,15 +41,15 @@ internal data class EpisodeChoice(
     val value: Double,
 )
 
-/** What executing a child episode did */
-internal enum class ChildExecution {
+/** What dispatching an episode did */
+internal enum class DispatchOutcome {
     COMPLETED,
     NOT_COMPLETED,
     BUDGET_EXHAUSTED,
 }
 
 /**
- * The child rung's execution adapter. It receives an already-selected
+ * The episode execution adapter. It receives an already-selected
  * episode and runs it: synthesizes the child from the derived chain,
  * spawns it with the parent's options minus the evolving declaration,
  * contains failure, and merges the outcome home. It never chooses which
@@ -57,7 +57,7 @@ internal enum class ChildExecution {
  * the values selection ranks, through the same full-path planner its
  * children run.
  */
-internal class ChildEpisodeExecutor(
+internal class EpisodeExecutor(
     private val process: SimpleAgentProcess,
     plannerFactory: PlannerFactory,
     worldStateDeterminer: WorldStateDeterminer,
@@ -122,7 +122,7 @@ internal class ChildEpisodeExecutor(
      * action budget bounds total dispatches; a failing child is contained,
      * its occurrence unconsumed, awaiting redispatch when next selected.
      */
-    fun execute(choice: EpisodeChoice): ChildExecution {
+    fun execute(choice: EpisodeChoice): DispatchOutcome {
         if (childCount >= process.processOptions.budget.actions) {
             // A persistent crash burns to this brake: name the failures so
             // exhaustion by failure never masquerades as ordinary spend
@@ -132,7 +132,7 @@ internal class ChildEpisodeExecutor(
                 process.processOptions.budget.actions,
                 failedDispatches,
             )
-            return ChildExecution.BUDGET_EXHAUSTED
+            return DispatchOutcome.BUDGET_EXHAUSTED
         }
         val childAgent = process.agent.copy(
             actions = choice.chainActions,
@@ -149,6 +149,7 @@ internal class ChildEpisodeExecutor(
             process,
             process.processOptions.copy(evolving = null, plannerType = PlannerType.GOAP),
         )
+        groundRequestWindow(choice, child)
         recordChild(child)
         // A failing child is contained: the parent keeps running, the
         // occurrence stays unconsumed, and a later selection respawns
@@ -160,7 +161,7 @@ internal class ChildEpisodeExecutor(
                 choice.goal.name,
                 failure,
             )
-            return ChildExecution.NOT_COMPLETED
+            return DispatchOutcome.NOT_COMPLETED
         }
         if (completed.status == AgentProcessStatusCode.FAILED) {
             failedDispatches++
@@ -170,7 +171,7 @@ internal class ChildEpisodeExecutor(
                 choice.goal.name,
                 completed.failureInfo?.let { ": $it" } ?: "",
             )
-            return ChildExecution.NOT_COMPLETED
+            return DispatchOutcome.NOT_COMPLETED
         }
         if (completed.status != AgentProcessStatusCode.COMPLETED) {
             logger.debug(
@@ -179,17 +180,17 @@ internal class ChildEpisodeExecutor(
                 choice.goal.name,
                 completed.status,
             )
-            return ChildExecution.NOT_COMPLETED
+            return DispatchOutcome.NOT_COMPLETED
         }
         mergeOutcome(choice, child, parentVisible)
-        return ChildExecution.COMPLETED
+        return DispatchOutcome.COMPLETED
     }
 
     /**
      * Merge-back: everything the chain wrote comes home, so accumulator
-     * patterns author identically on both rungs. Consumable-typed
-     * instances are recorded onto the episode and consumed at completion;
-     * undeclared standing writes survive as they would in-process. A
+     * patterns author identically inside and outside episodes.
+     * Consumable-typed instances are recorded onto the episode and
+     * consumed at completion; undeclared standing writes survive. A
      * narrower contract would strand standing state in the child: a chain
      * whose loop condition reads a stranded accumulator self-chains
      * forever.
@@ -209,6 +210,20 @@ internal class ChildEpisodeExecutor(
                     choice.episode.record(anchor, instance)
                 }
             }
+    }
+
+    /**
+     * The request window, structurally: in the child's world the episode's
+     * request is the only visible instance of its own class, so binding by
+     * type resolves the occurrence the episode holds, not a newer plain
+     * fact riding the snapshot. Standard ground-action semantics per
+     * occurrence (AIMA 3e SS10.1).
+     */
+    private fun groundRequestWindow(choice: EpisodeChoice, child: AgentProcess) {
+        val requestClass = choice.episode.request.javaClass
+        child.objects
+            .filter { it !== choice.episode.request && requestClass.isInstance(it) }
+            .forEach(child::hide)
     }
 
     private fun recordChild(child: AgentProcess) {

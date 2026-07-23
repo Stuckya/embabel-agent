@@ -21,7 +21,6 @@ import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ReplanRequestedEvent
 import com.embabel.agent.api.tool.TerminateActionException
 import com.embabel.agent.api.tool.TerminateAgentException
-import com.embabel.agent.api.tool.ToolControlFlowSignal
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.ActionStatus
 import com.embabel.agent.core.Agent
@@ -94,8 +93,8 @@ open class SimpleAgentProcess(
     /**
      * Set by the platform on children of an evolving process: evolve from
      * inside a child delegates up the tower to the nearest evolving
-     * ancestor, so chain actions publish occurrences identically on both
-     * rungs.
+     * ancestor, so chain actions publish occurrences exactly as frame
+     * actions do.
      */
     internal var evolveDelegate: ((Any) -> Unit)?
         get() = episodes.evolveDelegate
@@ -130,12 +129,12 @@ open class SimpleAgentProcess(
         episodes.dispatchIfEpisodeWins(plan, worldState)
 
     /**
-     * Execute the action, attributing new instances of its declared consumable
-     * types to the active episode whose chain it belongs to. Attribution is
-     * by identity, so completion consumes exactly what the occurrence made.
+     * Execute a frame action. Everything the parent runs is founding-frame
+     * work - episode chains execute only in children - so the runtime's
+     * only bookkeeping here is evolve lineage.
      */
-    protected fun executeActionAttributingConsumables(action: Action, servedGoal: String): ActionStatus =
-        episodes.attributing(action, servedGoal) { executeAction(action) }
+    protected fun executeFrameAction(action: Action): ActionStatus =
+        episodes.executingInFrame(action) { executeAction(action) }
 
     protected fun handlePlanNotFound(worldState: WorldState): AgentProcess {
         logger.debug(
@@ -151,10 +150,7 @@ open class SimpleAgentProcess(
                         .indentLines(1)
         )
         setStatus(AgentProcessStatusCode.STUCK)
-        val earlyTermination = identifyEarlyTermination()
-        if (earlyTermination != null) {
-            return this
-        }
+        identifyEarlyTermination()
         return this
     }
 
@@ -162,9 +158,6 @@ open class SimpleAgentProcess(
         plan: Plan,
         worldState: WorldState,
     ) {
-        if (episodes.completeIfEpisodic(plan.goal.name, worldState)) {
-            return
-        }
         if (!episodes.completesProcess(plan.goal.name)) {
             episodes.recordFrameAchievement(plan.goal.name)
             return
@@ -238,7 +231,7 @@ open class SimpleAgentProcess(
 
             val action = resolveActionFromPlan(plan)
             try {
-                val actionStatus = executeActionAttributingConsumables(action, plan.goal.name)
+                val actionStatus = executeFrameAction(action)
                 setStatus(actionStatusToAgentProcessStatus(actionStatus))
             } catch (rpe: ReplanRequestedException) {
                 handleReplanRequest(action, rpe)
@@ -259,12 +252,6 @@ open class SimpleAgentProcess(
                     e.reason,
                 )
                 setStatus(AgentProcessStatusCode.TERMINATED)
-            } catch (e: Exception) {
-                if (e is ToolControlFlowSignal) {
-                    // Other control flow signals (e.g., UserInputRequiredException) must propagate
-                    throw e
-                }
-                throw e
             }
         }
         return this

@@ -24,8 +24,6 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
-import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -233,7 +231,7 @@ class GoalEpisodeAimaTest {
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-problem",
-            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            ProcessOptions.DEFAULT.withEvolving(),
         )
         process.evolve(PaintRequested("job-1"))
 
@@ -273,55 +271,59 @@ class GoalEpisodeAimaTest {
     }
 
     @Test
-    fun `the painting problem under hybrid - value selection strands the intermediate and completion still sweeps it`() {
+    fun `the painting problem under hybrid - the child rung forecloses the stranded intermediate`() {
+        // In the parent's walk, value selection without a complete-path
+        // guarantee would run prep on its own netValue and strand the
+        // intermediate when the paint runs out - the book's painting
+        // predicament. The child rung forecloses it structurally: a chain
+        // is valued by the full-path plan its child would run, so a
+        // blocked chain never starts (p. 425 note 5)
         val process = create(
             OneShotPrepPaintingAgent(),
             "aima-painting-hybrid",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+                .withEvolving(),
         )
         process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
-        // Value selection has no complete-path guarantee: prep runs on its
-        // own netValue and the chain stalls mid-flight. This is the book's
-        // actual painting predicament, work stranded when paint runs out
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertNotNull(stalled.last<PreparedSurface>(), "Hybrid starts a chain it cannot finish")
+        assertNull(stalled.last<PreparedSurface>(), "No doomed child, no stranded prep")
         assertNotNull(stalled.last<PaintRequested>(), "The stall must not consume the request")
 
         stalled.addObject(PaintCan("red"))
         val painted = stalled.run()
 
         assertNull(painted.last<PaintRequested>(), "Completion consumed the request")
-        assertNull(painted.last<PreparedSurface>(), "Completion swept the stranded intermediate")
+        assertNull(painted.last<PreparedSurface>(), "Completion consumed the chain's own intermediate")
         assertNull(painted.last<SurfacePainted>(), "Completion consumed the satisfying output")
         assertNotNull(painted.last<PaintCan>(), "The can is still used, not consumed")
     }
 
     @Test
-    fun `the painting problem under hybrid - a rerunnable prefix spins on a blocked chain until the action budget`() {
+    fun `the painting problem under hybrid - a blocked chain never spins its rerunnable prefix`() {
+        // In the parent's walk, a rerunnable prep would re-run every tick
+        // toward a completion that never comes, burning the budget - the
+        // sphex loop. Structurally foreclosed: the chain is never a
+        // candidate while unplannable, so nothing spins and nothing spends
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-hybrid-spin",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+                .withEvolving(),
         )
         process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
 
-        // Ascending values cannot save a chain whose successor is blocked:
-        // the rerunnable prep re-runs every tick because its input is only
-        // consumed at completion, and completion never comes without a can.
-        // The action budget bounds the spin
-        assertEquals(AgentProcessStatusCode.TERMINATED, result.status)
+        assertEquals(AgentProcessStatusCode.STUCK, result.status, "A blocked chain parks, never terminates the budget")
         val preps = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "prep:job-1" }
-        assertTrue(preps > 1, "The rerunnable prefix re-ran, $preps times")
-        assertNotNull(result.last<PaintRequested>(), "The spin never consumed the request")
+        assertEquals(0, preps, "The prefix never ran: no child, no spin, no spend")
+        assertNotNull(result.last<PaintRequested>(), "The block never consumed the request")
+        assertEquals(0, process.frameworkChildCount, "No doomed child was ever spawned")
     }
 
     @Test
@@ -334,7 +336,7 @@ class GoalEpisodeAimaTest {
                 // The repair rule derives from the goal graph; each evolved
                 // DoorFellOff is one occurrence, and the shift's committed
                 // objective anchors the end
-                .withEvolving(Evolving(GoalTarget.output(ShiftReport::class.java), EpisodeExecution.IN_PROCESS)),
+                .withEvolving(GoalTarget.output(ShiftReport::class.java)),
             WeldsCompleted(0),
         )
 
@@ -388,7 +390,7 @@ class GoalEpisodeAimaTest {
         val process = create(
             SharedIntermediateAgent(),
             "aima-sussman-analogue",
-            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            ProcessOptions.DEFAULT.withEvolving(),
         )
 
         val exception = assertThrows<IllegalArgumentException> {

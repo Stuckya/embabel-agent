@@ -24,7 +24,6 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
@@ -78,9 +77,9 @@ data class AuditDone(val id: String)
  *   with their reason at construction, and the reason surfaces at the
  *   evolve() call site.
  *
- * This suite declares EpisodeExecution.IN_PROCESS: it pins the in-process
- * rung's mode semantics. The default child rung is pinned in
- * GoalEpisodeFrameworkDispatchTest.
+ * This suite pins the derived mode's semantics: what withEvolving means,
+ * what derivation admits and excludes, and how the mission ends. Dispatch
+ * mechanics are pinned in GoalEpisodeFrameworkDispatchTest.
  */
 class GoalEvolvingModeTest {
 
@@ -123,7 +122,8 @@ class GoalEvolvingModeTest {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
         val agent = AgentMetadataReader().createAgentMetadata(agentInstance) as CoreAgent
-        val options = ProcessOptions.DEFAULT.withEvolving(Evolving(objective, EpisodeExecution.IN_PROCESS))
+        val options = objective?.let { ProcessOptions.DEFAULT.withEvolving(it) }
+            ?: ProcessOptions.DEFAULT.withEvolving()
         return SimpleAgentProcess(
             "evolving-test",
             null,
@@ -489,7 +489,7 @@ class GoalEvolvingModeTest {
             agent.copy(goals = agent.goals + NIRVANA),
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(Evolving(GoalTarget.output(BatchMissionDone::class.java), EpisodeExecution.IN_PROCESS)),
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

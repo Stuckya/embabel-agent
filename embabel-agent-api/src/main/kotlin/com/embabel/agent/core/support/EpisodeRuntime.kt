@@ -22,7 +22,6 @@ import com.embabel.agent.core.Agent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Blackboard
-import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Goal
 import com.embabel.agent.core.IoBinding
 import com.embabel.agent.core.JvmType
@@ -37,7 +36,7 @@ import java.util.IdentityHashMap
 
 /**
  * The episode machinery for one evolving process: derivation, admission,
- * routing, the visibility windows, attribution, dispatch selection, and
+ * routing, the visibility windows, evolve lineage, dispatch selection, and
  * completion bookkeeping. The process owns the tick loop and its status;
  * the runtime owns every episode decision inside it, borrowing exactly the
  * two process powers it declares - status and rearming. Outside evolving
@@ -75,12 +74,11 @@ internal class EpisodeRuntime(
         derivedScope?.rules.orEmpty()
 
     init {
-        // Child dispatch would reject an ephemeral parent only at first
-        // dispatch, mid-mission: the conflicting declarations fail here
-        require(derivedScope == null || !childExecution || !process.processOptions.ephemeral) {
-            "An ephemeral process cannot use child episode execution: child processes " +
-                    "require the persistence the ephemeral declaration disclaims. " +
-                    "Declare EpisodeExecution.IN_PROCESS to evolve an ephemeral process"
+        // Dispatch would reject an ephemeral parent only at first dispatch,
+        // mid-mission: the conflicting declarations fail here
+        require(derivedScope == null || !process.processOptions.ephemeral) {
+            "An ephemeral process cannot evolve: episodes execute in child processes, " +
+                    "which require the persistence the ephemeral declaration disclaims"
         }
     }
 
@@ -174,10 +172,14 @@ internal class EpisodeRuntime(
         val owner: ResolvedEpisodeRule? = null,
     )
 
-    /** The episode whose chain action is currently executing, if any */
+    /**
+     * The episode evolve attributes publications to right now: the founding
+     * episode during a frame action, the dispatching episode during a child
+     * run. Pure lineage state - no chain action ever executes here.
+     */
     private var executingEpisode: Episode? = null
 
-    /** The name of the action currently executing, if any */
+    /** The name of the frame action currently executing, if any */
     private var executingAction: String? = null
 
     /**
@@ -200,19 +202,19 @@ internal class EpisodeRuntime(
     private val outcomeGroundings: MutableMap<Episode, List<Any>> = IdentityHashMap()
 
     /**
-     * The child rung's execution adapter: it runs already-selected
+     * The episode execution adapter: it runs already-selected
      * episodes and supplies the values selection ranks. Selection itself
      * stays with the planner.
      */
-    private val childExecutor: ChildEpisodeExecutor by lazy {
-        ChildEpisodeExecutor(process, plannerFactory, worldStateDeterminer)
+    private val executor: EpisodeExecutor by lazy {
+        EpisodeExecutor(process, plannerFactory, worldStateDeterminer)
     }
 
     /** Recent framework children, bounded, for inspection */
-    val frameworkChildren: List<AgentProcess> get() = childExecutor.recentChildrenView
+    val frameworkChildren: List<AgentProcess> get() = executor.recentChildrenView
 
     /** Total framework children ever dispatched */
-    val frameworkChildCount: Int get() = childExecutor.childCount
+    val frameworkChildCount: Int get() = executor.childCount
 
     /** Whether this process declared evolving mode, for platform wiring */
     val isEvolving: Boolean get() = derivedScope != null
@@ -227,8 +229,8 @@ internal class EpisodeRuntime(
     /**
      * Set by the platform on children of an evolving process: evolve from
      * inside a child delegates up the tower to the nearest evolving
-     * ancestor, so chain actions publish occurrences identically on both
-     * rungs.
+     * ancestor, so chain actions publish occurrences exactly as frame
+     * actions do.
      */
     var evolveDelegate: ((Any) -> Unit)? = null
 
@@ -287,25 +289,15 @@ internal class EpisodeRuntime(
         }
     }
 
-    private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
-        rule.goalsByName.values.maxOfOrNull { goal -> routingValue(rule, goal) }
-            ?: Double.NEGATIVE_INFINITY
-
     /**
-     * Routing shares dispatch's planning view: under child execution a
-     * candidate is valued by the full-path plan its child would run, so a
-     * parent planner with no full-path guarantee can never strand a
-     * contested occurrence the child rung could execute. An in-process
-     * candidate is valued by the parent planner that would walk it.
+     * Routing shares dispatch's planning view: a candidate is valued by the
+     * full-path plan its child would run, so a parent planner with no
+     * full-path guarantee can never strand a contested occurrence the
+     * dispatch could execute.
      */
-    private fun routingValue(rule: ResolvedEpisodeRule, goal: Goal): Double {
-        if (childExecution) {
-            return childExecutor.chainValue(rule, goal, agent)
-        }
-        return planner.planToGoal(agent.planningSystem.actions, goal)
-            ?.netValue(planner.worldState())
+    private fun bestPlanValue(rule: ResolvedEpisodeRule): Double =
+        rule.goalsByName.values.maxOfOrNull { goal -> executor.chainValue(rule, goal, agent) }
             ?: Double.NEGATIVE_INFINITY
-    }
 
     /**
      * Fail fast at the boundary: an evolving process's evolvable types are
@@ -402,6 +394,15 @@ internal class EpisodeRuntime(
         // An occurrence reopens the question: the goal was achieved as
         // state, and a fresh request makes it unachieved by definition
         achievedFrameGoals -= rule.goalsByName.keys
+        if (activeEpisodes[rule] == null && foundingWorkPlannable()) {
+            // Terminal evaluation precedes rearming for fresh arrivals too:
+            // plannable founding work runs before any admission re-arms the
+            // rule, whichever path the occurrence came in by
+            blackboard.hide(episode.request)
+            pendingEpisodes.getOrPut(rule) { ArrayDeque() }.add(episode)
+            logger.debug("Process {} deferred {}: terminal evaluation precedes admission", id, episode)
+            return
+        }
         if (activeEpisodes.putIfAbsent(rule, episode) == null) {
             episode.activate()
             groundOutcomeWindow(rule, episode)
@@ -457,21 +458,6 @@ internal class EpisodeRuntime(
         if (shadowed.isNotEmpty()) {
             outcomeGroundings[episode] = shadowed
         }
-    }
-
-    /**
-     * Complete the goal episodically if the completed goal belongs to a
-     * rule with an active episode. A rule completes as an episode only
-     * while one is active: a never-activated goal completing off standing
-     * facts is founding-frame work, never an episode.
-     */
-    fun completeIfEpisodic(goalName: String, worldState: WorldState): Boolean {
-        val rule = resolvedEpisodes.firstOrNull { it.matches(goalName) } ?: return false
-        if (activeEpisodes[rule] == null) {
-            return false
-        }
-        completeEpisode(rule, rule.goalsByName.getValue(goalName), worldState)
-        return true
     }
 
     /**
@@ -611,8 +597,8 @@ internal class EpisodeRuntime(
     /**
      * Consume the active episode's attributed consumables for the completed
      * candidate by identity: exactly what this occurrence made, nothing
-     * made elsewhere. Consumables of the episode's own failed attempts are
-     * recorded like any other and swept here.
+     * made elsewhere. A failed child never merges, so a failed attempt
+     * leaves nothing behind to sweep.
      */
     private fun consumeAttributed(rule: ResolvedEpisodeRule, goalName: String): Int {
         val episode = activeEpisodes[rule] ?: return 0
@@ -629,35 +615,16 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Execute the action through [execute], attributing new instances of its
-     * declared consumable types to the active episode whose chain it belongs
-     * to. Attribution is by identity, so completion consumes exactly what
-     * the occurrence made.
+     * Execute a frame action. Under one execution model everything the
+     * parent runs is founding-frame work - episode chains execute only in
+     * children - so the only bookkeeping is lineage: an evolve the action
+     * publishes records the founding episode as its cause.
      */
-    fun attributing(action: Action, servedGoal: String, execute: () -> ActionStatus): ActionStatus {
-        val owner = attributionOwner(servedGoal, action.name)
-        // Founding-frame work executes inside the process-episode, so an
-        // evolve it publishes records the founding episode as its cause
-        executingEpisode = owner?.second ?: foundingEpisode
+    fun executingInFrame(action: Action, execute: () -> ActionStatus): ActionStatus {
+        executingEpisode = foundingEpisode
         executingAction = action.name
         try {
-            if (owner == null) {
-                return execute()
-            }
-            val (rule, episode) = owner
-            val grounded = groundRequestBinding(episode)
-            try {
-                val before: MutableSet<Any> = Collections.newSetFromMap(IdentityHashMap())
-                before.addAll(blackboard.objects)
-                val status = execute()
-                blackboard.objects
-                    .filter { it !in before }
-                    .filter { instance -> rule.attributedTypesFor(action.name).any { it.isInstance(instance) } }
-                    .forEach { instance -> episode.record(action.name, instance) }
-                return status
-            } finally {
-                grounded.forEach(blackboard::reveal)
-            }
+            return execute()
         } finally {
             executingEpisode = null
             executingAction = null
@@ -665,65 +632,18 @@ internal class EpisodeRuntime(
     }
 
     /**
-     * Ground the request binding for an episode's chain execution: while
-     * the action runs, the episode's request is the only visible instance
-     * of its own class, so binding by type resolves the occurrence the
-     * episode holds. Standard ground-action semantics, per occurrence.
-     */
-    private fun groundRequestBinding(episode: Episode): List<Any> {
-        val requestClass = episode.request.javaClass
-        val shadowing = blackboard.objects
-            .filter { it !== episode.request && requestClass.isInstance(it) }
-        shadowing.forEach(blackboard::hide)
-        return shadowing
-    }
-
-    /**
-     * Ownership follows the plan being served, not chain membership: an
-     * action executing for an episode goal's plan is attributed to that
-     * rule's active episode, and an action serving another business goal
-     * attributes nothing, however many chains it appears in. Relevance is
-     * goal-relative (AIMA SS10.2.2). Per-tick value selection returns the
-     * unsatisfiable pairing goal for opportunistic steps, where no served
-     * goal exists; membership remains the documented fallback there.
-     */
-    private fun attributionOwner(servedGoal: String, actionName: String): Pair<ResolvedEpisodeRule, Episode>? {
-        val servedRule = resolvedEpisodes.firstOrNull { it.matches(servedGoal) }
-        if (servedRule != null) {
-            return activeEpisodes[servedRule]?.let { servedRule to it }
-        }
-        if (servedGoal != NIRVANA.name) {
-            return null
-        }
-        return activeEpisodeOwning(actionName)
-    }
-
-    private fun activeEpisodeOwning(actionName: String): Pair<ResolvedEpisodeRule, Episode>? =
-        activeEpisodes.entries
-            .firstOrNull { (rule, _) -> rule.isChainAction(actionName) }
-            ?.toPair()
-
-    /**
      * Everything episodic happens inside an episode: a rule's exclusive
      * chain actions are plannable only while the rule has an active
      * episode, so a standing resource can never let the chain complete
      * outside an episode.
      */
-    fun gatedChainActions(): Set<String> {
-        // Under child execution an activated rule's chain is never the
-        // parent planner's to run: the framework dispatches it
-        val dormant = resolvedEpisodes
-            .filter { episodicNow(it) && (childExecution || it !in activeEpisodes) }
+    fun gatedChainActions(): Set<String> =
+        // An activated rule's chain is never the parent planner's to run:
+        // the framework dispatches it. The gate holds against opportunistic
+        // value selection, which picks achievable actions without a goal
+        resolvedEpisodes
+            .filter { episodicNow(it) }
             .flatMapTo(mutableSetOf()) { it.exclusiveChainActions }
-        // An action serving a live in-process episode is never gated by a
-        // dormant sibling sharing it: liveness wins
-        val live = if (childExecution) emptySet<String>() else activeEpisodes.keys
-            .flatMapTo(mutableSetOf()) { rule -> rule.chainActionsByGoal.values.flatten() }
-        return dormant - live
-    }
-
-    private val childExecution: Boolean
-        get() = process.processOptions.evolving?.execution == EpisodeExecution.CHILD
 
     /**
      * A rule becomes episodic at its first observed occurrence: before that
@@ -735,23 +655,27 @@ internal class EpisodeRuntime(
     /**
      * The planning system for the next tick: achieved founding-frame goals
      * are withdrawn so a satisfied incident never outcompetes the mission,
-     * everything else is the agent's declared system.
+     * and activated rules' goals are withdrawn because they belong to the
+     * dispatch machinery - the parent can never plan toward or complete an
+     * episodic goal, not even vacuously off a satisfied condition.
      */
     fun planningSystem(): PlanningSystem {
-        if (achievedFrameGoals.isEmpty()) {
+        val withdrawn = achievedFrameGoals +
+                activatedRules.flatMapTo(mutableSetOf()) { it.goalsByName.keys }
+        if (withdrawn.isEmpty()) {
             return agent.planningSystem
         }
         val declared = agent.planningSystem
         return object : PlanningSystem {
             override val actions = declared.actions
-            override val goals = declared.goals.filterNot { it.name in achievedFrameGoals }.toSet()
+            override val goals = declared.goals.filterNot { it.name in withdrawn }.toSet()
             override fun knownConditions() = declared.knownConditions()
             override fun infoString(verbose: Boolean?, indent: Int) = declared.infoString(verbose, indent)
         }
     }
 
     /**
-     * Selection is the planner's on both rungs: active child episodes are
+     * Selection is the planner's: active episodes are
      * valued by the plans their children would run and compete with frame
      * work on net value. One execution per tick, so standing work and
      * other episodes interleave exactly as value dictates. An unplannable
@@ -759,20 +683,25 @@ internal class EpisodeRuntime(
      * doomed child.
      */
     fun dispatchIfEpisodeWins(plan: Plan?, worldState: WorldState): Boolean {
-        if (!childExecution) {
-            return false
-        }
-        val choice = childExecutor.choices(activeEpisodes, agent).maxByOrNull { it.value } ?: return false
+        val choice = executor.choices(activeEpisodes, agent).maxByOrNull { it.value } ?: return false
         if (plan != null && plan.netValue(worldState) > choice.value) {
             return false
         }
-        when (childExecutor.execute(choice)) {
-            ChildExecution.COMPLETED -> completeEpisode(choice.rule, choice.goal, planner.worldState())
-            ChildExecution.NOT_COMPLETED -> {
+        // An evolve delegated up from inside the child records the
+        // dispatching episode as its cause: lineage rides the dispatch
+        executingEpisode = choice.episode
+        val execution = try {
+            executor.execute(choice)
+        } finally {
+            executingEpisode = null
+        }
+        when (execution) {
+            DispatchOutcome.COMPLETED -> completeEpisode(choice.rule, choice.goal, planner.worldState())
+            DispatchOutcome.NOT_COMPLETED -> {
                 // Contained failure or a stuck child: the occurrence is
                 // intact and the next tick re-selects by value
             }
-            ChildExecution.BUDGET_EXHAUSTED -> {
+            DispatchOutcome.BUDGET_EXHAUSTED -> {
                 reportAbandonedOccurrences()
                 setStatus(AgentProcessStatusCode.TERMINATED)
                 return true

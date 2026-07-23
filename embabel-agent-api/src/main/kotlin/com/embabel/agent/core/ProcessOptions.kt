@@ -323,13 +323,6 @@ data class ProcessOptions @JvmOverloads constructor(
     fun withEvolving(objective: GoalTarget): ProcessOptions =
         this.copy(evolving = Evolving(objective))
 
-    /**
-     * Full-control form: declare the objective and the episode execution
-     * rung together.
-     */
-    fun withEvolving(evolving: Evolving): ProcessOptions =
-        this.copy(evolving = evolving)
-
     companion object {
 
         @JvmField
@@ -340,25 +333,12 @@ data class ProcessOptions @JvmOverloads constructor(
 }
 
 /**
- * Where an admitted episode's chain executes. CHILD is the default: the
- * framework synthesizes a child process from the derived chain and runs
- * the episode there, hiding the dispatch entirely. IN_PROCESS runs the
- * chain in the parent planner, the supported degenerate case for hot
- * loops sharing live standing state.
- */
-enum class EpisodeExecution {
-    CHILD,
-    IN_PROCESS,
-}
-
-/**
  * Evolving-mode declaration for a process: the environment classification,
  * declared once. The optional [objective] is the committed objective: the
  * founding episode completes the process when it completes, and no other
- * completion ends it. No objective means intentionally infinite.
- * [execution] chooses the episode rung, child by default.
+ * completion ends it. No objective means intentionally infinite. Episodes
+ * execute in framework-synthesized child processes: there is no other rung.
  */
 data class Evolving(
     val objective: GoalTarget? = null,
-    val execution: EpisodeExecution = EpisodeExecution.CHILD,
 )

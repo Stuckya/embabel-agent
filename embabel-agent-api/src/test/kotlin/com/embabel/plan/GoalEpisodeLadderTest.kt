@@ -25,8 +25,6 @@ import com.embabel.agent.api.common.PlannerType
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
-import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
@@ -191,7 +189,7 @@ class GoalEpisodeLadderTest {
                 // evolved DoorDown is one occurrence, and the shift's
                 // objective anchors completion at the parent level exactly
                 // as it would for an in-process chain
-                .withEvolving(Evolving(GoalTarget.output(ShiftLog::class.java), EpisodeExecution.IN_PROCESS)),
+                .withEvolving(GoalTarget.output(ShiftLog::class.java)),
             WeldTally(0),
         )
 
@@ -217,11 +215,18 @@ class GoalEpisodeLadderTest {
         assertNull(result.last<DoorDown>(), "Both requests consumed")
         assertNull(result.last<DoorFixed>(), "Both satisfying outputs consumed")
 
-        // Each dispatch ran its own isolated child to completion with lineage
+        // Each dispatch ran its own isolated child to completion. The
+        // dispatch action itself executes inside a framework child, so the
+        // manual child's recorded parent is that framework child: the tower
+        // deepened by one level and lineage is transitive
         assertEquals(2, parentAgent.children.size, "One child process per occurrence")
+        val frameworkIds = process.frameworkChildren.map { it.id }.toSet()
         parentAgent.children.forEach { child ->
             assertEquals(AgentProcessStatusCode.COMPLETED, child.status)
-            assertEquals(result.id, child.parentId, "The platform recorded the parent lineage")
+            assertTrue(
+                child.parentId in frameworkIds,
+                "The manual child's parent is the framework child that ran the dispatch action",
+            )
         }
         val childSteps = parentAgent.children.map { child ->
             child.objects.filterIsInstance<ExecutedStep>().map { it.name }.filter { it.startsWith("child-") }
@@ -278,9 +283,7 @@ class GoalEpisodeLadderTest {
             val child = platform.createChildProcess(
                 crew,
                 context.agentProcess,
-                ProcessOptions.DEFAULT.withEvolving(
-                    Evolving(GoalTarget.output(StepsDone::class.java), EpisodeExecution.IN_PROCESS)
-                ),
+                ProcessOptions.DEFAULT.withEvolving(GoalTarget.output(StepsDone::class.java)),
             )
             children += child
             child.evolve(StepRequested(1))
@@ -307,9 +310,7 @@ class GoalEpisodeLadderTest {
         val process = create(
             parent,
             "episode-ladder-tower",
-            ProcessOptions.DEFAULT.withEvolving(
-                Evolving(GoalTarget.output(WavesComplete::class.java), EpisodeExecution.IN_PROCESS)
-            ),
+            ProcessOptions.DEFAULT.withEvolving(GoalTarget.output(WavesComplete::class.java)),
             MissionTally(0),
         )
         process.evolve(WaveRequested(1))

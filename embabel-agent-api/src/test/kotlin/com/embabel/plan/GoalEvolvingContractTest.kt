@@ -28,7 +28,6 @@ import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ObjectAddedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
-import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
@@ -59,9 +58,9 @@ data class SignalArchived(val id: String)
 /**
  * The episode contract: serial admission, identity consumption, grounding,
  * retry, event ordering, and the canRerun boundary. Occurrences arrive only
- * through evolve(); everything else is standing state. This suite declares
- * EpisodeExecution.IN_PROCESS: it pins the in-process rung's contract. The
- * default child rung is pinned in GoalEpisodeFrameworkDispatchTest.
+ * through evolve(); everything else is standing state. Dispatch mechanics are
+ * pinned in GoalEpisodeFrameworkDispatchTest; this suite pins the contract
+ * those mechanics carry.
  */
 class GoalEvolvingContractTest {
 
@@ -195,7 +194,7 @@ class GoalEvolvingContractTest {
             "evolving-contract-serial",
             null,
             agent,
-            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            ProcessOptions.DEFAULT.withEvolving(),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
@@ -232,7 +231,7 @@ class GoalEvolvingContractTest {
                 "evolving-contract-tccl",
                 null,
                 agent,
-                ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+                ProcessOptions.DEFAULT.withEvolving(),
                 InMemoryBlackboard(),
                 dummyPlatformServices(),
                 DefaultPlannerFactory,
@@ -255,7 +254,8 @@ class GoalEvolvingContractTest {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
         val agent = AgentMetadataReader().createAgentMetadata(agentInstance) as CoreAgent
-        var options = ProcessOptions.DEFAULT.withEvolving(Evolving(objective, EpisodeExecution.IN_PROCESS))
+        var options = objective?.let { ProcessOptions.DEFAULT.withEvolving(it) }
+            ?: ProcessOptions.DEFAULT.withEvolving()
         listener?.let { options = options.withListener(it) }
         return SimpleAgentProcess(
             "evolving-contract",
@@ -335,23 +335,11 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `a failing completing action leaves the request unconsumed for retry`() {
-        val agent = FlakyAgent()
-        val process = evolvingProcess(agent)
-        process.evolve(CalibrationRequested("cal-1"))
-
-        runCatching { process.run() }
-        assertNotNull(process.last<CalibrationRequested>(), "A failed attempt must not consume the request")
-
-        val retried = process.run()
-
-        assertEquals(AgentProcessStatusCode.STUCK, retried.status)
-        assertEquals(2, agent.attempts, "The second attempt succeeded")
-        assertNull(retried.last<CalibrationRequested>(), "The successful completion consumed the request")
-    }
-
-    @Test
-    fun `episode rerun rides existing canRerun - a non-rerunnable action does not re-fire`() {
+    fun `canRerun scopes to the occurrence - a non-rerunnable action runs once per child`() {
+        // Execution history is process-scoped, so canRerun = false means
+        // once per occurrence's child, never once per mission: occurrences
+        // are independent (AIMA 3e ch 2). Within one chain it still means
+        // exactly once
         val process = evolvingProcess(OneShotAgent())
         process.evolve(CalibrationRequested("cal-1"))
 
@@ -361,11 +349,12 @@ class GoalEvolvingContractTest {
         process.evolve(CalibrationRequested("cal-2"))
         val after = parked.run()
 
-        // The episode rearms, but action re-execution rides the existing
-        // canRerun contract: a non-rerunnable completing action stays run
         assertEquals(AgentProcessStatusCode.STUCK, after.status)
         val steps = after.objects.filterIsInstance<ExecutedStep>().map { it.name }
-        assertEquals(listOf("calibrate:cal-1"), steps, "canRerun = false blocked the second occurrence")
+        assertEquals(
+            listOf("calibrate:cal-1", "calibrate:cal-2"), steps,
+            "Each occurrence ran its non-rerunnable action exactly once, in its own child",
+        )
     }
 
     @Test
@@ -424,11 +413,18 @@ class GoalEvolvingContractTest {
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        val goalEvents = events.filterIsInstance<GoalAchievedEvent>()
-        assertEquals(1, goalEvents.size, "One episode, one goal event")
-        assertTrue(goalEvents.single() is EpisodeCompletedEvent, "Episode completions are distinguishable by type")
+        // The child completes as a real process with its own events; the
+        // evolving parent's story stays scoped to the parent
+        val parentGoalEvents = events.filterIsInstance<GoalAchievedEvent>()
+            .filter { it.agentProcess.id == result.id }
+        assertEquals(1, parentGoalEvents.size, "One episode, one parent goal event")
+        assertTrue(parentGoalEvents.single() is EpisodeCompletedEvent, "Episode completions are distinguishable by type")
         assertEquals(false, requestVisibleAtEvent, "Consumption must precede the event that announces it")
-        assertEquals(0, events.count { it is AgentProcessFinishedEvent }, "Nonterminal completion never finishes")
+        assertEquals(
+            0,
+            events.count { it is AgentProcessFinishedEvent && it.agentProcess.id == result.id },
+            "Nonterminal completion never finishes the evolving process",
+        )
     }
 
     @Test
@@ -464,7 +460,7 @@ class GoalEvolvingContractTest {
             "evolving-contract-concurrent",
             null,
             agent,
-            ProcessOptions.DEFAULT.withEvolving(Evolving(execution = EpisodeExecution.IN_PROCESS)),
+            ProcessOptions.DEFAULT.withEvolving(),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
