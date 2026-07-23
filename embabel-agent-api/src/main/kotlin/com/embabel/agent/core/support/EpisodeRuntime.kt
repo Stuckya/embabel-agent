@@ -59,20 +59,36 @@ internal class EpisodeRuntime(
      * construction, with underivable goals excluded and their reasons kept
      * for the evolve call site. Null outside evolving mode.
      */
-    private val derivedScope: DerivedEvolvingScope? =
-        process.processOptions.evolving?.let { EpisodeDerivation.deriveEvolving(agent, it.objective) }
+    private val evolvingDeclared: Boolean = process.processOptions.evolving != null
 
     /**
-     * Episode rules derived from the goal graph in evolving mode. Empty
-     * outside evolving mode, where no episode machinery engages.
+     * Derivation runs when a fact first asks for it, against the agent as
+     * it stands then - not at construction, because a running process may
+     * change. The result is kept until something invalidates it, which is
+     * the seam a future scope change will use: the next arrival after an
+     * invalidation derives against the changed declarations, live.
      */
-    private val derivedRules: List<DerivedEpisodeRule> =
-        derivedScope?.rules.orEmpty()
+    private var derivedScopeCache: DerivedEvolvingScope? = null
+
+    private val derivedScope: DerivedEvolvingScope?
+        get() {
+            if (!evolvingDeclared) {
+                return null
+            }
+            derivedScopeCache?.let { return it }
+            val derived = EpisodeDerivation.deriveEvolving(agent, process.processOptions.evolving?.objective)
+            derivedScopeCache = derived
+            return derived
+        }
+
+    /** Episode rules, derived at first need. Empty outside evolving mode. */
+    private val derivedRules: List<DerivedEpisodeRule>
+        get() = derivedScope?.rules.orEmpty()
 
     init {
         // Dispatch would reject an ephemeral parent only at first dispatch,
         // mid-mission: the conflicting declarations fail here
-        require(derivedScope == null || !process.processOptions.ephemeral) {
+        require(!evolvingDeclared || !process.processOptions.ephemeral) {
             "An ephemeral process cannot evolve: episodes execute in child processes, " +
                     "which require the persistence the ephemeral declaration disclaims"
         }
@@ -93,8 +109,18 @@ internal class EpisodeRuntime(
      * smaller episode runs inside it, so when that work publishes a fact
      * through evolve, this episode is recorded as the publisher.
      */
+    /**
+     * The goals whose completion completes the process, resolved eagerly:
+     * stale instances of their output types must be hidden before any work
+     * runs, and an objective naming no goal must fail at construction.
+     */
+    private val objectiveGoals: Set<String> =
+        process.processOptions.evolving
+            ?.let { EpisodeDerivation.resolveObjective(it.objective, agent) }
+            .orEmpty()
+
     private val foundingEpisode: Episode? =
-        derivedScope?.let { Episode(FoundingFacts(blackboard.objects.toList())).also(Episode::activate) }
+        if (evolvingDeclared) Episode(FoundingFacts(blackboard.objects.toList())).also(Episode::activate) else null
 
     /**
      * Goals outside any episode that were already achieved: recorded and
@@ -114,12 +140,11 @@ internal class EpisodeRuntime(
     private val foundingShadow: List<Any> = shadowFoundingObjective()
 
     private fun shadowFoundingObjective(): List<Any> {
-        val scope = derivedScope ?: return emptyList()
-        if (scope.objectiveGoals.isEmpty()) {
+        if (!evolvingDeclared || objectiveGoals.isEmpty()) {
             return emptyList()
         }
         val satisfyingClasses = agent.goals
-            .filter { it.name in scope.objectiveGoals }
+            .filter { it.name in objectiveGoals }
             .mapNotNull { goal ->
                 val resolved = (goal.outputType as? JvmType)
                     ?.let { IoBinding(it.className).resolveJvmType()?.clazz }
@@ -215,7 +240,7 @@ internal class EpisodeRuntime(
     val frameworkChildCount: Int get() = executor.childCount
 
     /** Whether this process declared evolving mode, for platform wiring */
-    val isEvolving: Boolean get() = derivedScope != null
+    val isEvolving: Boolean get() = evolvingDeclared
 
     /**
      * Arrival bookkeeping still held, for inspection: an intentionally
@@ -238,7 +263,7 @@ internal class EpisodeRuntime(
      * and exactly this instance is consumed when the run completes.
      */
     fun evolve(fact: Any) {
-        if (derivedScope == null) {
+        if (!evolvingDeclared) {
             val delegate = evolveDelegate
             require(delegate != null) {
                 "evolve requires an evolving process: declare withEvolving() on the process options"
@@ -344,7 +369,7 @@ internal class EpisodeRuntime(
      * is allowed to start.
      */
     private fun admitDeferred() {
-        if (derivedScope == null) {
+        if (!evolvingDeclared) {
             return
         }
         val idleWithPending = derivedRules.filter {
@@ -513,8 +538,10 @@ internal class EpisodeRuntime(
      * goal completes the process, as ever.
      */
     fun completesProcess(goalName: String): Boolean {
-        val scope = derivedScope ?: return true
-        return goalName in scope.objectiveGoals
+        if (!evolvingDeclared) {
+            return true
+        }
+        return goalName in objectiveGoals
     }
 
     /**
@@ -547,7 +574,7 @@ internal class EpisodeRuntime(
      * its values compare with the next episode's.
      */
     private fun foundingWorkPlannable(): Boolean {
-        if (derivedScope == null) {
+        if (!evolvingDeclared) {
             return false
         }
         return foundingGoals().any { planner.planToGoal(agent.planningSystem.actions, it) != null }

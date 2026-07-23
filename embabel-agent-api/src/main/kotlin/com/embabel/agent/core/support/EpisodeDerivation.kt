@@ -25,8 +25,9 @@ import com.embabel.plan.common.condition.ConditionDetermination
 import com.embabel.plan.common.condition.EffectSpec
 
 /**
- * An episode rule derived from a declared goal's graph at process creation.
- * Rules are per goal by construction: one goal, one rule.
+ * An episode rule derived from a declared goal's graph when a fact first
+ * asks for it - not at process creation, because a running process may
+ * change. Rules are per goal: one goal, one rule.
  * @param goalsByName the rule's goal, keyed by name
  * @param evolvedEligible the loaded types an evolved instance may arrive
  * under for this rule: the input types every path to the goal needs but
@@ -71,7 +72,7 @@ internal data class DerivedEvolvingScope(
 )
 
 /**
- * Derives episode rules from an agent's declared goals at process creation.
+ * Derives episode rules from an agent's declared goals, at first need.
  * A goal with a scoped producer that is currently blocked by missing facts
  * remains a planner concern and derives normally here.
  */
@@ -79,11 +80,10 @@ internal object EpisodeDerivation {
 
     /**
      * Derive an episode rule for every declared goal whose graph supports
-     * one: everything the goal graph can state is derived, never declared,
-     * and the validations that decide derivability run at construction, so
-     * evolving mode keeps construction-time fail-fast without a declared
-     * policy. Cross-rule routing checks do not apply: contested arrival types
-     * are legal and routed by the planner at arrival.
+     * one: everything the goal graph can state is derived, never declared.
+     * A goal the graph cannot support is excluded with its reason, which
+     * surfaces at the evolve call site that needed it. Contested arrival
+     * types are legal and routed by value at arrival.
      */
     fun deriveEvolving(agent: Agent, objective: GoalTarget?): DerivedEvolvingScope {
         val objectiveGoals = resolveObjective(objective, agent)
@@ -115,7 +115,7 @@ internal object EpisodeDerivation {
      * process. Empty means intentionally infinite. An objective naming no
      * declared goal fails fast.
      */
-    private fun resolveObjective(objective: GoalTarget?, agent: Agent): Set<String> {
+    fun resolveObjective(objective: GoalTarget?, agent: Agent): Set<String> {
         if (objective == null) {
             return emptySet()
         }
