@@ -180,6 +180,7 @@ class GoalEpisodeLadderTest {
     @Test
     fun `the ladder - a child process is the episode body and the parent contract still holds`() {
         val parentAgent = WeldingParentAgent()
+        val recorder = ProcessEventRecorder()
         val process = create(
             parentAgent,
             "episode-ladder",
@@ -189,7 +190,8 @@ class GoalEpisodeLadderTest {
                 // evolved DoorDown is one occurrence, and the shift's
                 // objective anchors completion at the parent level exactly
                 // as it would for an in-process chain
-                .withEvolving(GoalTarget.output(ShiftLog::class.java)),
+                .withEvolving(GoalTarget.output(ShiftLog::class.java))
+                .withListener(recorder),
             WeldTally(0),
         )
 
@@ -226,7 +228,7 @@ class GoalEpisodeLadderTest {
         // manual child's recorded parent is that framework child: the tower
         // deepened by one level and lineage is transitive
         assertEquals(2, parentAgent.children.size, "One child process per occurrence")
-        val frameworkIds = process.frameworkChildren.map { it.id }.toSet()
+        val frameworkIds = recorder.episodeStarts(process).map { it.childProcessId }.toSet()
         parentAgent.children.forEach { child ->
             assertEquals(AgentProcessStatusCode.COMPLETED, child.status)
             assertTrue(

@@ -20,9 +20,6 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.plan.ChildMission
 import org.slf4j.LoggerFactory
 
-/** Bounded inspection window for framework-dispatched children. */
-private const val RETAINED_CHILDREN = 32
-
 /** An observed attempt result. Policy belongs to the planner session. */
 internal enum class DispatchOutcome {
     COMPLETED,
@@ -31,6 +28,11 @@ internal enum class DispatchOutcome {
     CANCELLED,
     BUDGET_EXHAUSTED,
 }
+
+internal data class EpisodeDispatch(
+    val child: AgentProcess?,
+    val outcome: DispatchOutcome,
+)
 
 /**
  * Mechanical child-process execution for a planner-issued mission.
@@ -43,25 +45,20 @@ internal class EpisodeExecutor(
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
-    private val recentChildren = ArrayDeque<AgentProcess>()
-
-    var childCount = 0
-        private set
-
-    val recentChildrenView: List<AgentProcess> get() = recentChildren.toList()
+    private var childCount = 0
 
     fun execute(
         episode: Episode,
         mission: ChildMission,
         onChildCreated: (AgentProcess) -> Unit,
-    ): DispatchOutcome {
+    ): EpisodeDispatch {
         if (childCount >= process.processOptions.budget.actions) {
             logger.warn(
                 "Process {} reached its action budget ({}) dispatching episode children",
                 process.id,
                 process.processOptions.budget.actions,
             )
-            return DispatchOutcome.BUDGET_EXHAUSTED
+            return EpisodeDispatch(null, DispatchOutcome.BUDGET_EXHAUSTED)
         }
 
         // The mission is planner-owned and opaque here. Its materialization
@@ -78,7 +75,7 @@ internal class EpisodeExecutor(
         // planner-selected occurrence exactly once and last, so ordinary
         // blackboard binding receives that exact identity.
         child.addObject(episode.request)
-        recordChild(child)
+        childCount++
         onChildCreated(child)
 
         val result = runCatching { child.run() }.getOrElse { failure ->
@@ -88,9 +85,9 @@ internal class EpisodeExecutor(
                 episode.id,
                 failure,
             )
-            return DispatchOutcome.FAILED
+            return EpisodeDispatch(child, DispatchOutcome.FAILED)
         }
-        return when (result.status) {
+        val outcome = when (result.status) {
             AgentProcessStatusCode.COMPLETED -> DispatchOutcome.COMPLETED
             AgentProcessStatusCode.STUCK,
             AgentProcessStatusCode.TERMINATED,
@@ -101,13 +98,6 @@ internal class EpisodeExecutor(
             AgentProcessStatusCode.FAILED -> DispatchOutcome.FAILED
             else -> DispatchOutcome.STUCK
         }
-    }
-
-    private fun recordChild(child: AgentProcess) {
-        recentChildren.addLast(child)
-        if (recentChildren.size > RETAINED_CHILDREN) {
-            recentChildren.removeFirst()
-        }
-        childCount++
+        return EpisodeDispatch(child, outcome)
     }
 }

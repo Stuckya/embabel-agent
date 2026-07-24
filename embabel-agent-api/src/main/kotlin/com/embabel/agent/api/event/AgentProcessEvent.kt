@@ -113,18 +113,6 @@ open class GoalAchievedEvent(
 ) : AbstractAgentProcessEvent(agentProcess)
 
 /**
- * A nonterminal goal achievement: the selected occurrence was consumed, the
- * child working memory was disposed, and the process continues. Emitted in
- * place of the plain [GoalAchievedEvent] so listeners can distinguish episodic
- * completions; listeners matching on [GoalAchievedEvent] still receive it.
- */
-class EpisodeCompletedEvent(
-    agentProcess: AgentProcess,
-    worldState: WorldState,
-    goal: Goal,
-) : GoalAchievedEvent(agentProcess, worldState, goal)
-
-/**
  * An occurrence was accepted at the evolving process boundary. Acceptance
  * does not make the occurrence standing state; the planning thread admits it
  * to the occurrence ledger on its next tick.

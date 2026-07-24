@@ -487,8 +487,6 @@ path.
 - Existing planner types remain the public selection mechanism.
 - The current condition planner implements the planning-session seam;
   other planners can implement the same contract incrementally.
-- Existing `EpisodeCompletedEvent` consumers may be supported by a
-  process-level compatibility adapter.
 - Internal types that previously called persistent occurrences
   “episodes” should migrate to occurrence terminology. Public semantics
   follow this specification even during that transition.

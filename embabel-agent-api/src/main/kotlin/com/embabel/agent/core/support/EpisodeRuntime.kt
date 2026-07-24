@@ -21,7 +21,6 @@ import com.embabel.agent.api.event.OccurrenceAcceptedEvent
 import com.embabel.agent.api.event.OccurrenceConsumedEvent
 import com.embabel.agent.core.Action
 import com.embabel.agent.core.ActionStatus
-import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.EpisodeExecution
 import com.embabel.agent.core.EpisodeId
@@ -50,7 +49,6 @@ internal class EpisodeRuntime(
     private val process: SimpleAgentProcess,
     private val setStatus: (AgentProcessStatusCode) -> Unit,
     private val makeRunning: () -> Boolean,
-    private val onOccurrenceConsumed: (WorldState, AgentProcess) -> Unit,
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -84,7 +82,6 @@ internal class EpisodeRuntime(
     private val episodes = linkedMapOf<OccurrenceId, Episode>()
     private val outcomes = ArrayDeque<EpisodeExecution>()
     private val lastExecutionIds = mutableMapOf<OccurrenceId, EpisodeId>()
-    private val lastExecutionChildren = mutableMapOf<OccurrenceId, AgentProcess>()
     private val executor by lazy { EpisodeExecutor(process) }
 
     private var revision: Long = 0
@@ -96,20 +93,6 @@ internal class EpisodeRuntime(
 
     private val executingEpisode = ThreadLocal<ExecutingEpisode?>()
     private val executingAction = ThreadLocal<String?>()
-
-    var lastCompletedEpisode: Episode? = null
-        private set
-
-    val frameworkChildren: List<AgentProcess> get() = executor.recentChildrenView
-
-    val frameworkChildCount: Int get() = executor.childCount
-
-    val retainedArrivalBookkeeping: Int
-        get() =
-            acceptedOccurrences.size + episodes.size + outcomes.size +
-                    lastExecutionIds.size + lastExecutionChildren.size
-
-    fun activeEpisode(id: OccurrenceId): Episode? = episodes[id]
 
     val isEvolving: Boolean get() = evolvingDeclaration != null
 
@@ -203,7 +186,7 @@ internal class EpisodeRuntime(
         episode.run()
         val execution = ExecutingEpisode(episode, episodeId)
         executingEpisode.set(execution)
-        val outcome = try {
+        val dispatch = try {
             executor.execute(episode, directive.mission) { child ->
                 execution.childProcessId = child.id
                 process.processContext.onProcessEvent(
@@ -218,7 +201,8 @@ internal class EpisodeRuntime(
         } finally {
             executingEpisode.remove()
         }
-        val child = executor.recentChildrenView.lastOrNull()
+        val child = dispatch.child
+        val outcome = dispatch.outcome
         val completedExecution = if (child != null) {
             val terminalOutcome = when (outcome) {
                 DispatchOutcome.COMPLETED -> EpisodeOutcome.COMPLETED
@@ -236,7 +220,6 @@ internal class EpisodeRuntime(
                     trace = EpisodeTrace(child.history.toList()),
                 )
                 lastExecutionIds[episode.id] = episodeId
-                lastExecutionChildren[episode.id] = child
                 process.processContext.onProcessEvent(
                     EpisodeFinishedEvent(
                         agentProcess = process,
@@ -276,19 +259,11 @@ internal class EpisodeRuntime(
         makeRunning()
     }
 
-    fun completeOccurrence(
-        directive: PlanningDirective.CompleteOccurrence,
-        worldState: WorldState,
-    ) {
+    fun completeOccurrence(directive: PlanningDirective.CompleteOccurrence) {
         val episode = requireEpisode(directive.occurrenceId)
         episode.complete()
         episodes.remove(episode.id)
         val completedExecutionId = lastExecutionIds.remove(episode.id)
-        val completedChild = lastExecutionChildren.remove(episode.id)
-        lastCompletedEpisode = episode
-        if (completedChild != null && makeRunning()) {
-            onOccurrenceConsumed(worldState, completedChild)
-        }
         if (completedExecutionId != null) {
             process.processContext.onProcessEvent(
                 OccurrenceConsumedEvent(
@@ -306,7 +281,6 @@ internal class EpisodeRuntime(
         episode.cancel()
         episodes.remove(episode.id)
         lastExecutionIds.remove(episode.id)
-        lastExecutionChildren.remove(episode.id)
         advanceRevision()
         makeRunning()
     }

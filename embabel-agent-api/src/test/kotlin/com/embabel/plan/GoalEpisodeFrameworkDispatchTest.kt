@@ -22,12 +22,13 @@ import com.embabel.agent.api.annotation.Condition
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
+import com.embabel.agent.api.event.OccurrenceAcceptedEvent
+import com.embabel.agent.api.event.OccurrenceConsumedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
-import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -166,7 +167,8 @@ class GoalEpisodeFrameworkDispatchTest {
         // The planner session owns routing and value comparison. The
         // runtime merely dispatches the returned child mission, using the
         // same declared planner type in the child.
-        val process = dispatching(ContestedMissionAgent(), hybrid = true)
+        val recorder = ProcessEventRecorder()
+        val process = dispatching(ContestedMissionAgent(), hybrid = true, recorder = recorder)
         process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
@@ -177,7 +179,7 @@ class GoalEpisodeFrameworkDispatchTest {
             listOf("draft:job-1", "file:job-1"), steps,
             "The higher-value planner mission won and ran once in its child",
         )
-        assertEquals(1, process.frameworkChildCount, "One child for the one occurrence")
+        assertEquals(1, recorder.episodeStarts(process).size, "One child for the one occurrence")
     }
 
     @Test
@@ -238,21 +240,15 @@ class GoalEpisodeFrameworkDispatchTest {
         // a new evolution changes the world, and the blocked work resumes
         // through nothing but the change itself
         val process = dispatching(SupplyChainAgent())
-        val paintOccurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertEquals(
-            EpisodeState.STUCK,
-            process.activeEpisode(paintOccurrence)?.state,
-            "The blocked occurrence remains in the episode ledger",
-        )
 
         process.evolve(CanRequested("supply-1"))
         val resolved = stalled.run()
 
-        assertNull(process.activeEpisode(paintOccurrence), "The blocked episode completed after the supply evolution")
         assertNotNull(resolved.last<PaintCan>(), "The supply run's lasting product survived and enabled the job")
         val steps = resolved.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertTrue("paint:job-1" in steps, "The blocked chain ran to its goal: $steps")
@@ -299,16 +295,16 @@ class GoalEpisodeFrameworkDispatchTest {
         // A full-path planner cannot see the condition flipping mid-run, so
         // the child parks having done nothing and the block is recorded -
         // the documented limitation, and the future author's input
-        val process = dispatching(ValueConditionChainAgent(), SampleTally(0))
-        val occurrence = process.evolve(BuildRequested("b-1"))
+        val recorder = ProcessEventRecorder()
+        val process = dispatching(ValueConditionChainAgent(), SampleTally(0), recorder = recorder)
+        process.evolve(BuildRequested("b-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
         assertEquals(
             0,
-            process.frameworkChildCount,
+            recorder.episodeStarts(process).size,
             "The runtime must not invent a child mission when the planner cannot produce one",
         )
     }
@@ -329,25 +325,26 @@ class GoalEpisodeFrameworkDispatchTest {
         // nothing: crashes retry freely, and the budget is the bound
         val blackboard = InMemoryBlackboard()
         val agent = AgentMetadataReader().createAgentMetadata(AlwaysCrashingAgent()) as CoreAgent
+        val recorder = ProcessEventRecorder()
         val process = SimpleAgentProcess(
             "framework-dispatch-crash-budget",
             null,
             agent,
             ProcessOptions.DEFAULT
                 .withBudget(com.embabel.agent.core.Budget().withActions(5))
-                .withEvolving(),
+                .withEvolving()
+                .withListener(recorder),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
             Instant.now(),
         )
-        val occurrence = process.evolve(CalibrationRequested("cal-1"))
+        process.evolve(CalibrationRequested("cal-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.TERMINATED, result.status, "The budget bounded the retries")
-        assertEquals(5, process.frameworkChildCount, "One child per budgeted attempt, then the brake")
-        assertNotNull(process.activeEpisode(occurrence), "The occurrence was never consumed")
+        assertEquals(5, recorder.episodeStarts(process).size, "One child per budgeted attempt, then the brake")
     }
 
     @Agent(description = "Standing state maintained by a two-action cycle, read by a chain")
@@ -468,35 +465,31 @@ class GoalEpisodeFrameworkDispatchTest {
     }
 
     @Test
-    fun `a reopened contest leaves no arrival bookkeeping when it completes`() {
-        // The blocked-contestant record is per-occurrence state: a long
-        // running process must not accumulate it past completion
+    fun `a reopened contest consumes its occurrence when it completes`() {
         val process = dispatching(DeadWinnerAgent())
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
         val result = process.run()
         assertNull(result.last<PaintRequested>(), "the rival completed the occurrence")
-        assertEquals(0, process.retainedArrivalBookkeeping, "no arrival bookkeeping survives completion")
     }
 
     @Test
     fun `an unresolved contest parks without runtime candidate reconstruction`() {
-        val process = dispatching(DeadlockedRivalsAgent())
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        val recorder = ProcessEventRecorder()
+        val process = dispatching(DeadlockedRivalsAgent(), recorder = recorder)
+        process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
         assertEquals(
             0,
-            process.frameworkChildCount,
+            recorder.episodeStarts(process).size,
             "The runtime does not derive contestant missions from the action graph",
         )
 
-        val again = stalled.run()
+        stalled.run()
 
-        assertEquals(0, process.frameworkChildCount, "An unchanged world buys no inferred attempts")
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
+        assertEquals(0, recorder.episodeStarts(process).size, "An unchanged world buys no inferred attempts")
     }
 
     @Agent(description = "An action reading its request by an interface type")
@@ -514,11 +507,12 @@ class GoalEpisodeFrameworkDispatchTest {
         // The planner-selected occurrence is inserted last in the child.
         // The sibling remains ordinary standing work and may run later in
         // the root, but it cannot replace the selected child occurrence.
-        val process = dispatching(InterfaceInputAgent())
+        val recorder = ProcessEventRecorder()
+        val process = dispatching(InterfaceInputAgent(), recorder = recorder)
         process.evolve(FooRequest("occurrence"))
         process.addObject(BarRequest("newer-sibling"))
         val result = process.run()
-        val child = process.frameworkChildren.single()
+        val child = recorder.childProcesses(process).single()
         assertEquals("occurrence", child.last<JobHandled>()?.id)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
@@ -561,6 +555,7 @@ class GoalEpisodeFrameworkDispatchTest {
         vararg seeds: Any,
         objective: GoalTarget? = null,
         hybrid: Boolean = false,
+        recorder: ProcessEventRecorder? = null,
     ): SimpleAgentProcess {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
@@ -571,6 +566,7 @@ class GoalEpisodeFrameworkDispatchTest {
         if (hybrid) {
             options = options.withPlannerType(PlannerType.HYBRID)
         }
+        recorder?.let { options = options.withListener(it) }
         return SimpleAgentProcess(
             "framework-dispatch",
             null,
@@ -585,21 +581,14 @@ class GoalEpisodeFrameworkDispatchTest {
 
     @Test
     fun `an evolved episode runs in a framework child - the developer never sees the platform`() {
-        var episodeCompletions = 0
-        val listener = object : com.embabel.agent.api.event.AgenticEventListener {
-            override fun onProcessEvent(event: com.embabel.agent.api.event.AgentProcessEvent) {
-                if (event is com.embabel.agent.api.event.EpisodeCompletedEvent) {
-                    episodeCompletions++
-                }
-            }
-        }
+        val recorder = ProcessEventRecorder()
         val blackboard = InMemoryBlackboard()
         val agent = AgentMetadataReader().createAgentMetadata(PlainCalibrationAgent()) as CoreAgent
         val process = SimpleAgentProcess(
             "framework-dispatch-hidden",
             null,
             agent,
-            ProcessOptions.DEFAULT.withEvolving().withListener(listener),
+            ProcessOptions.DEFAULT.withEvolving().withListener(recorder),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
@@ -610,14 +599,18 @@ class GoalEpisodeFrameworkDispatchTest {
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "One episode completed, then a clean park")
-        val children = process.frameworkChildren
+        val children = recorder.childProcesses(process)
         assertEquals(1, children.size, "The framework spawned exactly one child for the occurrence")
         assertEquals(result.id, children.single().parentId, "The platform recorded the parent lineage")
         assertEquals(
             AgentProcessStatusCode.COMPLETED, children.single().status,
             "The planner-issued child mission ran to completion",
         )
-        assertEquals(1, episodeCompletions, "Planner-directed completion emitted one episode event")
+        assertEquals(
+            1,
+            recorder.events.filterIsInstance<OccurrenceConsumedEvent>().size,
+            "Planner-directed completion consumed one occurrence",
+        )
         assertNull(result.last<CalibrationRequested>(), "The occurrence was consumed")
         assertNull(result.last<CalibrationKit>(), "Child-local intermediates never crossed into root state")
         assertNull(result.last<CalibrationCompleted>(), "Child-local output disappeared with the attempt")
@@ -635,10 +628,12 @@ class GoalEpisodeFrameworkDispatchTest {
         // inside the chain, and the follow-up occurrence is evolved from
         // inside the framework child. Explicit share transfers the tally;
         // evolve delegates up the tower to the owning evolving parent
+        val recorder = ProcessEventRecorder()
         val process = dispatching(
             PlainBatchMissionAgent(),
             SampleTally(0),
             objective = GoalTarget.output(BatchMissionDone::class.java),
+            recorder = recorder,
         )
         process.evolve(BatchRequested(1))
 
@@ -647,12 +642,13 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status, "The committed objective ended the mission")
         assertEquals(200, result.last<BatchMissionDone>()?.samples, "Four child episodes accumulated to the target")
         assertEquals(200, result.last<SampleTally>()?.count, "The accumulator was shared from every child")
-        assertEquals(4, process.frameworkChildren.size, "One framework child per occurrence")
+        val children = recorder.childProcesses(process)
+        assertEquals(4, children.size, "One framework child per occurrence")
         assertNull(result.last<BatchRequested>(), "Every occurrence was consumed, including tower-delegated ones")
         assertNull(result.last<BatchCollected>(), "Every satisfying output was consumed")
         assertEquals(
             listOf(listOf(1), listOf(2), listOf(3), listOf(4)),
-            process.frameworkChildren.map { child ->
+            children.map { child ->
                 child.objects.filterIsInstance<BatchRequested>().map(BatchRequested::id)
             },
             "Snapshot pairing: each child saw exactly its own occurrence, never a queued one",
@@ -703,17 +699,18 @@ class GoalEpisodeFrameworkDispatchTest {
         // respawns a fresh child in the same run, bounded by the parent's
         // action budget
         val agent = PlainFlakyAgent()
-        val process = dispatching(agent)
+        val recorder = ProcessEventRecorder()
+        val process = dispatching(agent, recorder = recorder)
         process.evolve(CalibrationRequested("cal-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "The parent survived the child's failure")
         assertEquals(2, agent.attempts, "The contained failure was re-selected and a fresh child respawned")
-        assertEquals(2, process.frameworkChildren.size, "One failed child, one successful respawn")
+        assertEquals(2, recorder.episodeStarts(process).size, "One failed child, one successful respawn")
         assertNull(result.last<CalibrationRequested>(), "Only the successful child consumed the occurrence")
         assertEquals(
-            AgentProcessStatusCode.COMPLETED, process.frameworkChildren.last().status,
+            AgentProcessStatusCode.COMPLETED, recorder.childProcesses(process).last().status,
             "The respawned child ran the chain to its goal",
         )
     }
@@ -721,16 +718,11 @@ class GoalEpisodeFrameworkDispatchTest {
     @Test
     fun `a blocked child consumes nothing and redispatches when the world changes`() {
         val process = dispatching(PlainPaintingAgent())
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No can, so the child stalls before work")
-        assertEquals(
-            EpisodeState.STUCK,
-            process.activeEpisode(occurrence)?.state,
-            "A blocked episode must retain its occurrence",
-        )
         assertTrue(
             stalled.objects.filterIsInstance<ExecutedStep>().isEmpty(),
             "GOAP in the child refuses to start a chain it cannot finish: no stranded prep",
@@ -740,7 +732,6 @@ class GoalEpisodeFrameworkDispatchTest {
         val painted = stalled.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, painted.status)
-        assertNull(process.activeEpisode(occurrence), "The redispatched child completed and consumed")
         assertNotNull(painted.last<PaintCan>(), "The can is used, not consumed")
         val steps = painted.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("prep:job-1", "paint:job-1"), steps, "The chain ran whole in the successful child")
@@ -774,13 +765,15 @@ class GoalEpisodeFrameworkDispatchTest {
         // in-process spins do
         val blackboard = InMemoryBlackboard()
         val agent = AgentMetadataReader().createAgentMetadata(GreedyChainAgent()) as CoreAgent
+        val recorder = ProcessEventRecorder()
         val process = SimpleAgentProcess(
             "framework-dispatch-budget",
             null,
             agent,
             ProcessOptions.DEFAULT
                 .withBudget(com.embabel.agent.core.Budget().withActions(5))
-                .withEvolving(),
+                .withEvolving()
+                .withListener(recorder),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
@@ -794,17 +787,19 @@ class GoalEpisodeFrameworkDispatchTest {
             AgentProcessStatusCode.TERMINATED, result.status,
             "The action budget bounded the dispatch loop",
         )
-        assertEquals(5, process.frameworkChildren.size, "One child per budgeted action, then the brake")
+        assertEquals(5, recorder.episodeStarts(process).size, "One child per budgeted action, then the brake")
+        val acceptedFollowups = recorder.events.filterIsInstance<OccurrenceAcceptedEvent>()
+            .filter { it.causedBy != null }
         assertTrue(
-            process.retainedArrivalBookkeeping > 0,
-            "The unbounded chain's next occurrence stayed in the ledger",
+            acceptedFollowups.isNotEmpty(),
+            "Child episodes published causally linked follow-ups",
         )
         assertTrue(
-            process.lastCompletedEpisode?.causedBy?.request is BatchRequested,
+            acceptedFollowups.all { it.occurrence is BatchRequested },
             "A follow-up published from inside a child records the dispatching episode as its cause",
         )
         assertTrue(
-            process.lastCompletedEpisode?.publishedBy?.endsWith(".forgeLink") == true,
+            acceptedFollowups.all { it.publishedBy?.endsWith(".forgeLink") == true },
             "ctx.evolve records the publishing action across the child boundary",
         )
     }
@@ -940,17 +935,20 @@ class GoalEpisodeFrameworkDispatchTest {
 
     @Test
     fun `an evolved hazard runs as its own framework child between batches`() {
+        val recorder = ProcessEventRecorder()
         val process = dispatching(
             HazardousMissionAgent(),
             SampleTally(0),
             hybrid = true,
+            recorder = recorder,
         )
         process.evolve(BatchRequested(1))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertEquals(4, process.frameworkChildren.size, "Three batch occurrences and one hazard occurrence")
+        val children = recorder.childProcesses(process)
+        assertEquals(4, children.size, "Three batch occurrences and one hazard occurrence")
         assertEquals(150, result.last<BatchMissionDone>()?.samples)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertTrue(
@@ -958,7 +956,7 @@ class GoalEpisodeFrameworkDispatchTest {
             "The hazard chain explicitly shared its trace: $steps",
         )
         assertTrue(
-            process.frameworkChildren.any { child ->
+            children.any { child ->
                 child.history.any { it.actionName.endsWith(".assess") } &&
                         child.history.any { it.actionName.endsWith(".clear") }
             },
@@ -1000,19 +998,21 @@ class GoalEpisodeFrameworkDispatchTest {
         val blackboard = InMemoryBlackboard()
         blackboard.addObject(SampleTally(0))
         val agent = AgentMetadataReader().createAgentMetadata(SphexMissionAgent()) as CoreAgent
+        val recorder = ProcessEventRecorder()
         val process = SimpleAgentProcess(
             "framework-dispatch-sphex",
             null,
             agent.copy(goals = agent.goals + NIRVANA),
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
-                .withEvolving(GoalTarget.output(BatchMissionDone::class.java)),
+                .withEvolving(GoalTarget.output(BatchMissionDone::class.java))
+                .withListener(recorder),
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
             Instant.now(),
         )
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
 
@@ -1023,39 +1023,13 @@ class GoalEpisodeFrameworkDispatchTest {
         assertEquals(3, result.last<BatchMissionDone>()?.samples, "Frame work proceeded past the blocked episode")
         assertEquals(
             0,
-            process.frameworkChildCount,
+            recorder.episodeStarts(process).size,
             "The runtime must not turn planner obstruction into a guessed mission",
         )
         assertTrue(
             result.objects.filterIsInstance<ExecutedStep>().none { it.name.startsWith("paint") },
             "The blocked child's litter died with its board: the parent stays clean",
         )
-        assertEquals(EpisodeState.PENDING, process.activeEpisode(occurrence)?.state)
-    }
-
-    @Test
-    fun `child retention is bounded - a long mission keeps a window, not a hoard`() {
-        val blackboard = InMemoryBlackboard()
-        val agent = AgentMetadataReader().createAgentMetadata(GreedyChainAgent()) as CoreAgent
-        val process = SimpleAgentProcess(
-            "framework-dispatch-retention",
-            null,
-            agent,
-            ProcessOptions.DEFAULT
-                .withBudget(com.embabel.agent.core.Budget().withActions(35))
-                .withEvolving(),
-            blackboard,
-            dummyPlatformServices(),
-            DefaultPlannerFactory,
-            Instant.now(),
-        )
-        process.evolve(BatchRequested(1))
-
-        val result = process.run()
-
-        assertEquals(AgentProcessStatusCode.TERMINATED, result.status)
-        assertEquals(35, process.frameworkChildCount, "Every dispatch counted")
-        assertEquals(32, process.frameworkChildren.size, "Inspection sees a bounded window of recent children")
     }
 
     @Test
@@ -1063,11 +1037,13 @@ class GoalEpisodeFrameworkDispatchTest {
         // A HYBRID parent's children run HYBRID, pairing goal and all: the
         // developer declared a planning philosophy and it travels down the
         // tower untouched
+        val recorder = ProcessEventRecorder()
         val process = dispatching(
             PlainBatchMissionAgent(),
             SampleTally(0),
             objective = GoalTarget.output(BatchMissionDone::class.java),
             hybrid = true,
+            recorder = recorder,
         )
         process.evolve(BatchRequested(1))
 
@@ -1075,7 +1051,7 @@ class GoalEpisodeFrameworkDispatchTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         assertEquals(200, result.last<BatchMissionDone>()?.samples)
-        val children = process.frameworkChildren
+        val children = recorder.childProcesses(process)
         assertEquals(4, children.size)
         children.forEach { child ->
             assertEquals(AgentProcessStatusCode.COMPLETED, child.status, "Every child completed whole")

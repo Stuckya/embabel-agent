@@ -136,14 +136,6 @@ interface Blackboard : Bindable, MayHaveLastResult, HasInfoString {
     fun hide(what: Any)
 
     /**
-     * Reveal a previously hidden object, making it retrievable again.
-     * Identity-based like [hide]: only this exact instance is revealed.
-     * Returns true if this exact instance was hidden and is now visible.
-     * Implementations that do not support hiding may return false.
-     */
-    fun reveal(what: Any): Boolean
-
-    /**
      * Make [value] visible only while [block] runs.
      *
      * Planning uses this for an occurrence-scoped view: the occurrence is

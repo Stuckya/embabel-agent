@@ -21,13 +21,13 @@ import com.embabel.agent.api.annotation.Agent
 import com.embabel.agent.api.annotation.support.AgentMetadataReader
 import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.common.PlannerType
+import com.embabel.agent.api.event.OccurrenceAcceptedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Evolving
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
-import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
@@ -38,7 +38,6 @@ import java.time.Instant
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -99,27 +98,29 @@ class GoalEvolvingModeTest {
 
     @Test
     fun `an unroutable occurrence is accepted and parked by the planner`() {
-        val process = evolvingProcess()
+        val recorder = ProcessEventRecorder()
+        val process = evolvingProcess(recorder = recorder)
 
-        val occurrence = process.evolve(AuditDone("audit-1"))
+        process.evolve(AuditDone("audit-1"))
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
-        assertEquals(0, process.frameworkChildCount)
+        assertEquals(0, recorder.episodeStarts(process).size)
     }
 
     @Test
     fun `ordinary standing facts remain root work rather than episodes`() {
+        val recorder = ProcessEventRecorder()
         val process = evolvingProcess(
             ZoneInfo("zone-9"),
             CalibrationRequested("standing"),
+            recorder = recorder,
         )
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertEquals(0, process.frameworkChildCount)
+        assertEquals(0, recorder.episodeStarts(process).size)
         assertEquals(
             listOf("calibrate:standing@zone-9"),
             result.objects.filterIsInstance<ExecutedStep>().map { it.name },
@@ -128,21 +129,21 @@ class GoalEvolvingModeTest {
 
     @Test
     fun `episode completion does not complete the root mission`() {
+        val recorder = ProcessEventRecorder()
         val process = evolvingProcess(
             ZoneInfo("zone-9"),
             objective = GoalTarget.output(CalibrationCompleted::class.java),
+            recorder = recorder,
         )
-        val occurrence = process.evolve(CalibrationRequested("episode-1"))
+        process.evolve(CalibrationRequested("episode-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        assertNull(process.activeEpisode(occurrence))
-        assertNotNull(process.lastCompletedEpisode)
         assertNull(result.last<CalibrationCompleted>(), "Child output remains child-local")
         assertEquals(
             "episode-1",
-            process.frameworkChildren.single().last<CalibrationCompleted>()?.id,
+            recorder.childProcesses(process).single().last<CalibrationCompleted>()?.id,
         )
     }
 
@@ -158,7 +159,6 @@ class GoalEvolvingModeTest {
 
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         assertEquals("root-work", result.last<CalibrationCompleted>()?.id)
-        assertNull(process.lastCompletedEpisode, "The root mission is not a synthetic founding episode")
         assertThrows<IllegalArgumentException> {
             process.evolve(CalibrationRequested("too-late"))
         }
@@ -166,21 +166,22 @@ class GoalEvolvingModeTest {
 
     @Test
     fun `equal publications remain distinct occurrences`() {
-        val process = evolvingProcess()
+        val recorder = ProcessEventRecorder()
+        val process = evolvingProcess(recorder = recorder)
         val fact = AuditDone("same")
 
         val first = process.evolve(fact)
         val second = process.evolve(fact)
 
         assertTrue(first != second)
-        process.run()
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(first)?.state)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(second)?.state)
+        assertEquals(AgentProcessStatusCode.STUCK, process.run().status)
+        assertEquals(0, recorder.episodeStarts(process).size)
     }
 
     @Test
-    fun `external evolve calls queue atomically until the next planning tick`() {
-        val process = evolvingProcess()
+    fun `external evolve calls are accepted atomically from concurrent publishers`() {
+        val recorder = ProcessEventRecorder()
+        val process = evolvingProcess(recorder = recorder)
         val executor = Executors.newFixedThreadPool(4)
         try {
             val publications = (1..32).map { id ->
@@ -191,22 +192,14 @@ class GoalEvolvingModeTest {
             val occurrences = publications.map { it.get(10, TimeUnit.SECONDS) }
 
             assertEquals(32, occurrences.toSet().size)
-            assertTrue(
-                occurrences.all { process.activeEpisode(it) == null },
-                "Publisher threads must not mutate the planner-visible ledger",
-            )
 
             val result = process.run()
 
             assertEquals(AgentProcessStatusCode.STUCK, result.status)
-            assertTrue(
-                occurrences.all { process.activeEpisode(it)?.state == EpisodeState.STUCK },
-                "The planning thread must admit every queued occurrence exactly once",
-            )
-            assertTrue(
-                occurrences.all { process.activeEpisode(it)?.publishedBy == null },
-                "External process.evolve calls have no synthetic action attribution",
-            )
+            val accepted = recorder.events.filterIsInstance<OccurrenceAcceptedEvent>()
+            assertEquals(occurrences.toSet(), accepted.map { it.occurrenceId }.toSet())
+            assertTrue(accepted.all { it.publishedBy == null })
+            assertEquals(0, recorder.episodeStarts(process).size)
         } finally {
             executor.shutdownNow()
         }
@@ -215,16 +208,19 @@ class GoalEvolvingModeTest {
     private fun evolvingProcess(
         vararg seeds: Any,
         objective: GoalTarget? = null,
+        recorder: ProcessEventRecorder? = null,
     ): SimpleAgentProcess {
         val blackboard = InMemoryBlackboard()
         seeds.forEach(blackboard::addObject)
         val agent = AgentMetadataReader().createAgentMetadata(CalibrationAgent()) as CoreAgent
+        var options = objective?.let(ProcessOptions.DEFAULT::withEvolving)
+            ?: ProcessOptions.DEFAULT.withEvolving()
+        recorder?.let { options = options.withListener(it) }
         return SimpleAgentProcess(
             "evolving-mode",
             null,
             agent,
-            objective?.let(ProcessOptions.DEFAULT::withEvolving)
-                ?: ProcessOptions.DEFAULT.withEvolving(),
+            options,
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,

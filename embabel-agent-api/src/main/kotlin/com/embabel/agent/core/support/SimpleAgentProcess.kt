@@ -17,7 +17,6 @@ package com.embabel.agent.core.support
 
 import com.embabel.agent.api.common.PlatformServices
 import com.embabel.agent.api.event.AgentProcessPlanFormulatedEvent
-import com.embabel.agent.api.event.EpisodeCompletedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.ReplanRequestedEvent
 import com.embabel.agent.api.tool.TerminateActionException
@@ -72,7 +71,6 @@ open class SimpleAgentProcess(
         process = this,
         setStatus = ::setStatus,
         makeRunning = ::makeRunning,
-        onOccurrenceConsumed = ::emitLegacyEpisodeCompletion,
     )
 
     /**
@@ -103,25 +101,6 @@ open class SimpleAgentProcess(
         set(value) {
             episodes.shareDelegate = value
         }
-
-    /**
-     * The most recently completed episode, kept so callers can inspect
-     * what just finished. Completed episodes are otherwise discarded.
-     */
-    internal val lastCompletedEpisode: Episode? get() = episodes.lastCompletedEpisode
-
-    /** Recent framework children, bounded, for inspection */
-    internal val frameworkChildren: List<AgentProcess> get() = episodes.frameworkChildren
-
-    /** Total framework children ever dispatched */
-    internal val frameworkChildCount: Int get() = episodes.frameworkChildCount
-
-    /** Arrival bookkeeping still held, for leak inspection */
-    internal val retainedArrivalBookkeeping: Int get() = episodes.retainedArrivalBookkeeping
-
-    /** Active ledger record for contract tests and process observability. */
-    internal fun activeEpisode(id: com.embabel.agent.core.OccurrenceId): Episode? =
-        episodes.activeEpisode(id)
 
     override fun evolve(fact: Any) = episodes.evolve(fact)
 
@@ -207,25 +186,6 @@ open class SimpleAgentProcess(
         setStatus(AgentProcessStatusCode.COMPLETED)
     }
 
-    /**
-     * Compatibility event derived from the observed child result. Occurrence
-     * routing and completion remain planner directives owned by the session.
-     */
-    private fun emitLegacyEpisodeCompletion(
-        worldState: WorldState,
-        child: AgentProcess,
-    ) {
-        child.goal?.let { goal ->
-            processContext.onProcessEvent(
-                EpisodeCompletedEvent(
-                    agentProcess = this,
-                    worldState = worldState,
-                    goal = goal,
-                )
-            )
-        }
-    }
-
     protected fun sendProcessRunningEvent(
         plan: Plan,
         worldState: WorldState,
@@ -300,7 +260,7 @@ open class SimpleAgentProcess(
             }
 
             is PlanningDirective.CompleteOccurrence -> {
-                episodes.completeOccurrence(directive, worldState)
+                episodes.completeOccurrence(directive)
                 this
             }
 

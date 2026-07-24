@@ -79,8 +79,6 @@ class InMemoryBlackboard(
         hiddens += what
     }
 
-    override fun reveal(what: Any): Boolean = hiddens.remove(what)
-
     override fun <T> withTransientObject(
         value: Any,
         block: () -> T,

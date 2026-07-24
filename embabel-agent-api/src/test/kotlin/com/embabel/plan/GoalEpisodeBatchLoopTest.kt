@@ -173,6 +173,5 @@ class GoalEpisodeBatchLoopTest {
         assertNull(result.last<HazardAssessed>(), "The hazard intermediate remained child-local")
         assertNull(result.last<HazardCleared>(), "The hazard output remained child-local")
 
-        assertEquals(0, process.retainedArrivalBookkeeping, "Every published occurrence completed")
     }
 }

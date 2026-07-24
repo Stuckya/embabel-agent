@@ -23,9 +23,10 @@ import com.embabel.agent.api.common.ActionContext
 import com.embabel.agent.api.event.AgentProcessEvent
 import com.embabel.agent.api.event.AgentProcessFinishedEvent
 import com.embabel.agent.api.event.AgenticEventListener
-import com.embabel.agent.api.event.EpisodeCompletedEvent
+import com.embabel.agent.api.event.EpisodeFinishedEvent
 import com.embabel.agent.api.event.GoalAchievedEvent
 import com.embabel.agent.api.event.OccurrenceAcceptedEvent
+import com.embabel.agent.api.event.OccurrenceConsumedEvent
 import com.embabel.agent.core.Agent as CoreAgent
 import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.Evolving
@@ -36,7 +37,6 @@ import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.AgentProcessCallback
 import com.embabel.agent.core.last
 import com.embabel.agent.core.support.ConcurrentAgentProcess
-import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.SimpleAgentProcess
 import com.embabel.agent.spi.support.DefaultPlannerFactory
@@ -167,18 +167,23 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `completed occurrences leave no retained arrival bookkeeping`() {
-        // An intentionally infinite process ingests occurrences forever:
-        // bookkeeping retained past completion is a leak, not a record
-        val process = evolvingProcess(CalibrationAgent())
+    fun `completed occurrences emit one consumed event each`() {
+        val events = mutableListOf<AgentProcessEvent>()
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                events += event
+            }
+        }
+        val process = evolvingProcess(CalibrationAgent(), listener = listener)
         repeat(3) { n ->
             process.evolve(CalibrationRequested("cal-$n"))
             process.run()
         }
         assertNull(process.last<CalibrationRequested>(), "Every occurrence was consumed")
         assertEquals(
-            0, process.retainedArrivalBookkeeping,
-            "A completed occurrence releases its arrival bookkeeping",
+            3,
+            events.filterIsInstance<OccurrenceConsumedEvent>()
+                .count { it.agentProcess.id == process.id },
         )
     }
 
@@ -394,15 +399,13 @@ class GoalEvolvingContractTest {
         // behind it. Head-of-line blocking is the accepted cost of serial
         // admission
         val process = evolvingProcess(DualInputAgent())
-        val first = process.evolve(CalibrationRequested("cal-1"))
-        val second = process.evolve(CalibrationRequested("cal-2"))
+        process.evolve(CalibrationRequested("cal-1"))
+        process.evolve(CalibrationRequested("cal-2"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status, "No ZoneInfo, so the chain cannot start")
         assertTrue(stalled.objects.filterIsInstance<CalibrationRequested>().isEmpty())
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(first)?.state)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(second)?.state)
 
         stalled.addObject(ZoneInfo("zone-9"))
         val resumed = stalled.run()
@@ -439,13 +442,14 @@ class GoalEvolvingContractTest {
     fun `the chain binds its episode's request even when a plain fact of the same type is newer`() {
         // The selected occurrence is last in the fresh child. A same-typed
         // standing fact remains legitimate root work after the episode.
-        val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"))
+        val recorder = ProcessEventRecorder()
+        val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"), listener = recorder)
         process.evolve(CalibrationRequested("cal-1"))
         process.addObject(CalibrationRequested("cal-2"))
 
         val result = process.run()
 
-        assertEquals("cal-1", process.frameworkChildren.single().last<CalibrationCompleted>()?.id)
+        assertEquals("cal-1", recorder.childProcesses(process).single().last<CalibrationCompleted>()?.id)
         val steps = result.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(
             listOf("calibrate:cal-1@zone-9", "calibrate:cal-2@zone-9"), steps,
@@ -473,31 +477,28 @@ class GoalEvolvingContractTest {
     }
 
     @Test
-    fun `episode completion emits EpisodeCompletedEvent after consumption and never a finished event`() {
+    fun `episode completion emits lifecycle events without completing the parent process`() {
         val events = mutableListOf<AgentProcessEvent>()
-        var requestVisibleAtEvent: Boolean? = null
         val listener = object : AgenticEventListener {
             override fun onProcessEvent(event: AgentProcessEvent) {
                 events.add(event)
-                if (event is EpisodeCompletedEvent) {
-                    requestVisibleAtEvent =
-                        event.agentProcess.last(CalibrationRequested::class.java) != null
-                }
             }
         }
         val process = evolvingProcess(CalibrationAgent(), listener = listener)
-        process.evolve(CalibrationRequested("cal-1"))
+        val occurrenceId = process.evolve(CalibrationRequested("cal-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status)
-        // The child completes as a real process with its own events; the
-        // evolving parent's story stays scoped to the parent
         val parentGoalEvents = events.filterIsInstance<GoalAchievedEvent>()
             .filter { it.agentProcess.id == result.id }
-        assertEquals(1, parentGoalEvents.size, "One episode, one parent goal event")
-        assertTrue(parentGoalEvents.single() is EpisodeCompletedEvent, "Episode completions are distinguishable by type")
-        assertEquals(false, requestVisibleAtEvent, "Consumption must precede the event that announces it")
+        assertTrue(parentGoalEvents.isEmpty(), "An episode is not a parent goal achievement")
+        val finished = events.filterIsInstance<EpisodeFinishedEvent>()
+            .single { it.agentProcess.id == result.id && it.occurrenceId == occurrenceId }
+        val consumed = events.filterIsInstance<OccurrenceConsumedEvent>()
+            .single { it.agentProcess.id == result.id && it.occurrenceId == occurrenceId }
+        assertEquals(finished.episodeId, consumed.episodeId)
+        assertTrue(events.indexOf(finished) < events.indexOf(consumed))
         assertEquals(
             0,
             events.count { it is AgentProcessFinishedEvent && it.agentProcess.id == result.id },
@@ -526,7 +527,6 @@ class GoalEvolvingContractTest {
         assertEquals(AgentProcessStatusCode.COMPLETED, result.status)
         val goalEvents = events.filterIsInstance<GoalAchievedEvent>()
         assertEquals(1, goalEvents.size, "One root-mission achievement")
-        assertTrue(goalEvents.single() !is EpisodeCompletedEvent, "Root completion is terminal, not an episode")
         assertTrue(events.any { it is AgentProcessFinishedEvent }, "Terminal completion emits a finished event")
     }
 
@@ -563,7 +563,18 @@ class GoalEvolvingContractTest {
         // The condition planner owns whether a prior root achievement can
         // serve a later occurrence. The runtime must not shadow outputs or
         // clear planner state to force a rerun.
-        val process = evolvingProcess(DualInputAgent(), ZoneInfo("zone-9"), CalibrationRequested("cal-1"))
+        val events = mutableListOf<AgentProcessEvent>()
+        val listener = object : AgenticEventListener {
+            override fun onProcessEvent(event: AgentProcessEvent) {
+                events += event
+            }
+        }
+        val process = evolvingProcess(
+            DualInputAgent(),
+            ZoneInfo("zone-9"),
+            CalibrationRequested("cal-1"),
+            listener = listener,
+        )
 
         val rootRun = process.run()
         assertEquals(AgentProcessStatusCode.STUCK, rootRun.status)
@@ -578,7 +589,10 @@ class GoalEvolvingContractTest {
         assertEquals(AgentProcessStatusCode.STUCK, reopened.status, "The episode completed, then a clean park")
         val steps = reopened.objects.filterIsInstance<ExecutedStep>().map { it.name }
         assertEquals(listOf("calibrate:cal-1@zone-9"), steps)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
+        assertTrue(
+            events.filterIsInstance<OccurrenceConsumedEvent>()
+                .none { it.agentProcess.id == process.id && it.occurrenceId == occurrence },
+        )
         assertEquals(
             "cal-1", reopened.last<CalibrationRequested>()?.id,
             "The episode consumed its own occurrence; the root standing fact survives",

@@ -27,7 +27,6 @@ import com.embabel.agent.core.AgentProcessStatusCode
 import com.embabel.agent.core.GoalTarget
 import com.embabel.agent.core.ProcessOptions
 import com.embabel.agent.core.last
-import com.embabel.agent.core.support.EpisodeState
 import com.embabel.agent.core.support.InMemoryBlackboard
 import com.embabel.agent.core.support.NIRVANA
 import com.embabel.agent.core.support.SimpleAgentProcess
@@ -203,6 +202,7 @@ class GoalEpisodeAimaTest {
         processId: String,
         options: ProcessOptions,
         vararg seeds: Any,
+        recorder: ProcessEventRecorder? = null,
     ): SimpleAgentProcess {
         val blackboard = InMemoryBlackboard()
         seeds.forEach { blackboard.addObject(it) }
@@ -217,7 +217,7 @@ class GoalEpisodeAimaTest {
             processId,
             null,
             effectiveAgent,
-            options,
+            recorder?.let(options::withListener) ?: options,
             blackboard,
             dummyPlatformServices(),
             DefaultPlannerFactory,
@@ -232,7 +232,7 @@ class GoalEpisodeAimaTest {
             "aima-painting-problem",
             ProcessOptions.DEFAULT.withEvolving(),
         )
-        val firstOccurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
@@ -242,7 +242,6 @@ class GoalEpisodeAimaTest {
         // start a chain it cannot finish. The stall happens before any
         // work: no wasted prep, request untouched
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(firstOccurrence)?.state)
         assertNull(stalled.last<PreparedSurface>(), "GOAP does not start a chain it cannot finish")
         assertTrue(
             stalled.objects.filterIsInstance<ExecutedStep>().isEmpty(),
@@ -253,7 +252,6 @@ class GoalEpisodeAimaTest {
         val painted = stalled.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, painted.status)
-        assertNull(process.activeEpisode(firstOccurrence), "Completion consumed the occurrence")
         assertNull(painted.last<PreparedSurface>(), "Completion consumed the intermediate")
         assertNull(painted.last<SurfacePainted>(), "Completion consumed the satisfying output")
         assertNotNull(painted.last<PaintCan>(), "The can is used, not consumed: AIMA's reusable resource")
@@ -284,18 +282,16 @@ class GoalEpisodeAimaTest {
                 .withPlannerType(PlannerType.HYBRID)
                 .withEvolving(),
         )
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val stalled = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, stalled.status)
         assertNull(stalled.last<PreparedSurface>(), "No doomed child, no stranded prep")
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
 
         stalled.addObject(PaintCan("red"))
         val painted = stalled.run()
 
-        assertNull(process.activeEpisode(occurrence), "Completion consumed the occurrence")
         assertNull(painted.last<PreparedSurface>(), "Completion consumed the chain's own intermediate")
         assertNull(painted.last<SurfacePainted>(), "Completion consumed the satisfying output")
         assertNotNull(painted.last<PaintCan>(), "The can is still used, not consumed")
@@ -307,23 +303,24 @@ class GoalEpisodeAimaTest {
         // child's own budget. Evolving Mode contains that behavior in one
         // child and reports the outcome; it does not reconstruct the graph
         // to predict or repair the planner's decision.
+        val recorder = ProcessEventRecorder()
         val process = create(
             PaintingRobotAgent(),
             "aima-painting-hybrid-spin",
             ProcessOptions.DEFAULT
                 .withPlannerType(PlannerType.HYBRID)
                 .withEvolving(),
+            recorder = recorder,
         )
-        val occurrence = process.evolve(PaintRequested("job-1"))
+        process.evolve(PaintRequested("job-1"))
 
         val result = process.run()
 
         assertEquals(AgentProcessStatusCode.STUCK, result.status, "A blocked chain parks, never terminates the budget")
         val preps = result.objects.filterIsInstance<ExecutedStep>().count { it.name == "prep:job-1" }
         assertEquals(50, preps, "The selected planner retained its native NIRVANA behavior")
-        assertEquals(EpisodeState.STUCK, process.activeEpisode(occurrence)?.state)
         assertEquals(
-            1, process.frameworkChildCount,
+            1, recorder.episodeStarts(process).size,
             "One observed attempt, contained by its boundary - the block is recorded, never re-spun",
         )
     }
